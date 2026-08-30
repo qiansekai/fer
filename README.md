@@ -1,126 +1,161 @@
 # File-Engine-Rust
 
-> Everything 级「秒定位全局文件」搜索引擎，纯 Rust 从零重写。
-> 索引走 NTFS MFT（管理员快路径），搜索走 SQLite + FTS5 trigram（毫秒级），
-> 可选 USN 日志实时监控 + HTTP API / 网页 UI。
-
-## 为什么有它
-
-`Coding/File-Engine-Core`（Java 版，上游 File-Engine）的 Rust 重写曾烂尾于骨架
-（`.claude/worktrees/rust-rewrite`，13 个空模块）。本项目**不**在其上续写，而是
-新开目录从零实现，并带完整测试。
+> Everything 级「秒定位全局文件」搜索引擎，纯 Rust。
+> 索引走 **原始 $MFT 扫描**（与 Everything 同款内核路径），搜索走 SQLite + FTS5 trigram（毫秒级），
+> 支持硬链接别名、文件大小/时间/属性过滤，CLI + HTTP API 双通道，agent 友好。
 
 ## 特性
 
-- ⚡ **秒级全盘索引 + 低内存**：管理员权限下直接读 NTFS MFT（`FSCTL_ENUM_USN_DATA`），
-  与 Everything 同机制；紧凑数组 + 流式 DFS 落库，**全盘 409 万条峰值内存 ~170 MB**；
-  无管理员时自动回退 `walkdir` 全盘遍历
-- 🚀 **毫秒级搜索**：子串（FTS5 trigram ≥3 字符 / instr 兜底）、
-  `*`/`?` 通配符（`*.rs` 后缀型走反向列区间查询，纯 LIKE 兜底）、大小写不敏感、
-  CJK 友好；默认匹配文件名，含 `\`/`/` 或 `--path` 时匹配全路径
-- 🔄 **实时监控**：`fer monitor` 轮询 USN 日志（自动查询日志 ID），增量应用
-  创建/删除/重命名（删除按 FRN 直删，MFT 记录被回收也能正确移除）
-- 🌐 **HTTP API + 网页 UI**：`fer serve` 后浏览器打开即搜
-- ✅ **测试闭环**：单元测试（匹配语义 / SQL 查询 / USN 缓冲解析 / 路径重建）+
-  临时目录端到端 + 真实卷集成测试（`#[ignore]`，管理员下跑）；
-  与 Everything（es CLI）交叉验证：Cargo.toml/AGENTS.md/*.mp4 等查询 **100% 一致**
-
-## 实测性能（本机 6 卷 · 352 万文件 + 57 万目录）
-
-| 查询 | 结果数 | 耗时 |
-|------|-------:|-----:|
-| `*.rs`（后缀） | 40,039 | 4 ms |
-| `*.jpg`（后缀） | 109,682 | 32 ms |
-| `Cargo.toml`（子串） | 2,603 | 16 ms |
-| `File-Engine-Rust\src`（路径） | 10 | 38 ms |
-| `报告`（2 字 CJK） | 40 | ~1.3 s（全扫描，见限制） |
-
-索引构建：全盘 6 卷 409 万条 ≈ 485 s，**峰值内存 171 MB**。
+- ⚡ **完整 MFT 解析**：直读 NTFS `$MFT`（runlist + USA fixup + `$FILE_NAME` 全属性），
+  一次拿到：**全部硬链接别名**（`System32\ntdll.dll` → WinSxS 本体也能搜到）、
+  真实大小、修改/创建时间、hidden/system/readonly/reparse 标志；
+  分片 `$MFT` 自动回退 USN 枚举，无管理员回退目录遍历
+- 🧠 **低内存**：紧凑数组 + 流式 DFS 落库，全盘 400 万条峰值内存 ~170 MB
+- 🚀 **毫秒级搜索**：子串（FTS5 trigram ≥3 字符）、`*.rs` 后缀（反向列区间查询）、
+  通配符、大小写不敏感、CJK
+- 🔍 **过滤查询语言**：`ext: size: dm: dc: type: hidden: parent: path: name:` + 取反（`!`）
+- 🔄 **实时监控**：`fer monitor` 轮询 USN 日志增量更新（删除按 FRN 直删）
+- 🌐 **HTTP API + 网页 UI** + **CLI --json**（稳定 JSON 输出，面向 agent）
+- ✅ 测试闭环：单元 + 端到端 + 真实卷（`#[ignore]`）+ 与 Everything(es) 交叉验证
 
 ## 构建
 
 ```bash
-# 本机（Tairitsu）没有 MSVC 链接器（Git 的 GNU link.exe 会遮蔽 link），
-# 用 rustup 的 GNU 工具链构建，产物为独立 exe（无运行时依赖）：
+# 本机（Tairitsu）无 MSVC 链接器，走 rustup GNU 工具链（rust-toolchain.toml 已配置）：
 rustup run stable-x86_64-pc-windows-gnu cargo build --release
-# 或者直接：cargo build --release   （需 PATH 走 rustup 代理且 rust-toolchain.toml 生效）
-# 产物：target-gnu/release/fer.exe（项目配置了 rust-toolchain.toml + .cargo/config.toml 指向 GNU）
+# 产物：target-gnu/release/fer.exe（独立 exe，无运行时依赖）
 ```
 
-> 有 MSVC（VS2022 C++ 生成工具）的机器上默认 `cargo build --release` 即可。
-
-## 使用
+## CLI 使用
 
 ```bash
-fer volumes                          # 列出固定 NTFS 卷
-fer index --volumes D                # 索引 D 盘（默认 auto：优先 USN，失败回退 walk）
-fer index                            # 索引全部固定 NTFS 卷
-fer search "AGENTS.md"               # 秒搜
-fer search "*.rs" --limit 50         # 通配符
-fer search "src\main" --path         # 全路径搜索
-fer search "main" --count-only       # 只看命中总数
+fer volumes                          # 列出固定 NTFS 卷（--json 输出 JSON）
+fer index                            # 全盘建索引（auto：MFT → USN → walk 逐级回退）
+fer index --volumes D --method mft   # 指定卷 / 强制 MFT 路径
+fer search "AGENTS.md"               # 秒搜（子串）
+fer search "*.rs"                    # 通配符
+fer search "ext:mp4 size:>1gb dm:thisweek"   # 过滤查询语言
+fer search "foo" --limit 50 --count-only     # 只看命中数
 fer serve --addr 127.0.0.1:9876      # HTTP API + 网页 UI
-fer monitor --volume D               # USN 日志实时增量（需管理员）
+fer monitor --volume D               # USN 实时增量（需管理员）
 fer stats                            # 索引统计
-# 自定义数据库位置（默认 %LOCALAPPDATA%\file-engine-rust\index.db）
-fer --db D:\data\idx.db search foo
+fer --db <path> <cmd>                # 自定义索引库（默认 %LOCALAPPDATA%\file-engine-rust\index.db）
 ```
+
+## 查询语言（CLI 与 HTTP 共用）
+
+空白分隔的 term，全部大小写不敏感；`!term` 取反。示例：
+`ext:rs,png size:>1mb dm:thisweek parent:D:\proj !hidden:true`
+
+| 语法 | 含义 |
+|------|------|
+| `foo` | 文件名子串（basename contains） |
+| `*.rs` `main*` `a?c*` | 通配符（`*` 任意串、`?` 单字符；`*.rs` 为精确后缀） |
+| `D:\proj\src`（含分隔符的裸词） | 全路径子串 |
+| `name:foo` | 显式文件名匹配（同裸词） |
+| `ext:rs,png` | 扩展名（逗号列表，不带点） |
+| `size:>1mb` `size:<10kb` `size:1kb-5mb` `size:1024` | 大小（kb=1024, mb=1024², gb=1024³；`>` `<` 区间；裸值为精确字节） |
+| `dm:today` `dm:yesterday` `dm:thisweek` `dm:thismonth` | 修改时间（近 7 天/30 天） |
+| `dm:2026-01-01` `dm:>2026-01-01` `dm:2026-01-01..2026-01-31` | 修改时间绝对日期（本地时区，含当日） |
+| `dc:...` | 创建时间（同上语法） |
+| `type:file` / `type:dir` | 只文件 / 只目录 |
+| `hidden:` `system:` `readonly:` `reparse:` | 属性过滤（后接 true/false/1/0） |
+| `parent:D:\proj` | 该目录**子树**（前缀匹配） |
+| `path:D:\proj\src` | 全路径前缀 |
+| `!term` | 取反（与其它 term 为 AND 关系） |
 
 ## HTTP API
 
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | `/api/health` | `{"ok":true}` |
-| GET | `/api/search?q=<query>&limit=<n>&path=<bool>` | 命中列表 + 总数 + 耗时 |
-| GET | `/api/stats` | 索引统计 + 卷列表 |
-| POST | `/api/rescan` | 后台全量重建索引 |
-| GET | `/` | 极简网页搜索 UI |
-
-## 测试
-
-```bash
-cargo test                                        # 单元 + 临时目录端到端
-cargo test --test live_volume -- --ignored --nocapture   # 真实卷（需管理员）
-# 自定义盘符：$env:FER_TEST_DRIVE='D'
+```
+GET /api/health                     → {"ok":true}
+GET /api/search?q=<query>&limit=<n> → 命中列表（带 size/mtime/ctime/flags）
+GET /api/stats                      → 索引统计 + 卷列表
+POST /api/rescan                    → 后台全量重建
+GET /                              → 网页搜索 UI
 ```
 
-真实卷测试断言：C 盘 MFT 记录数 > 10 万、`ntdll.dll` 可被枚举且搜索命中、
-搜索耗时 < 1s。另可用 Everything 的 `es` CLI 交叉验证（本机 Everything 1.5 在役）。
+搜索响应（hits 为数组，`total` 为未截断的总命中数）：
+
+```json
+{
+  "ok": true, "query": "ext:rs", "count": 100, "total": 40039, "took_ms": 5,
+  "hits": [
+    {"path": "D:\\proj\\main.rs", "is_dir": false, "size": 1234,
+     "mtime": 1750000000, "ctime": 1749000000, "flags": 0}
+  ]
+}
+```
+
+curl 示例：
+
+```bash
+curl "http://127.0.0.1:9876/api/search?q=ext%3Ars%20size%3A%3E1mb&limit=10"
+curl -X POST http://127.0.0.1:9876/api/rescan
+```
+
+## Agent 使用指南
+
+- **CLI**：所有子命令支持 `--json`；错误时退出码非 0。查询语言参数**带引号传入**：
+  `fer search "ext:rs dm:thisweek" --json`（注意 shell 里 `!` 需转义或使用单引号）。
+- **HTTP**：长驻 `fer serve` 后直接 `GET /api/search?q=...`，URL 编码查询串。
+- **稳定契约**：`--json` 输出与 `/api/*` 的字段名视为稳定 API；`took_ms`/`total` 仅供观测。
+- 已知边界：2 字短查询（尤其中文）走全扫描约 1s 量级；硬链接别名均已收录。
 
 ## 架构
 
 ```
 src/
-├── usn.rs      FSCTL_ENUM_USN_DATA / READ_USN_JOURNAL，纯函数解析器 + FRN→路径树重建
+├── mft.rs      原始 $MFT 扫描：FSCTL_GET_NTFS_VOLUME_DATA → record0 $DATA runlist
+│               → 分块读 + USA fixup → FILE 记录 → 全部 $FILE_NAME（硬链接）+
+│               大小/时间/DOS 标志；纯函数解析器全部有单测
+├── usn.rs      FSCTL_ENUM_USN_DATA / READ_USN_JOURNAL（回退索引 + 变更监控）
 ├── walk.rs     walkdir 回退（Windows 上 metadata 零额外 syscall）
-├── store.rs    SQLite(WAL+mmap) + FTS5 trigram；重建事务（synchronous=OFF 提速）；
-│               name_r/path_r 反向列把 `*.rs` 后缀搜索变成索引区间查询
-├── matcher.rs  匹配语义参考实现（单测基准）
-├── indexer.rs  auto/usn/walk 编排，进度输出
+├── store.rs    SQLite(WAL+mmap) + FTS5 trigram；反向列区间查询；查询语言→SQL 翻译
+├── query.rs    查询语言解析（纯函数 + 单测）
+├── indexer.rs  mft → usn → walk 逐级回退编排
 ├── monitor.rs  USN 日志轮询 → delete_by_frn / upsert
 ├── server.rs   axum HTTP API + 内嵌网页
-└── main.rs     fer CLI（clap）
+└── main.rs     fer CLI（clap，--json 全局开关）
 ```
+
+## 测试
+
+```bash
+cargo test                                        # 单元 + 端到端（33+ 用例）
+cargo test --test live_volume -- --ignored --nocapture   # 真实卷（需管理员）
+# 自定义盘符：$env:FER_TEST_DRIVE='D'
+```
+
+真实卷测试断言：MFT 扫描 >10 万文件、`hosts` 命中、**硬链接别名 System32\ntdll.dll 命中**、
+元数据 size 真实、搜索 <1s。与 Everything(es) 交叉验证见提交历史中的验证记录。
+
+## 实测性能（本机 6 卷 · 全盘）
+
+| 查询 | 结果数 | 耗时 |
+|------|-------:|-----:|
+| `*.rs`（后缀） | 40,039 | ~5 ms |
+| `Cargo.toml`（子串） | 2,603 | ~20 ms |
+| `ntdll.dll`（含硬链接别名） | 61 | ~5 ms |
+| 路径/过滤查询 | — | 数十 ms |
+
+索引构建：全盘 ~400 万条（MFT 路径含硬链接别名），峰值内存 ~170 MB。
 
 ## 已知限制 / TODO
 
-- **2 字短查询（尤其 CJK）走 instr 全扫描**（FTS5 trigram 要求 ≥3 字符），4M 条目约 1.3 s；
-  Everything 靠内存索引做到 ~100 ms。彻底解法 = serve 模式常驻紧凑内存索引（选项化）
-- **硬链接别名只显示主名**：`FSCTL_ENUM_USN_DATA` 只暴露 MFT 记录的主文件名。
-  `C:\Windows\System32\ntdll.dll` 这类 WinSxS 硬链接别名（Everything 通过解析完整
-  MFT 的附加 `$FILE_NAME` 属性能看到）不会出现在索引里，只会显示 WinSxS 主名。
-  补齐需 `FSCTL_GET_NTFS_FILE_RECORD` 解析，列为 TODO
-- USN 路径不取文件大小（USN_RECORD 无 size 字段；walk 路径有），后续可后补
-- 未做拼音 / 模糊排序 / 内容搜索（本项目和 Everything 一样只搜文件名）
-- 多卷监控需逐个 `fer monitor`；USN 日志回卷会报错提示重建（而非自动重建）
-- 重建索引会阻塞同库的搜索（v1 设计）
+- 2 字短查询（尤其 CJK）走 instr 全扫描（FTS5 trigram 要求 ≥3 字符）；serve 模式可加内存索引
+- 单个 `$FILE_NAME` 残留 0 大小（NTFS 自身行为，Everything 同样显示未知），不影响搜索
+- 8.3 短名（namespace=2）不入索引（避免噪音）；分片 `$MFT` 回退 USN 路径会丢失硬链接别名
+- FAT/exFAT 卷不支持（监控需 ReadDirectoryChangesW，列为 TODO）
+- 多卷监控需逐个 `fer monitor`；USN 日志回卷会报错提示重建
 
 ## 与上游对照
 
-| | File-Engine-Core (Java) | File-Engine-Rust (本项目) |
-|---|---|---|
-| 索引 | C++ JNI 读 USN | 纯 Rust windows-sys 读 MFT |
-| 存储 | SQLite | SQLite + FTS5 trigram |
-| 搜索 | HTTP API | CLI + HTTP API + 网页 |
-| 监控 | fileMonitor 线程 | USN 日志轮询 |
-| 依赖 | JDK21 + VS2022 + GraalVM | 单一 exe（无运行时依赖） |
+| | File-Engine-Core (Java) | Everything | File-Engine-Rust |
+|---|---|---|---|
+| 索引 | C++ JNI 读 USN | 完整 MFT 解析 | **完整 MFT 解析（mft.rs）** |
+| 硬链接别名 | ❌ | ✅ | ✅ |
+| 大小/时间/属性 | 部分 | ✅ | ✅ |
+| 存储 | SQLite | 内存索引 | SQLite + FTS5 trigram |
+| 搜索 | HTTP API | GUI + IPC | CLI + HTTP + 网页 |
+| 监控 | fileMonitor | USN + RDCW | USN 轮询 |
+| 依赖 | JDK21+VS+GraalVM | 闭源 | 单一 exe |
