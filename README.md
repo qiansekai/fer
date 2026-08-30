@@ -129,20 +129,26 @@ cargo test --test live_volume -- --ignored --nocapture   # 真实卷（需管理
 真实卷测试断言：MFT 扫描 >10 万文件、`hosts` 命中、**硬链接别名 System32\ntdll.dll 命中**、
 元数据 size 真实、搜索 <1s。与 Everything(es) 交叉验证见提交历史中的验证记录。
 
-## 实测性能（本机 6 卷 · 全盘）
+## 实测性能（本机 6 卷 · 全盘 358 万文件）
 
 | 查询 | 结果数 | 耗时 |
 |------|-------:|-----:|
-| `*.rs`（后缀） | 40,039 | ~5 ms |
+| `*.rs`（后缀） | 40,067 | 16 ms |
+| `*.jpg`（后缀） | 109,726 | 11 ms |
 | `Cargo.toml`（子串） | 2,603 | ~20 ms |
-| `ntdll.dll`（含硬链接别名） | 61 | ~5 ms |
-| 路径/过滤查询 | — | 数十 ms |
+| `ntdll.dll`（含硬链接别名） | 61 | ~10 ms |
+| `dm:thisweek`（mtime 索引） | 1,701,682 | 39 ms |
+| `hidden:true`（部分索引） | 583 | ~0 ms |
+| `ext:mp4 size:>100mb` | 42 | 9 ms |
+| `parent:D:\Kita-Tools\Coding` | 77,899 | 57 ms |
+| `报告`（2 字 CJK，全扫描下限） | 41 | ~430 ms |
 
-索引构建：全盘 ~400 万条（MFT 路径含硬链接别名），峰值内存 ~170 MB。
+索引构建：全盘 ~415 万条（MFT 路径含硬链接别名），峰值内存 ~309 MB。
 
 ## 已知限制 / TODO
 
-- 2 字短查询（尤其 CJK）走 instr 全扫描（FTS5 trigram 要求 ≥3 字符）；serve 模式可加内存索引
+- 2 字短查询（尤其 CJK）走 instr 全索引扫描（FTS5 trigram 要求 ≥3 字符），
+  约 0.4-0.5s——SQLite 架构下限；serve 模式可加常驻内存索引压到 ~100ms
 - 单个 `$FILE_NAME` 残留 0 大小（NTFS 自身行为，Everything 同样显示未知），不影响搜索
 - 8.3 短名（namespace=2）不入索引（避免噪音）；分片 `$MFT` 回退 USN 路径会丢失硬链接别名
 - FAT/exFAT 卷不支持（监控需 ReadDirectoryChangesW，列为 TODO）

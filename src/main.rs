@@ -129,6 +129,13 @@ fn main() -> Result<()> {
             };
             let store = Store::open(&db)?;
             let t = Instant::now();
+            if count_only && !cli.json {
+                // skip the hits query entirely — halved latency on scan-bound
+                // queries (2-char CJK, big wildcards)
+                let total = store.count_query(&q)?;
+                eprintln!("{total} total results in {} ms", t.elapsed().as_millis());
+                return Ok(());
+            }
             let r = store.search_query(&q, Some(limit))?;
             let took = t.elapsed().as_millis();
             if cli.json {

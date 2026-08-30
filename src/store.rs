@@ -252,23 +252,36 @@ impl Store {
         Ok(SearchResult { hits, total })
     }
 
+    /// COUNT-only variant of [`Store::search_query`] — skips the hits query
+    /// entirely (halves latency for scan-bound queries like 2-char CJK).
+    pub fn count_query(&self, q: &crate::query::Query) -> Result<u64> {
+        let mut count_conds: Vec<String> = Vec::with_capacity(q.include.len() + q.exclude.len());
+        for t in &q.include {
+            count_conds.push(Self::term_sql(t, true));
+        }
+        for t in &q.exclude {
+            count_conds.push(format!("NOT ({})", Self::term_sql(t, true)));
+        }
+        let count_where = if count_conds.is_empty() {
+            "1=1".to_string()
+        } else {
+            count_conds.join(" AND ")
+        };
+        let sql_count = format!("SELECT COUNT(*) FROM files WHERE {count_where}");
+        Ok(self.conn.query_row(&sql_count, [], |r| r.get::<_, i64>(0))? as u64)
+    }
+
     /// Translate one query term into a SQL condition (all literals inlined and
     /// escaped; the query language is trusted input by design). `for_count`
     /// emits the rowid-subquery-free form so COUNT runs over covering indexes.
     fn term_sql(t: &crate::query::Term, for_count: bool) -> String {
         use crate::query::Term;
         match t {
-            Term::Name(s) => name_substring_sql(s, "name_l"),
-            Term::PathSubstr(s) => name_substring_sql(s, "path_l"),
+            Term::Name(s) => name_substring_sql(s, "name_l", for_count),
+            Term::PathSubstr(s) => name_substring_sql(s, "path_l", for_count),
             Term::Suffix(s) => suffix_sql(s, "name_r", for_count),
-            Term::NameWild(p) => format!(
-                "name_l LIKE '{}' ESCAPE '\\'",
-                sql_literal(&glob_to_like(p))
-            ),
-            Term::PathWild(p) => format!(
-                "path_l LIKE '{}' ESCAPE '\\'",
-                sql_literal(&glob_to_like(p))
-            ),
+            Term::NameWild(p) => like_sql("name_l", p, for_count),
+            Term::PathWild(p) => like_sql("path_l", p, for_count),
             Term::Ext(list) => {
                 let parts: Vec<String> = list
                     .iter()
@@ -520,16 +533,34 @@ fn lim_sql(lim: Option<i64>) -> String {
 }
 
 /// Substring condition on a lowercased column: FTS5 trigram (>= 3 chars) or
-/// `instr` (1-2 chars), via a rowid subquery so joins stay cheap.
-fn name_substring_sql(s: &str, col: &str) -> String {
+/// `instr` (1-2 chars). The hits form wraps the scan in a rowid subquery so
+/// the planner scans the slim index instead of the whole table.
+fn name_substring_sql(s: &str, col: &str, for_count: bool) -> String {
     if s.chars().count() >= 3 {
         let q = format!("{col} : \"{}\"", s.replace('"', "\"\""));
         format!(
             "id IN (SELECT rowid FROM files_fts WHERE files_fts MATCH '{}')",
             sql_literal(&q)
         )
-    } else {
+    } else if for_count {
         format!("instr({col}, '{}') > 0", sql_literal(s))
+    } else {
+        format!(
+            "id IN (SELECT id FROM files WHERE instr({col}, '{}') > 0)",
+            sql_literal(s)
+        )
+    }
+}
+
+/// Wildcard glob condition; same subquery trick for the hits form.
+fn like_sql(col: &str, glob: &str, for_count: bool) -> String {
+    let lit = sql_literal(&glob_to_like(glob));
+    if for_count {
+        format!("{col} LIKE '{lit}' ESCAPE '\\'")
+    } else {
+        format!(
+            "id IN (SELECT id FROM files WHERE {col} LIKE '{lit}' ESCAPE '\\')"
+        )
     }
 }
 
