@@ -119,8 +119,8 @@ src/
 │               大小/时间/DOS 标志；纯函数解析器全部有单测
 ├── usn.rs      FSCTL_ENUM_USN_DATA / READ_USN_JOURNAL（回退索引 + 变更监控）
 ├── walk.rs     walkdir 回退（Windows 上 metadata 零额外 syscall）
-├── mem.rs      FERIDX01 dump 内存引擎：56B 紧凑 Entry + arena + 6 排序置换，
-│               mmap 零拷贝加载，全部查询语言内存求值
+├── mem.rs      FERIDX01 dump 内存引擎：56B 紧凑 Entry + arena + 7 排序置换
+│               （含 by_frn，monitor 二分删改），mmap 零拷贝加载，多 term 并行求值
 ├── store.rs    SQLite + FTS5 oracle（feature `sqlite`，仅测试交叉验证，不进生产路径）
 ├── query.rs    查询语言解析（纯函数 + 单测）
 ├── indexer.rs  mft → usn → walk 逐级回退编排

@@ -16,10 +16,11 @@ CLI `--json` 与 HTTP API 双通道。
   ~1GB）；构建热缓存 ~11s / 冷盘 ~40-50s
 - dump **mmap 零拷贝加载**（裸指针 View + `Keep` 所有权锚点，加载 ~1ms，页按需缺页）：
   serve 启动 ~135ms，CLI 全查询 17-336ms（含进程启动）
-- dump 二进制契约：56B repr(C) Entry + 8 字节对齐段 + 头部 17 偏移 + 6 列表计数
-  （v2）；改布局必须 bump FORMAT_VERSION
-- monitor：load dump → USN 增量进内存（frn 映射/删除集/追加列表）→ 默认每 60s
-  防抖重建成新 dump；USN 位置存 `*.feridx.usn` 边车，崩溃靠日志回放补齐
+- dump 二进制契约：56B repr(C) Entry + 8 字节对齐段 + 头部 18 偏移 + 6 列表计数
+  + **by_frn 置换段**（v3，monitor 的 FRN→条目二分查找）；改布局必须 bump FORMAT_VERSION
+- monitor：load dump → USN 增量进内存（by_frn 二分 + 删除影子集/删除集/追加列表）→
+  默认每 60s 防抖重建成新 dump（flush 走 push_arena 直达复用，零 String 分配）；
+  USN 位置存 `*.feridx.usn` 边车，崩溃靠日志回放补齐
 - serve：全查询走内存引擎；`/api/rescan` 重建 + 换 dump + 热替换引擎
 
 ## 关键路径
@@ -67,8 +68,11 @@ cargo test --test live_volume -- --ignored --nocapture       # 真实卷（管�
 - **路径子串扫描必须 CI**（paths arena 存原始大小写，memchr 定位首字节折叠变体 +
   `ci_eq_at` 校验；byte-exact memmem 会漏掉全部大写路径）
 - **dump Entry 布局是二进制契约**（56B repr(C) 无填充），改字段必须 bump FORMAT_VERSION
-- monitor 追加项**不要**塞进 frn 映射（删除集偏移会失真）——追加后未落盘即删的
-  直接从追加列表 swap_remove；同窗口同路径多次创建同理去重
+- monitor 删除事件先用 `removed_frns` 影子集挡掉本窗口已退役的 FRN（否则
+  删除-重建-删除会把旧条目重复标记删除）；追加项 flush 前不在索引里（find_frn
+  查不到），同窗口删除走 `appended.swap_remove`；同窗口同路径多次创建同理去重
+- 多 term 查询的 eval 在 scoped 线程上并行求值；`ScopedJoinHandle` 的 join 必须
+  写在 `thread::scope` 闭包内（handle 的 env 生命周期出不了 scope）
 - release 开了 `fat LTO + codegen-units=1 + panic=abort + target-cpu=native`（本机专用）；
   另有 `--profile min-size`（`opt-level="z"`）体积最精简构建；clippy 保持 0 警告
 - 本仓库有 git（commit 节点：基线/测试全绿/真实卷全绿/性能优化/内存引擎/dupes/极致性能），

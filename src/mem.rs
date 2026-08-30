@@ -8,7 +8,8 @@
 //!   `names` (lowercased, for substring/glob scans),
 //!   `revs` (reversed lowercased names, for suffix binary search)
 //! * sorted permutations: `by_path` (CI order), `by_rev`, `by_size`,
-//!   `by_mtime`, `by_ctime` — all queries reduce to two binary searches
+//!   `by_mtime`, `by_ctime`, `by_frn` (FRN order — the monitor's delete
+//!   lookup) — all queries reduce to two binary searches
 //!   (partition points) over one of these
 //!
 //! All 12 query-language terms evaluate in memory. SQLite survives only as a
@@ -20,7 +21,6 @@
 //! lowercases them. Extremely rare in Windows paths.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -38,17 +38,18 @@ use crate::query::{Query, Term};
 
 /// Dump file magic + format version. v2 pads every section to 8-byte
 /// alignment so the file can be memory-mapped and viewed in place (zero-copy
-/// loading); v1 had unaligned sections and is rejected.
+/// loading); v1 had unaligned sections and is rejected. v3 adds the `by_frn`
+/// permutation section (FRN → entry binary search for the monitor).
 const MAGIC: &[u8; 8] = b"FERIDX01";
-const FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION: u32 = 3;
 
 /// Fixed dump section order: entries, paths, names, revs, the six sorted
-/// permutations, then the six id lists. The header stores byte offsets for
-/// each section plus the total file length (SEC+1 table entries), followed by
-/// the six id-list element counts — logical lengths come from these, so
-/// inter-section alignment padding never leaks into the data.
-const SEC: usize = 16;
-const HDR_LEN: usize = 32 + (SEC + 1) * 8 + 6 * 4; // 192
+/// permutations, the six id lists, then `by_frn`. The header stores byte
+/// offsets for each section plus the total file length (SEC+1 table entries),
+/// followed by the six id-list element counts — logical lengths come from
+/// these, so inter-section alignment padding never leaks into the data.
+const SEC: usize = 17;
+const HDR_LEN: usize = 32 + (SEC + 1) * 8 + 6 * 4; // 200
 
 /// Packed, dump-stable 56-byte record. Field order groups the u64s so there
 /// is no interior padding; the dump is written/read as raw little-endian
@@ -115,6 +116,35 @@ impl MemBuilder {
     pub fn finish(self) -> MemIndex {
         finalize(self.entries, self.paths, self.names, self.revs)
     }
+
+    /// Append an entry whose arena strings are already materialized (the
+    /// monitor's flush fast path): no basename extraction, no case
+    /// folding/reversal, no String allocations — bytes are copied straight
+    /// out of the old index's arenas.
+    pub(crate) fn push_arena(&mut self, path: &[u8], name_l: &[u8], rev: &[u8], meta: EntryMeta) {
+        let id = self.entries.len() as u32;
+        let po = self.paths.len() as u32;
+        self.paths.extend_from_slice(path);
+        let no = self.names.len() as u32;
+        self.names.extend_from_slice(name_l);
+        let ro = self.revs.len() as u32;
+        self.revs.extend_from_slice(rev);
+        self.entries.push(Entry {
+            id,
+            path_off: po,
+            path_len: path.len() as u16,
+            name_off: no,
+            name_len: name_l.len() as u16,
+            rev_off: ro,
+            rev_len: rev.len() as u16,
+            size: meta.size,
+            mtime: meta.mtime,
+            ctime: meta.ctime,
+            flags: meta.flags,
+            is_dir: meta.is_dir as u8,
+            frn: meta.frn.unwrap_or(0),
+        });
+    }
 }
 
 pub struct MemIndex {
@@ -146,6 +176,7 @@ struct OwnedData {
     by_size: Vec<u32>,
     by_mtime: Vec<u32>,
     by_ctime: Vec<u32>,
+    by_frn: Vec<u32>,
     dir_ids: Vec<u32>,
     file_ids: Vec<u32>,
     hidden_ids: Vec<u32>,
@@ -214,6 +245,7 @@ pub struct Sections {
     system_ids: View<u32>,
     readonly_ids: View<u32>,
     reparse_ids: View<u32>,
+    by_frn: View<u32>,
 }
 
 impl std::ops::Deref for MemIndex {
@@ -298,6 +330,7 @@ impl MemIndex {
             pod_bytes(&self.system_ids),
             pod_bytes(&self.readonly_ids),
             pod_bytes(&self.reparse_ids),
+            pod_bytes(&self.by_frn),
         ];
         for (i, bytes) in secs.into_iter().enumerate() {
             offs[i] = off;
@@ -379,6 +412,7 @@ impl MemIndex {
                 && offs.windows(2).all(|w| w[0] <= w[1])
                 && offs.iter().all(|o| o % 8 == 0)
                 && (offs[1] - offs[0]) as usize == n * std::mem::size_of::<Entry>()
+                && (offs[17] - offs[16]) as usize == n * 4
                 && counts[0] + counts[1] == n,
             "dump layout corrupt: {}",
             path.display()
@@ -411,6 +445,7 @@ impl MemIndex {
             system_ids: view_of(view_at(offs[13], counts[3] * 4)),
             readonly_ids: view_of(view_at(offs[14], counts[4] * 4)),
             reparse_ids: view_of(view_at(offs[15], counts[5] * 4)),
+            by_frn: view_of(view_at(offs[16], perm_bytes)),
         };
         Ok(MemIndex { _keep: Keep::Mapped(mmap), sec })
     }
@@ -442,6 +477,22 @@ impl MemIndex {
         .into_owned()
     }
 
+    /// Arena bytes of entry `i`'s path / lowercased name / reversed name
+    /// (zero-allocation views — the monitor's flush fast path copies these
+    /// straight into the rebuilt index).
+    pub fn path_bytes(&self, i: usize) -> &[u8] {
+        let e = &self.entries[i];
+        &self.paths[e.path_off as usize..e.path_off as usize + e.path_len as usize]
+    }
+    pub fn name_l_bytes(&self, i: usize) -> &[u8] {
+        let e = &self.entries[i];
+        &self.names[e.name_off as usize..e.name_off as usize + e.name_len as usize]
+    }
+    pub fn rev_bytes(&self, i: usize) -> &[u8] {
+        let e = &self.entries[i];
+        &self.revs[e.rev_off as usize..e.rev_off as usize + e.rev_len as usize]
+    }
+
     /// Metadata of entry `i` (monitor / dupes / flush use).
     pub fn meta_at(&self, i: usize) -> EntryMeta {
         let e = &self.entries[i];
@@ -455,15 +506,18 @@ impl MemIndex {
         }
     }
 
-    /// FRN → entry-index map for the monitor's delete-by-FRN fast path.
-    pub fn frn_map(&self) -> HashMap<u64, u32> {
-        let mut m = HashMap::with_capacity(self.entries.len());
-        for (i, e) in self.entries.iter().enumerate() {
-            if e.frn != 0 {
-                m.insert(e.frn, i as u32);
-            }
+    /// FRN → entry index via the `by_frn` permutation (two binary searches).
+    /// Replaces the ~100 MB FRN HashMap the monitor used to materialize at
+    /// startup and on every flush. `0` means "no FRN" and never matches.
+    pub fn find_frn(&self, frn: u64) -> Option<u32> {
+        if frn == 0 {
+            return None;
         }
-        m
+        let lo = self.by_frn.partition_point(|&i| self.entries[i as usize].frn < frn);
+        self.by_frn
+            .get(lo)
+            .copied()
+            .filter(|&i| self.entries[i as usize].frn == frn)
     }
 
     /// Exact (ASCII-CI) path lookup — the monitor dedupes create/rename events
@@ -493,7 +547,8 @@ impl MemIndex {
                 + self.by_rev.len()
                 + self.by_size.len()
                 + self.by_mtime.len()
-                + self.by_ctime.len())
+                + self.by_ctime.len()
+                + self.by_frn.len())
                 * 4
             + (self.dir_ids.len()
                 + self.file_ids.len()
@@ -505,10 +560,25 @@ impl MemIndex {
     }
 
     /// Evaluate the whole query in memory; returns matching file ids ascending.
+    /// Independent terms evaluate on scoped threads (multi-scan queries then
+    /// cost one scan, not the sum); intersections stay sequential.
     pub fn search(&self, q: &Query) -> Vec<u32> {
+        let evals = |terms: &[Term]| -> Vec<IdSet<'_>> {
+            if terms.len() > 1 {
+                std::thread::scope(|s| {
+                    let handles: Vec<_> =
+                        terms.iter().map(|t| s.spawn(|| self.eval(t))).collect();
+                    handles
+                        .into_iter()
+                        .map(|h| h.join().expect("query eval thread panicked"))
+                        .collect()
+                })
+            } else {
+                terms.iter().map(|t| self.eval(t)).collect()
+            }
+        };
         let mut acc: Option<IdSet<'_>> = None;
-        for t in &q.include {
-            let ids = self.eval(t);
+        for ids in evals(&q.include) {
             acc = Some(match acc {
                 None => ids,
                 Some(a) => IdSet::Owned(intersect(a.as_slice(), ids.as_slice())),
@@ -518,8 +588,7 @@ impl MemIndex {
             }
         }
         let mut acc = acc.unwrap_or_else(|| IdSet::Owned(self.all_ids()));
-        for t in &q.exclude {
-            let ids = self.eval(t);
+        for ids in evals(&q.exclude) {
             acc = IdSet::Owned(subtract(acc.as_slice(), ids.as_slice()));
             if acc.as_slice().is_empty() {
                 break;
@@ -817,6 +886,7 @@ fn finalize(entries: Vec<Entry>, paths: Vec<u8>, names: Vec<u8>, revs: Vec<u8>) 
     let mut by_size = seq;
     let mut by_mtime = (0..n as u32).collect::<Vec<u32>>();
     let mut by_ctime = (0..n as u32).collect::<Vec<u32>>();
+    let mut by_frn = (0..n as u32).collect::<Vec<u32>>();
     let mut dir_ids: Vec<u32> = Vec::new();
     let mut file_ids: Vec<u32> = Vec::new();
     let mut hidden_ids: Vec<u32> = Vec::new();
@@ -844,6 +914,8 @@ fn finalize(entries: Vec<Entry>, paths: Vec<u8>, names: Vec<u8>, revs: Vec<u8>) 
         s.spawn(|| {
             by_mtime.sort_unstable_by_key(|&i| e[i as usize].mtime);
             by_ctime.sort_unstable_by_key(|&i| e[i as usize].ctime);
+            // id tiebreak keeps the sort deterministic (dump bytes stable).
+            by_frn.sort_unstable_by_key(|&i| (e[i as usize].frn, e[i as usize].id));
         });
         s.spawn(|| {
             for t in e {
@@ -879,6 +951,7 @@ fn finalize(entries: Vec<Entry>, paths: Vec<u8>, names: Vec<u8>, revs: Vec<u8>) 
         by_size,
         by_mtime,
         by_ctime,
+        by_frn,
         dir_ids,
         file_ids,
         hidden_ids,
@@ -910,6 +983,7 @@ impl MemIndex {
             system_ids: View::from_slice(&o.system_ids),
             readonly_ids: View::from_slice(&o.readonly_ids),
             reparse_ids: View::from_slice(&o.reparse_ids),
+            by_frn: View::from_slice(&o.by_frn),
         };
         MemIndex { _keep: Keep::Owned(o), sec }
     }
@@ -1141,7 +1215,7 @@ mod tests {
         vec![
             (r"D:\docs\年度报告.md", EntryMeta { size: 100, mtime: now, ctime: now, flags: 0, ..Default::default() }),
             (r"D:\docs\readme.txt", EntryMeta { size: 500, mtime: now - 10_000_000, ctime: now, flags: 0, ..Default::default() }),
-            (r"D:\proj\src\main.rs", EntryMeta { size: 2 << 20, mtime: now, ctime: now, flags: 0, ..Default::default() }),
+            (r"D:\proj\src\main.rs", EntryMeta { size: 2 << 20, mtime: now, ctime: now, flags: 0, frn: Some(42), ..Default::default() }),
             (r"D:\proj\src\lib.rs", EntryMeta { size: 3 << 20, mtime: now - 100, ctime: now, flags: EntryMeta::FLAG_HIDDEN, ..Default::default() }),
             (r"D:\media\rs.jpg", EntryMeta { size: 9 << 20, mtime: now, ctime: now, flags: 0, ..Default::default() }),
             (r"D:\media\sub", EntryMeta { is_dir: true, size: 0, mtime: now, ctime: now, flags: 0, ..Default::default() }),
@@ -1243,5 +1317,30 @@ mod tests {
         let mem = build_mem();
         let q = Query::parse("").unwrap();
         assert_eq!(mem.search(&q).len(), 6);
+    }
+
+    #[test]
+    fn find_frn_binary_search() {
+        let mem = build_mem();
+        let idx = mem.find_frn(42).expect("frn 42 present");
+        assert_eq!(mem.path_at(idx as usize), r"D:\proj\src\main.rs");
+        assert!(mem.find_frn(43).is_none());
+        assert!(mem.find_frn(0).is_none()); // 0 = "no FRN"
+    }
+
+    #[test]
+    fn dump_roundtrip_v3() {
+        let mem = build_mem();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.feridx");
+        mem.save(&path).unwrap();
+        let loaded = MemIndex::load_dump(&path).unwrap();
+        assert_eq!(loaded.len(), mem.len());
+        assert_eq!(loaded.dir_count(), mem.dir_count());
+        assert_eq!(loaded.file_count(), mem.file_count());
+        let idx = loaded.find_frn(42).expect("frn survives roundtrip");
+        assert_eq!(loaded.path_at(idx as usize), r"D:\proj\src\main.rs");
+        let q = Query::parse("ext:rs").unwrap();
+        assert_eq!(loaded.search(&q), mem.search(&q));
     }
 }

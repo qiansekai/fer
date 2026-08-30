@@ -43,7 +43,10 @@ pub fn run(
     let mut start = read_usn(&usn_sidecar, drive).unwrap_or_else(|| sync_to_now(&vol));
     eprintln!("[monitor] watching {drive}: from USN {start} (dump: {})", dump.display());
     let mut cache: HashMap<u64, Option<String>> = HashMap::new();
-    let mut frn: HashMap<u64, u32> = mem.frn_map();
+    // FRNs retired this window but still present in the (not yet flushed)
+    // index — shadows the by_frn lookup so a delete after a re-create hits
+    // the appended list instead of re-marking the old entry.
+    let mut removed_frns: HashSet<u64> = HashSet::new();
     let mut removed: HashSet<u32> = HashSet::new();
     let mut appended: Vec<(String, EntryMeta)> = Vec::new();
     let mut last_flush = std::time::Instant::now();
@@ -58,8 +61,14 @@ pub fn run(
         let mut applied = 0usize;
         for r in &records {
             if r.reason & (USN_REASON_FILE_DELETE | USN_REASON_RENAME_OLD_NAME) != 0 {
-                if let Some(idx) = frn.remove(&r.frn) {
-                    removed.insert(idx);
+                let live = if removed_frns.contains(&r.frn) {
+                    None
+                } else {
+                    mem.find_frn(r.frn).map(|i| i as usize)
+                };
+                if let Some(idx) = live {
+                    removed_frns.insert(r.frn);
+                    removed.insert(idx as u32);
                     applied += 1;
                 } else if let Some(k) = appended
                     .iter()
@@ -84,7 +93,7 @@ pub fn run(
                 // already occupies this path.
                 if let Some(idx) = mem.find_path_idx(&path) {
                     let old_frn = mem.meta_at(idx).frn.unwrap_or(0);
-                    frn.remove(&old_frn);
+                    removed_frns.insert(old_frn);
                     removed.insert(idx as u32);
                 }
                 let meta = EntryMeta { is_dir: r.is_dir, frn: Some(r.frn), ..Default::default() };
@@ -113,16 +122,7 @@ pub fn run(
             let kept = mem.len() - removed.len() + appended.len();
             mem = flush(&mem, &removed, &appended, &dump)?;
             write_usn(&usn_sidecar, drive, start)?;
-            // FRN map delta: deletions were already removed at event time; the
-            // appended entries now live at the tail of the rebuilt index.
-            // (Rebuilding the whole map would churn ~100 MB of HashMap on
-            // every flush.)
-            let base = kept - appended.len();
-            for (j, (_, meta)) in appended.iter().enumerate() {
-                if let Some(f) = meta.frn {
-                    frn.insert(f, (base + j) as u32);
-                }
-            }
+            removed_frns.clear();
             removed.clear();
             appended.clear();
             last_flush = std::time::Instant::now();
@@ -133,7 +133,9 @@ pub fn run(
 }
 
 /// Rebuild the index (drop `removed` indices, append new entries) and write it
-/// to `dump` atomically. Returns the new authoritative index.
+/// to `dump` atomically. Kept entries stream through the arena fast path —
+/// no per-entry String allocation or case-fold recomputation. Returns the new
+/// authoritative index.
 fn flush(
     mem: &MemIndex,
     removed: &HashSet<u32>,
@@ -145,7 +147,12 @@ fn flush(
         if removed.contains(&(i as u32)) {
             continue;
         }
-        b.push(&mem.path_at(i), mem.meta_at(i));
+        b.push_arena(
+            mem.path_bytes(i),
+            mem.name_l_bytes(i),
+            mem.rev_bytes(i),
+            mem.meta_at(i),
+        );
     }
     for (path, meta) in appended {
         b.push(path, *meta);
