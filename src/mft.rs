@@ -166,16 +166,18 @@ impl MftScanner {
     /// Scan the whole $MFT, emitting one entry per `$FILE_NAME`.
     /// Returns the number of FILE records processed.
     pub fn scan(&self, mut on_entry: impl FnMut(&MftEntry)) -> Result<u64> {
+        const CHUNK: usize = 4 << 20; // records parse per chunk; big reads amortize syscalls
         let mut offset = 0u64;
         let mut records = 0u64;
-        let mut buf: Vec<u8> = Vec::with_capacity(1 << 20);
+        let mut buf: Vec<u8> = Vec::with_capacity(CHUNK);
         while offset < self.data_size {
-            let want = (1 << 20).min(self.data_size - offset) as usize;
+            let want = (CHUNK as u64).min(self.data_size - offset) as usize;
             buf.clear();
             self.read_mft(offset, want, &mut buf)?;
             let mut pos = 0usize;
             while pos + self.record_size as usize <= buf.len() {
-                let rec = &buf[pos..pos + self.record_size as usize];
+                // USA fixup in place — we own `buf` and refill it every chunk.
+                let rec = &mut buf[pos..pos + self.record_size as usize];
                 pos += self.record_size as usize;
                 if rec.len() < 48 || &rec[0..4] != b"FILE" {
                     continue;
@@ -184,12 +186,8 @@ impl MftScanner {
                 if flags & 0x01 == 0 {
                     continue; // not in use
                 }
-                // USA fixup in place (we own the buffer).
-                let fixed = match apply_fixups(rec, self.sector_size) {
-                    Ok(f) => f,
-                    Err(_) => continue, // corrupt record — skip
-                };
-                let hdr = match parse_file_header(&fixed) {
+                apply_fixups_inplace(rec, self.sector_size);
+                let hdr = match parse_file_header(rec) {
                     Ok(h) => h,
                     Err(_) => continue,
                 };
@@ -203,18 +201,23 @@ impl MftScanner {
                     hdr.record_number as u64 & FRN_MASK
                 };
                 let is_dir = flags & 0x02 != 0;
-                // Per-record metadata from the authoritative attributes:
+                // One pass over the attributes. Per-record metadata comes from
+                // the authoritative attributes:
                 // * size — the $DATA attribute's real size ($FILE_NAME's size
                 //   fields are stale directory-entry caches NTFS no longer
                 //   maintains; they read 0 for most user files)
                 // * mtime/ctime — $STANDARD_INFORMATION (same staleness issue)
+                // plus every $FILE_NAME — hard-linked files carry one
+                // attribute per link.
                 let mut std_mtime = 0i64;
                 let mut std_ctime = 0i64;
                 let mut data_size: Option<u64> = None;
-                for attr in iterate_attributes(&fixed, hdr.attr_off, hdr.bytes_in_use) {
+                let mut names: Vec<(u64, String, bool, bool, bool, bool)> = Vec::new();
+                let mut max_size = 0u64;
+                for attr in iterate_attributes(rec, hdr.attr_off, hdr.bytes_in_use) {
                     match attr.attr_type {
                         0x10 if !attr.non_resident && attr.value_len >= 24 => {
-                            let v = &fixed[attr.value_off..attr.value_off + attr.value_len as usize];
+                            let v = &rec[attr.value_off..attr.value_off + attr.value_len as usize];
                             std_ctime = filetime_to_unix(u64::from_le_bytes(v[0..8].try_into().unwrap()));
                             std_mtime = filetime_to_unix(u64::from_le_bytes(v[8..16].try_into().unwrap()));
                         }
@@ -225,45 +228,32 @@ impl MftScanner {
                                 Some(attr.value_len as u64)
                             };
                         }
+                        0x30 if !attr.non_resident && attr.value_len >= 66 => {
+                            let v = &rec[attr.value_off..attr.value_off + attr.value_len as usize];
+                            let parent_frn = u64::from_le_bytes(v[0..8].try_into().unwrap()) & FRN_MASK;
+                            let size = u64::from_le_bytes(v[48..56].try_into().unwrap());
+                            let dos_flags = u32::from_le_bytes(v[56..60].try_into().unwrap());
+                            let name_len = v[64] as usize;
+                            let namespace = v[65];
+                            if namespace == 2 {
+                                continue; // pure DOS (8.3) alias — skip clutter
+                            }
+                            if name_len == 0 || 66 + name_len * 2 > v.len() {
+                                continue;
+                            }
+                            let name = utf16_name(&v[66..66 + name_len * 2]);
+                            max_size = max_size.max(size);
+                            names.push((
+                                parent_frn,
+                                name,
+                                dos_flags & 0x02 != 0,
+                                dos_flags & 0x04 != 0,
+                                dos_flags & 0x01 != 0,
+                                dos_flags & 0x0400 != 0,
+                            ));
+                        }
                         _ => {}
                     }
-                }
-                let mtime = if std_mtime > 0 { std_mtime } else { 0 };
-                let ctime = if std_ctime > 0 { std_ctime } else { 0 };
-                // Collect every $FILE_NAME of this record: hard-linked files
-                // carry one attribute per link.
-                let mut names: Vec<(u64, String, bool, bool, bool, bool)> = Vec::new();
-                let mut max_size = 0u64;
-                for attr in iterate_attributes(&fixed, hdr.attr_off, hdr.bytes_in_use) {
-                    if attr.attr_type != 0x30 || attr.non_resident || attr.value_len < 66 {
-                        continue;
-                    }
-                    let v = &fixed[attr.value_off..attr.value_off + attr.value_len as usize];
-                    let parent_frn = u64::from_le_bytes(v[0..8].try_into().unwrap()) & FRN_MASK;
-                    let size = u64::from_le_bytes(v[48..56].try_into().unwrap());
-                    let dos_flags = u32::from_le_bytes(v[56..60].try_into().unwrap());
-                    let name_len = v[64] as usize;
-                    let namespace = v[65];
-                    if namespace == 2 {
-                        continue; // pure DOS (8.3) alias — skip clutter
-                    }
-                    if name_len == 0 || 66 + name_len * 2 > v.len() {
-                        continue;
-                    }
-                    let mut utf16 = Vec::with_capacity(name_len);
-                    for i in 0..name_len {
-                        utf16.push(u16::from_le_bytes([v[66 + i * 2], v[67 + i * 2]]));
-                    }
-                    let name = String::from_utf16_lossy(&utf16);
-                    max_size = max_size.max(size);
-                    names.push((
-                        parent_frn,
-                        name,
-                        dos_flags & 0x02 != 0,
-                        dos_flags & 0x04 != 0,
-                        dos_flags & 0x01 != 0,
-                        dos_flags & 0x0400 != 0,
-                    ));
                 }
                 let size = data_size.unwrap_or(max_size);
                 for (parent_frn, name, hidden, system, readonly, reparse) in names {
@@ -273,8 +263,8 @@ impl MftScanner {
                         name,
                         is_dir,
                         size,
-                        mtime,
-                        ctime,
+                        mtime: std_mtime.max(0),
+                        ctime: std_ctime.max(0),
                         hidden,
                         system,
                         readonly,
@@ -288,7 +278,10 @@ impl MftScanner {
     }
 
     /// Read `len` bytes at `offset` within the $MFT data, crossing run
-    /// boundaries as needed.
+    /// boundaries as needed. Contiguous stretches inside one run are fetched
+    /// with a single ReadFile straight into `out` — the $MFT is almost always
+    /// one long run, so this turns millions of per-cluster syscalls into a
+    /// handful of megabyte-sized reads.
     fn read_mft(&self, offset: u64, len: usize, out: &mut Vec<u8>) -> Result<()> {
         let bytes_per_cluster = self.bytes_per_cluster.max(512) as u64;
         let mut done = 0usize;
@@ -303,21 +296,33 @@ impl MftScanner {
             if run.lcn < 0 {
                 bail!("$MFT run at VCN {} is sparse — unsupported", run.vcn);
             }
-            let run_off = (run.lcn as u64 + (cluster - run.vcn)) * bytes_per_cluster;
-            let in_cluster = (off % bytes_per_cluster) as usize;
-            let take = (len - done).min(bytes_per_cluster as usize - in_cluster);
-            let device_off = run_off + in_cluster as u64;
-            let mut chunk = vec![0u8; take];
-            read_raw(self.vol.raw_handle(), device_off, take as u32)
-                .with_context(|| format!("reading $MFT at device offset {device_off}"))?
-                .into_iter()
-                .zip(chunk.iter_mut())
-                .for_each(|(a, b)| *b = a);
-            out.extend_from_slice(&chunk);
+            let run_end = (run.vcn + run.len) * bytes_per_cluster;
+            let take = (run_end - off).min((len - done) as u64) as usize;
+            let device_off = (run.lcn as u64 + (cluster - run.vcn)) * bytes_per_cluster + off % bytes_per_cluster;
+            let start = out.len();
+            out.resize(start + take, 0);
+            read_raw_into(
+                self.vol.raw_handle(),
+                device_off,
+                &mut out[start..],
+            )
+            .with_context(|| format!("reading $MFT at device offset {device_off}"))?;
             done += take;
         }
         Ok(())
     }
+}
+
+/// Decode a little-endian UTF-16 name via an aligned stack buffer (an NTFS
+/// name is at most 255 UTF-16 units). Avoids per-element byte assembly.
+fn utf16_name(bytes: &[u8]) -> String {
+    let mut tmp = [0u8; 510];
+    tmp[..bytes.len()].copy_from_slice(bytes);
+    // SAFETY: `tmp` is a stack array (2-aligned); u16 has no invalid bit
+    // patterns; the slice length is halved to match.
+    let units: &[u16] =
+        unsafe { std::slice::from_raw_parts(tmp.as_ptr() as *const u16, bytes.len() / 2) };
+    String::from_utf16_lossy(units)
 }
 
 // ---------------------------------------------------------------------------
@@ -346,25 +351,35 @@ fn parse_file_header(rec: &[u8]) -> Result<FileHeader> {
     })
 }
 
-/// Apply the UPDATE_SEQUENCE_ARRAY fixups, returning a patched copy.
-fn apply_fixups(rec: &[u8], sector_size: u32) -> Result<Vec<u8>> {
-    let hdr = parse_file_header(rec)?;
-    let mut out = rec.to_vec();
-    if hdr.usa_count < 2 || hdr.usa_off + hdr.usa_count * 2 > out.len() {
-        return Ok(out); // nothing to fix
+/// Apply the UPDATE_SEQUENCE_ARRAY fixups in place. Guards all offsets; on
+/// anything malformed the record is left untouched (parse will then skip it).
+/// Idempotent with respect to the USA table itself.
+fn apply_fixups_inplace(rec: &mut [u8], sector_size: u32) {
+    if rec.len() < 48 || &rec[0..4] != b"FILE" {
+        return;
     }
-    let usa: Vec<u16> = (0..hdr.usa_count)
-        .map(|i| u16::from_le_bytes([out[hdr.usa_off + i * 2], out[hdr.usa_off + i * 2 + 1]]))
-        .collect();
+    let usa_off = u16::from_le_bytes([rec[4], rec[5]]) as usize;
+    let usa_count = u16::from_le_bytes([rec[6], rec[7]]) as usize;
+    if usa_count < 2 || usa_off + usa_count * 2 > rec.len() {
+        return; // nothing to fix
+    }
     let sector = sector_size as usize;
-    for s in 1..hdr.usa_count {
+    for s in 1..usa_count {
         let end = s * sector;
-        if end + 2 > out.len() {
+        if end + 2 > rec.len() {
             break;
         }
-        out[end - 2] = (usa[s] & 0xFF) as u8;
-        out[end - 1] = (usa[s] >> 8) as u8;
+        let v = u16::from_le_bytes([rec[usa_off + s * 2], rec[usa_off + s * 2 + 1]]);
+        rec[end - 2] = v as u8;
+        rec[end - 1] = (v >> 8) as u8;
     }
+}
+
+/// Copying variant used for one-shot reads (record 0) and unit tests.
+fn apply_fixups(rec: &[u8], sector_size: u32) -> Result<Vec<u8>> {
+    parse_file_header(rec)?;
+    let mut out = rec.to_vec();
+    apply_fixups_inplace(&mut out, sector_size);
     Ok(out)
 }
 
@@ -460,6 +475,12 @@ fn parse_runlist(buf: &[u8]) -> Result<Vec<Run>> {
 /// Raw read at an absolute device offset on the volume handle.
 fn read_raw(handle: HANDLE, offset: u64, len: u32) -> Result<Vec<u8>> {
     let mut buf = vec![0u8; len as usize];
+    read_raw_into(handle, offset, &mut buf)?;
+    Ok(buf)
+}
+
+/// Raw read directly into a caller buffer (no intermediate allocation).
+fn read_raw_into(handle: HANDLE, offset: u64, buf: &mut [u8]) -> Result<()> {
     let mut pos = offset as i64;
     let ok = unsafe {
         SetFilePointerEx(
@@ -472,6 +493,7 @@ fn read_raw(handle: HANDLE, offset: u64, len: u32) -> Result<Vec<u8>> {
     if ok == 0 {
         bail!("SetFilePointerEx failed: error {}", unsafe { GetLastError() });
     }
+    let len = buf.len() as u32;
     let mut read = 0u32;
     let ok = unsafe {
         ReadFile(
@@ -488,7 +510,7 @@ fn read_raw(handle: HANDLE, offset: u64, len: u32) -> Result<Vec<u8>> {
             unsafe { GetLastError() }
         );
     }
-    Ok(buf)
+    Ok(())
 }
 
 #[cfg(test)]

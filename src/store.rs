@@ -14,6 +14,8 @@ use serde::Serialize;
 
 use crate::EntryMeta;
 use crate::basename;
+use crate::fold_lower;
+use crate::lower_rev;
 use crate::matcher::has_wildcards;
 
 const SCHEMA: &str = r#"
@@ -220,7 +222,7 @@ impl Store {
              PRAGMA synchronous=OFF;
              PRAGMA temp_store=MEMORY;
              PRAGMA locking_mode=EXCLUSIVE;
-             PRAGMA cache_size=-131072;",
+             PRAGMA cache_size=-262144;",
         )?;
         self.conn.execute_batch(
             "BEGIN;
@@ -246,12 +248,12 @@ impl Store {
             "INSERT OR IGNORE INTO files(path, path_l, name, name_l, name_r, is_dir, size, mtime, ctime, flags, frn)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         )?;
-        let fts_stmt = self.conn
-            .prepare("INSERT INTO files_fts(rowid, name_l) VALUES (?1, ?2)")?;
+        // No FTS statement: the trigram index is populated in one `rebuild`
+        // pass at commit — tokenizing 4M names as a single sorted sweep beats
+        // incremental posting maintenance row by row.
         Ok(Rebuild {
             conn: &self.conn,
             files_stmt: Some(files_stmt),
-            fts_stmt: Some(fts_stmt),
             count: 0,
             committed: false,
         })
@@ -264,16 +266,16 @@ impl Store {
         let has_sep = pattern.contains('\\') || pattern.contains('/');
         let term = if path_mode || has_sep {
             if has_wildcards(pattern) {
-                Term::PathWild(pattern.to_lowercase())
+                Term::PathWild(fold_lower(pattern))
             } else {
-                Term::PathSubstr(pattern.to_lowercase())
+                Term::PathSubstr(fold_lower(pattern))
             }
         } else if let Some(suffix) = try_suffix_literal(pattern) {
-            Term::Suffix(suffix.to_lowercase())
+            Term::Suffix(fold_lower(&suffix))
         } else if has_wildcards(pattern) {
-            Term::NameWild(pattern.to_lowercase())
+            Term::NameWild(fold_lower(pattern))
         } else {
-            Term::Name(pattern.to_lowercase())
+            Term::Name(fold_lower(pattern))
         };
         let q = crate::query::Query {
             include: vec![term],
@@ -437,10 +439,10 @@ impl Store {
     }
 
     pub fn upsert(&self, path: &str, meta: EntryMeta) -> Result<()> {
-        let path_l = path.to_lowercase();
+        let path_l = fold_lower(path);
         let name = basename(path).to_owned();
-        let name_l = name.to_lowercase();
-        let name_r: String = name_l.chars().rev().collect();
+        let name_l = fold_lower(&name);
+        let name_r = lower_rev(&name_l);
         let existing: Option<i64> = self
             .conn
             .query_row("SELECT id FROM files WHERE path = ?1", [path], |r| r.get(0))
@@ -488,19 +490,18 @@ impl Store {
 pub struct Rebuild<'a> {
     conn: &'a Connection,
     files_stmt: Option<rusqlite::Statement<'a>>,
-    fts_stmt: Option<rusqlite::Statement<'a>>,
     count: u64,
     committed: bool,
 }
 
 impl Rebuild<'_> {
     pub fn insert(&mut self, path: &str, meta: EntryMeta) -> Result<()> {
-        let path_l = path.to_lowercase();
+        let path_l = fold_lower(path);
         let name = basename(path).to_owned();
-        let name_l = name.to_lowercase();
+        let name_l = fold_lower(&name);
         // Reversed name column turns suffix wildcards (`*.rs`) into indexed
         // prefix lookups (see `search`).
-        let name_r: String = name_l.chars().rev().collect();
+        let name_r = lower_rev(&name_l);
         let changed = self
             .files_stmt
             .as_mut()
@@ -518,31 +519,24 @@ impl Rebuild<'_> {
                 meta.flags as i64,
                 meta.frn.map(|f| f as i64)
             ])?;
-        if changed == 0 {
-            // OR IGNORE swallowed a duplicate path (recycled FRN during churn)
-            // — skip the FTS row as well.
-            return Ok(());
+        if changed > 0 {
+            self.count += 1;
         }
-        let id = self.conn.last_insert_rowid();
-        self.fts_stmt
-            .as_mut()
-            .unwrap()
-            .execute(params![id, &name_l])?;
-        self.count += 1;
         Ok(())
     }
 
     pub fn commit(mut self) -> Result<u64> {
         self.files_stmt.take();
-        self.fts_stmt.take();
         self.conn.execute_batch("COMMIT;")?;
-        // Recreate the secondary indexes in bulk (sorted input beats
-        // incremental btree maintenance), refresh planner statistics, then
+        // Rebuild the trigram index in one pass from the content table, then
+        // recreate the secondary indexes in bulk (sorted input beats
+        // incremental btree maintenance), refresh planner statistics, and
         // restore the normal journal/pragmas. ANALYZE runs with temp_store
         // back on FILE to keep the transient memory footprint low.
         self.conn.execute_batch("PRAGMA temp_store=FILE;")?;
         self.conn.execute_batch(
-            "CREATE INDEX idx_files_name_l ON files(name_l);
+            "INSERT INTO files_fts(files_fts) VALUES ('rebuild');
+             CREATE INDEX idx_files_name_l ON files(name_l);
              CREATE INDEX idx_files_name_r ON files(name_r);
              CREATE INDEX idx_files_path_l ON files(path_l);
              CREATE INDEX idx_files_frn ON files(frn);

@@ -75,3 +75,30 @@ pub struct BuildReport {
 pub fn basename(p: &str) -> &str {
     p.rsplit(['\\', '/']).next().unwrap_or(p)
 }
+
+/// Lowercase with an ASCII fast path. Windows names are overwhelmingly ASCII;
+/// `str::to_lowercase` pays full Unicode processing for every one of them,
+/// which dominates build/load time at millions of rows.
+#[inline]
+pub fn fold_lower(s: &str) -> String {
+    if s.is_ascii() {
+        s.to_ascii_lowercase()
+    } else {
+        s.to_lowercase()
+    }
+}
+
+/// Reversed lowercase name (suffix searches run as prefix searches on it).
+/// Byte reversal is only valid for ASCII; non-ASCII reverses by chars so
+/// multi-byte sequences stay well-formed.
+#[inline]
+pub fn lower_rev(s: &str) -> String {
+    if s.is_ascii() {
+        let mut b = s.as_bytes().to_vec();
+        b.reverse();
+        // Reversed ASCII is still valid UTF-8.
+        String::from_utf8(b).expect("ascii is valid utf8")
+    } else {
+        s.chars().rev().collect()
+    }
+}

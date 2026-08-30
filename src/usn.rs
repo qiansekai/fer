@@ -420,6 +420,12 @@ impl TreeBuilder {
         std::str::from_utf8(&self.names[off..end]).unwrap_or("")
     }
 
+    fn name_bytes(&self, i: usize) -> &[u8] {
+        let off = self.name_off[i] as usize;
+        let end = off + self.name_len[i] as usize;
+        &self.names[off..end]
+    }
+
     /// DFS from the volume root, emitting `on_entry(full_path, meta)` for
     /// every reachable record. Returns the number of unreachable records
     /// (the volume root record itself plus orphans).
@@ -427,8 +433,17 @@ impl TreeBuilder {
         let total = self.frn.len() as u64;
         // Permutation sorted by parent FRN so children of X are a contiguous
         // range found by two binary searches — no children HashMap needed.
+        // Children additionally sorted by name: the DFS then emits paths in
+        // near-lexicographic order, which keeps the path UNIQUE/`path_l`
+        // b-tree inserts (and the index rebuilds) sequential-ish instead of
+        // random within every directory.
         let mut order: Vec<u32> = (0..self.frn.len() as u32).collect();
-        order.sort_unstable_by_key(|&i| self.parent[i as usize]);
+        order.sort_unstable_by(|&a, &b| {
+            let (a, b) = (a as usize, b as usize);
+            self.parent[a]
+                .cmp(&self.parent[b])
+                .then_with(|| self.name_bytes(a).cmp(self.name_bytes(b)))
+        });
 
         // Reusable path buffer: "D:" + pushed segments. Each recursion frame
         // truncates only its own suffix, so the prefix bytes are never touched

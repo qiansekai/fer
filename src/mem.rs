@@ -20,27 +20,95 @@
 //! lowercases them. Extremely rare in Windows paths.
 
 use std::cmp::Ordering;
+use std::fs::File;
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use rusqlite::Connection;
 
+use crate::EntryMeta;
+use crate::basename;
+use crate::fold_lower;
+use crate::lower_rev;
 use crate::query::{Query, Term};
 use crate::store::Hit;
 
+/// Dump file magic + format version.
+const MAGIC: &[u8; 8] = b"FERIDX01";
+const FORMAT_VERSION: u32 = 1;
+
+/// Fixed dump section order: entries, paths, names, revs, the six sorted
+/// permutations, then the six id lists. The header stores byte offsets for
+/// each section plus the total file length (SEC+1 table entries).
+const SEC: usize = 16;
+const HDR_LEN: usize = 32 + (SEC + 1) * 8;
+
+/// Packed, dump-stable 56-byte record. Field order groups the u64s so there
+/// is no interior padding; the dump is written/read as raw little-endian
+/// sections, so this layout is part of the on-disk format.
+#[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct Entry {
-    id: u32,
-    path_off: u32,
-    path_len: u16,
-    name_off: u32,
-    name_len: u16,
-    rev_off: u32,
-    rev_len: u16,
     size: u64,
     mtime: i64,
     ctime: i64,
+    frn: u64,
+    id: u32,
+    path_off: u32,
+    name_off: u32,
+    rev_off: u32,
+    path_len: u16,
+    name_len: u16,
+    rev_len: u16,
     flags: u8,
     is_dir: u8,
+}
+
+const _: () = assert!(std::mem::size_of::<Entry>() == 56);
+
+/// Streaming builder: feeds (path, meta) into the compact structure; IDs are
+/// assigned sequentially and FRNs carried for the monitor.
+#[derive(Default)]
+pub struct MemBuilder {
+    entries: Vec<Entry>,
+    paths: Vec<u8>,
+    names: Vec<u8>,
+    revs: Vec<u8>,
+}
+
+impl MemBuilder {
+    pub fn push(&mut self, path: &str, meta: EntryMeta) {
+        let id = self.entries.len() as u32;
+        let name = basename(path);
+        let name_l = fold_lower(name);
+        let rev = lower_rev(&name_l);
+        let po = self.paths.len() as u32;
+        self.paths.extend_from_slice(path.as_bytes());
+        let no = self.names.len() as u32;
+        self.names.extend_from_slice(name_l.as_bytes());
+        let ro = self.revs.len() as u32;
+        self.revs.extend_from_slice(rev.as_bytes());
+        self.entries.push(Entry {
+            id,
+            path_off: po,
+            path_len: path.len() as u16,
+            name_off: no,
+            name_len: name_l.len() as u16,
+            rev_off: ro,
+            rev_len: rev.len() as u16,
+            size: meta.size,
+            mtime: meta.mtime,
+            ctime: meta.ctime,
+            flags: meta.flags,
+            is_dir: meta.is_dir as u8,
+            frn: meta.frn.unwrap_or(0),
+        });
+    }
+
+    pub fn finish(self) -> MemIndex {
+        finalize(self.entries, self.paths, self.names, self.revs)
+    }
 }
 
 pub struct MemIndex {
@@ -65,7 +133,7 @@ pub struct MemIndex {
 impl MemIndex {
     pub fn load(conn: &Connection) -> Result<Self> {
         let mut stmt = conn.prepare(
-            "SELECT id, path, name_l, size, mtime, ctime, flags, is_dir FROM files ORDER BY id",
+            "SELECT id, path, name_l, size, mtime, ctime, flags, is_dir, frn FROM files ORDER BY id",
         )?;
         let mut rows = stmt.query([])?;
         let mut entries: Vec<Entry> = Vec::new();
@@ -79,7 +147,7 @@ impl MemIndex {
             }
             let path: String = row.get(1)?;
             let name_l: String = row.get(2)?;
-            let rev: String = name_l.chars().rev().collect();
+            let rev = lower_rev(&name_l);
             let po = paths.len() as u32;
             paths.extend_from_slice(path.as_bytes());
             let no = names.len() as u32;
@@ -99,71 +167,117 @@ impl MemIndex {
                 ctime: row.get(5)?,
                 flags: row.get::<_, i64>(6)? as u8,
                 is_dir: row.get::<_, i64>(7)? as u8,
+                frn: row.get::<_, Option<i64>>(8)?.map(|f| f as u64).unwrap_or(0),
             });
         }
+        Ok(finalize(entries, paths, names, revs))
+    }
 
-        let n = entries.len() as u32;
-        let mut perm: Vec<u32> = (0..n).collect();
-
-        let mut by_name = perm.clone();
-        by_name.sort_unstable_by(|&a, &b| {
-            name_of(&entries, &names, a)
-                .cmp(name_of(&entries, &names, b))
-                .then(a.cmp(&b))
-        });
-
-        let mut by_rev = perm.clone();
-        by_rev.sort_unstable_by(|&a, &b| {
-            rev_of(&entries, &revs, a)
-                .cmp(rev_of(&entries, &revs, b))
-                .then(a.cmp(&b))
-        });
-
-        let mut by_path = perm.clone();
-        by_path.sort_unstable_by(|&a, &b| {
-            ci_cmp(path_of(&entries, &paths, a), path_of(&entries, &paths, b)).then(a.cmp(&b))
-        });
-
-        let mut by_size = perm.clone();
-        by_size.sort_unstable_by(|&a, &b| {
-            (entries[a as usize].size, a).cmp(&(entries[b as usize].size, b))
-        });
-        let mut by_mtime = perm.clone();
-        by_mtime.sort_unstable_by(|&a, &b| {
-            (entries[a as usize].mtime, a).cmp(&(entries[b as usize].mtime, b))
-        });
-        let mut by_ctime = perm.clone();
-        by_ctime.sort_unstable_by(|&a, &b| {
-            (entries[a as usize].ctime, a).cmp(&(entries[b as usize].ctime, b))
-        });
-        perm.clear();
-
-        let mut dir_ids = Vec::new();
-        let mut file_ids = Vec::new();
-        let mut hidden_ids = Vec::new();
-        let mut system_ids = Vec::new();
-        let mut readonly_ids = Vec::new();
-        let mut reparse_ids = Vec::new();
-        for e in &entries {
-            if e.is_dir != 0 {
-                dir_ids.push(e.id);
-            } else {
-                file_ids.push(e.id);
-            }
-            if e.flags & crate::EntryMeta::FLAG_HIDDEN != 0 {
-                hidden_ids.push(e.id);
-            }
-            if e.flags & crate::EntryMeta::FLAG_SYSTEM != 0 {
-                system_ids.push(e.id);
-            }
-            if e.flags & crate::EntryMeta::FLAG_READONLY != 0 {
-                readonly_ids.push(e.id);
-            }
-            if e.flags & crate::EntryMeta::FLAG_REPARSE != 0 {
-                reparse_ids.push(e.id);
-            }
+    /// Serialize the finished index (packed entries + arenas + permutations)
+    /// as one contiguous dump. Written to a temp file then renamed, so a crash
+    /// either leaves the previous dump or no dump at all.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let n = self.entries.len();
+        anyhow::ensure!(n <= u32::MAX as usize, "too many entries for the dump format");
+        let mut tmp = std::ffi::OsString::from(path.as_os_str());
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        let file = File::create(&tmp)?;
+        let mut w = BufWriter::with_capacity(1 << 21, file);
+        let mut offs = [0u64; SEC + 1];
+        w.write_all(&[0u8; HDR_LEN])?; // header placeholder, rewritten below
+        let mut off = HDR_LEN as u64;
+        let secs: [&[u8]; SEC] = [
+            pod_bytes(&self.entries),
+            &self.paths,
+            &self.names,
+            &self.revs,
+            pod_bytes(&self.by_path),
+            pod_bytes(&self.by_name),
+            pod_bytes(&self.by_rev),
+            pod_bytes(&self.by_size),
+            pod_bytes(&self.by_mtime),
+            pod_bytes(&self.by_ctime),
+            pod_bytes(&self.dir_ids),
+            pod_bytes(&self.file_ids),
+            pod_bytes(&self.hidden_ids),
+            pod_bytes(&self.system_ids),
+            pod_bytes(&self.readonly_ids),
+            pod_bytes(&self.reparse_ids),
+        ];
+        for (i, bytes) in secs.into_iter().enumerate() {
+            offs[i] = off;
+            w.write_all(bytes)?;
+            off += bytes.len() as u64;
         }
+        offs[SEC] = off;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let mut hdr = Vec::with_capacity(HDR_LEN);
+        hdr.extend_from_slice(MAGIC);
+        hdr.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        hdr.extend_from_slice(&(n as u32).to_le_bytes());
+        hdr.extend_from_slice(&now.to_le_bytes()); // created (informational)
+        hdr.extend_from_slice(&0i64.to_le_bytes()); // reserved
+        for o in offs {
+            hdr.extend_from_slice(&o.to_le_bytes());
+        }
+        let mut file = w.into_inner()?;
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(&hdr)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
 
+    /// Load a dump written by [`MemIndex::save`] — a straight sequential read
+    /// at disk speed, no SQLite walk and no re-sorting.
+    pub fn load_dump(path: &Path) -> Result<Self> {
+        let file = File::open(path)?;
+        let mut r = BufReader::with_capacity(1 << 21, file);
+        let mut hdr = [0u8; HDR_LEN];
+        r.read_exact(&mut hdr)?;
+        if hdr[0..8] != *MAGIC {
+            bail!("not a FERIDX dump: {}", path.display());
+        }
+        let version = u32::from_le_bytes(hdr[8..12].try_into().unwrap());
+        if version != FORMAT_VERSION {
+            bail!("dump format v{version} unsupported (want v{FORMAT_VERSION})");
+        }
+        let n = u32::from_le_bytes(hdr[12..16].try_into().unwrap()) as usize;
+        let mut offs = [0u64; SEC + 1];
+        for (i, o) in offs.iter_mut().enumerate() {
+            *o = u64::from_le_bytes(hdr[32 + i * 8..40 + i * 8].try_into().unwrap());
+        }
+        let file_len = r.get_ref().metadata()?.len();
+        anyhow::ensure!(
+            offs[0] == HDR_LEN as u64
+                && offs[SEC] == file_len
+                && offs.windows(2).all(|w| w[0] <= w[1])
+                && (offs[1] - offs[0]) as usize == n * std::mem::size_of::<Entry>(),
+            "dump layout corrupt: {}",
+            path.display()
+        );
+        let entries = read_pod::<Entry>(&mut r, n)?;
+        let paths = read_pod::<u8>(&mut r, (offs[2] - offs[1]) as usize)?;
+        let names = read_pod::<u8>(&mut r, (offs[3] - offs[2]) as usize)?;
+        let revs = read_pod::<u8>(&mut r, (offs[4] - offs[3]) as usize)?;
+        let by_path = read_pod::<u32>(&mut r, n)?;
+        let by_name = read_pod::<u32>(&mut r, n)?;
+        let by_rev = read_pod::<u32>(&mut r, n)?;
+        let by_size = read_pod::<u32>(&mut r, n)?;
+        let by_mtime = read_pod::<u32>(&mut r, n)?;
+        let by_ctime = read_pod::<u32>(&mut r, n)?;
+        let list_len = |i: usize| ((offs[i + 1] - offs[i]) / 4) as usize;
+        let dir_ids = read_pod::<u32>(&mut r, list_len(10))?;
+        let file_ids = read_pod::<u32>(&mut r, list_len(11))?;
+        let hidden_ids = read_pod::<u32>(&mut r, list_len(12))?;
+        let system_ids = read_pod::<u32>(&mut r, list_len(13))?;
+        let readonly_ids = read_pod::<u32>(&mut r, list_len(14))?;
+        let reparse_ids = read_pod::<u32>(&mut r, list_len(15))?;
         Ok(MemIndex {
             entries,
             paths,
@@ -468,6 +582,141 @@ impl MemIndex {
 
 // ---------------------------------------------------------------------------
 // pure helpers
+
+/// Build the query permutations (sorted id arrays) from the packed entries.
+/// The six sorts and the attribute filter pass are independent — they run on
+/// scoped threads, so finalizing a 4M-entry index takes a few hundred
+/// milliseconds instead of a serial second-plus.
+fn finalize(entries: Vec<Entry>, paths: Vec<u8>, names: Vec<u8>, revs: Vec<u8>) -> MemIndex {
+    let n = entries.len();
+    let seq = (0..n as u32).collect::<Vec<u32>>();
+    let mut by_path = seq.clone();
+    let mut by_name = seq.clone();
+    let mut by_rev = seq.clone();
+    let mut by_size = seq;
+    let mut by_mtime = (0..n as u32).collect::<Vec<u32>>();
+    let mut by_ctime = (0..n as u32).collect::<Vec<u32>>();
+    let mut dir_ids: Vec<u32> = Vec::new();
+    let mut file_ids: Vec<u32> = Vec::new();
+    let mut hidden_ids: Vec<u32> = Vec::new();
+    let mut system_ids: Vec<u32> = Vec::new();
+    let mut readonly_ids: Vec<u32> = Vec::new();
+    let mut reparse_ids: Vec<u32> = Vec::new();
+    let e: &[Entry] = &entries;
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            by_path.sort_unstable_by(|&a, &b| {
+                ci_cmp(path_of(e, &paths, a), path_of(e, &paths, b))
+            });
+        });
+        s.spawn(|| {
+            by_name.sort_unstable_by(|&a, &b| {
+                name_of(e, &names, a).cmp(name_of(e, &names, b))
+            });
+        });
+        s.spawn(|| {
+            by_rev.sort_unstable_by(|&a, &b| {
+                rev_of(e, &revs, a).cmp(rev_of(e, &revs, b))
+            });
+        });
+        s.spawn(|| by_size.sort_unstable_by_key(|&i| e[i as usize].size));
+        s.spawn(|| {
+            by_mtime.sort_unstable_by_key(|&i| e[i as usize].mtime);
+            by_ctime.sort_unstable_by_key(|&i| e[i as usize].ctime);
+        });
+        s.spawn(|| {
+            for t in e {
+                let id = t.id;
+                if t.is_dir != 0 {
+                    dir_ids.push(id);
+                } else {
+                    file_ids.push(id);
+                }
+                if t.flags & 1 != 0 {
+                    hidden_ids.push(id);
+                }
+                if t.flags & 2 != 0 {
+                    system_ids.push(id);
+                }
+                if t.flags & 4 != 0 {
+                    readonly_ids.push(id);
+                }
+                if t.flags & 8 != 0 {
+                    reparse_ids.push(id);
+                }
+            }
+        });
+    });
+    MemIndex {
+        entries,
+        paths,
+        names,
+        revs,
+        by_path,
+        by_name,
+        by_rev,
+        by_size,
+        by_mtime,
+        by_ctime,
+        dir_ids,
+        file_ids,
+        hidden_ids,
+        system_ids,
+        readonly_ids,
+        reparse_ids,
+    }
+}
+
+/// Byte view of a POD slice — Entry/u32/u8 are plain integers with no invalid
+/// bit patterns and no padding hazards, so raw sections are dump-stable.
+fn pod_bytes<T>(v: &[T]) -> &[u8] {
+    // SAFETY: any byte pattern is a valid value of these integer types; the
+    // length is scaled by size_of::<T>.
+    unsafe { std::slice::from_raw_parts(v.as_ptr().cast(), std::mem::size_of_val(v)) }
+}
+
+/// Read `n` POD values into a freshly allocated, correctly aligned Vec with a
+/// single read_exact.
+fn read_pod<T: Copy>(r: &mut impl Read, n: usize) -> Result<Vec<T>> {
+    let mut v: Vec<T> = Vec::with_capacity(n);
+    // SAFETY: the Vec allocation is aligned and sized for n values of T; the
+    // byte view covers exactly that region; set_len only after a successful
+    // read_exact, and any bytes form valid integer values.
+    let bytes = unsafe {
+        std::slice::from_raw_parts_mut(v.as_mut_ptr().cast(), n * std::mem::size_of::<T>())
+    };
+    r.read_exact(bytes)?;
+    unsafe { v.set_len(n) };
+    Ok(v)
+}
+
+/// Dump file path companion to the SQLite db ("index.db" → "index.db.feridx").
+pub fn dump_path(db: &Path) -> PathBuf {
+    let mut p = std::ffi::OsString::from(db.as_os_str());
+    p.push(".feridx");
+    PathBuf::from(p)
+}
+
+/// True when a dump exists and is at least as new as the db, including its
+/// -wal sidecar (monitor writes land there between checkpoints). A stale dump
+/// must not answer queries — callers fall back to SQL.
+pub fn dump_is_fresh(db: &Path) -> bool {
+    let dump = dump_path(db);
+    let Ok(dump_m) = std::fs::metadata(&dump).and_then(|m| m.modified()) else {
+        return false;
+    };
+    let mut wal = std::ffi::OsString::from(db.as_os_str());
+    wal.push("-wal");
+    let db_m = [db.to_path_buf(), PathBuf::from(wal)]
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok())
+        .filter_map(|m| m.modified().ok())
+        .max();
+    match db_m {
+        Some(t) => dump_m >= t,
+        None => true,
+    }
+}
 
 fn name_of<'a>(entries: &'a [Entry], names: &'a [u8], i: u32) -> &'a [u8] {
     let e = &entries[i as usize];

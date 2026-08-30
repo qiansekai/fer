@@ -2,6 +2,10 @@
 
 Everything 级文件搜索引擎的 Rust 重写。本文件是给后续 agent 会话的速查卡。
 
+> ⚠️ **进行中（2026-08-31）**：性能优化会话中途额度耗尽。5 个文件已改未提交
+> （mft/usn/lib/store/mem），`cargo check` 已过但**测试未跑、未实测**。
+> 状态、dump 格式契约、剩余 TODO 全在 **[HANDOFF.md](HANDOFF.md)**——先读它再动手。
+
 ## 一句话
 
 `fer`（本仓库产物）用原始 NTFS `$MFT` 扫描建索引（硬链接别名/大小/时间/属性全量），
