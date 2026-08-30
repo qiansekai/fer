@@ -142,29 +142,41 @@ cargo test --test live_volume -- --ignored --nocapture   # 真实卷（需管理
 真实卷测试断言：MFT 扫描 >10 万文件、`hosts` 命中、**硬链接别名 System32\ntdll.dll 命中**、
 元数据 size 真实、搜索 <1s。与 Everything(es) 交叉验证见提交历史中的验证记录。
 
-## 实测性能（本机 6 卷 · 全盘 358 万文件）
+## 实测性能（本机 6 卷 · 全盘 416.8 万条 · dump v3 · 2026-09 基准）
 
-| 查询 | 结果数 | 耗时 |
-|------|-------:|-----:|
-| `*.rs`（后缀） | 40,067 | 16 ms |
-| `*.jpg`（后缀） | 109,726 | 11 ms |
-| `Cargo.toml`（子串） | 2,603 | ~20 ms |
-| `ntdll.dll`（含硬链接别名） | 61 | ~10 ms |
-| `dm:thisweek`（mtime 索引） | 1,701,682 | 39 ms |
-| `hidden:true`（部分索引） | 583 | ~0 ms |
-| `ext:mp4 size:>100mb` | 42 | 9 ms |
-| `parent:D:\Kita-Tools\Coding` | 77,899 | 57 ms |
-| `报告`（2 字 CJK） | 41 | 61-153 ms（内存扫描） |
-| `Cargo.toml`（名字子串） | 2,603 | 55 ms |
-| `dm:thisweek`（127 万命中） | 1,267,567 | 29-51 ms |
-| `*.rs` / `main*.rs` | 40,075 / 161 | **0-6 ms** |
-| 路径子串（含 `\` 裸词） | 84,166 | 232-290 ms |
+CLI 全查询 3 轮取 min/median（每项均含进程启动 + dump mmap 加载）：
 
-索引构建：全盘 ~416 万条（MFT 路径含硬链接别名），**热缓存 ~11s / 冷盘 ~40-50s**
-（MFT 扫描 43s 是磁盘物理下限），构建收尾原子写 **FERIDX01 dump**（~1GB）。
-- **serve**：mmap 零拷贝加载，**启动 ~135ms**（含进程启动），全查询 0-232ms
-- **CLI**：同样零拷贝，**全查询 17-336ms**（含进程启动），无 SQLite、无门控
-- **monitor**：USN 增量进内存，默认每 60s 防抖写回 dump（`--flush-secs` 可调）
+| 类别 | 查询 | 结果数 | min | median |
+|------|------|-------:|----:|-------:|
+| 后缀 | `*.rs` | 40,076 | 2 ms | 2 ms |
+| 后缀 | `*.jpg` | 109,730 | 4 ms | 5 ms |
+| 扩展名 | `ext:rs` | 40,076 | 2 ms | 2 ms |
+| 通配符 | `main*.rs` | 161 | 6 ms | 6 ms |
+| 大小 | `size:>1mb` | 52,327 | 10 ms | 10 ms |
+| mtime | `dm:thisweek` | 1,273,577 | 43 ms | 47 ms |
+| 目录 | `type:dir` | 573,127 | **1 ms** | 1 ms |
+| 文件 | `type:file` | 3,595,317 | 6 ms | 6 ms |
+| 隐藏 | `hidden:true` | 583 | **0 ms** | 0 ms |
+| 取反 | `!hidden:true` | 4,167,861 | 63 ms | 73 ms |
+| 父目录 | `parent:D:\Kita-Tools` | 2,546,957 | 72 ms | 81 ms |
+| 交集 | `ext:rs size:>1mb` | 98 | 9 ms | 10 ms |
+| 混合 | `dm:thisweek type:file` | 1,028,236 | 53 ms | 57 ms |
+| 2 字子串 | `rs` | 183,817 | 158 ms | 168 ms（全名扫描） |
+| 2 字 CJK | `报告` | 40 | 152 ms | 158 ms（全名扫描） |
+| 长子串 | `report` | 7,440 | 167 ms | 171 ms（全名扫描） |
+| 路径子串 | `Kita-Tools\Coding`（含 `\`） | 86,189 | 281 ms | 294 ms |
+| 并行 | `report 报告`（两全扫合取） | 0 | 158 ms | 166 ms（≈单扫描） |
+
+索引构建：全盘 416.8 万条（MFT 路径含硬链接别名），**热缓存 12.3s / 冷盘 ~40-50s**
+（MFT 扫描是磁盘物理下限），收尾原子写 **FERIDX01 dump**（1021MB，写出 2.4s）。
+- **serve**：mmap 零拷贝加载，**进程启动→listening 86ms**；HTTP 查询（热页）：
+  `ext:rs` 2ms、`type:dir` 1ms、`dm:thisweek type:file` 34ms；逻辑内存 1021MB /
+  RSS 350MB（mmap 按需缺页，OS 可回收）
+- **CLI**：全查询 **0-294ms**（含进程启动 + dump 加载），无 SQLite、无门控
+- **monitor**：USN 增量进内存（by_frn 二分 + 删除影子集），默认每 60s 防抖写回 dump
+  （`--flush-secs` 可调）；flush 走 arena 直达复用（零 String 分配）
+- **编译**：`cargo check` 6.9s（不编 SQLite）；release 1.81MB / `--profile min-size`
+  1.58MB；clippy 0 警告
 
 ## 已知限制 / TODO
 
