@@ -117,6 +117,20 @@ impl MemBuilder {
 }
 
 pub struct MemIndex {
+    keep: Keep,
+    sec: Sections,
+}
+
+/// What keeps the section memory alive. `Owned` holds the Vecs produced by
+/// finalize (their heap buffers are stable across moves, so the raw pointers
+/// in `Sections` stay valid); `Mapped` holds the mmap of a dump file.
+enum Keep {
+    Owned(OwnedData),
+    Mapped(memmap2::Mmap),
+}
+
+#[derive(Default)]
+struct OwnedData {
     entries: Vec<Entry>,
     paths: Vec<u8>,
     names: Vec<u8>,
@@ -133,6 +147,75 @@ pub struct MemIndex {
     system_ids: Vec<u32>,
     readonly_ids: Vec<u32>,
     reparse_ids: Vec<u32>,
+}
+
+/// Immutable pointer+len slice view. Backed either by the owned Vecs or by the
+/// mmap'd dump; read-only after construction. Send/Sync are implemented
+/// manually because raw pointers are !Send — soundness rests on the sections
+/// never being mutated or reallocated once published (MemIndex is read-only).
+#[derive(Clone, Copy)]
+struct View<T> {
+    ptr: *const T,
+    len: usize,
+}
+
+unsafe impl<T: Send + Sync> Send for View<T> {}
+unsafe impl<T: Send + Sync> Sync for View<T> {}
+
+impl<T> View<T> {
+    fn from_slice(s: &[T]) -> Self {
+        View { ptr: s.as_ptr(), len: s.len() }
+    }
+    fn slice(&self) -> &[T] {
+        // SAFETY: the pointer/len were captured from a live allocation (owned
+        // Vec or mapping) that `Keep` still owns, and are never mutated.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+impl<T> std::ops::Deref for View<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        self.slice()
+    }
+}
+
+impl<'a, T> IntoIterator for &'a View<T> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.slice().iter()
+    }
+}
+
+/// The sixteen dump sections as views; `MemIndex` derefs to this, so query
+/// code reads `self.entries` etc. exactly as if they were owned slices.
+/// (`pub` only because `Deref` exposes it in the public interface.)
+#[derive(Clone, Copy)]
+pub struct Sections {
+    entries: View<Entry>,
+    paths: View<u8>,
+    names: View<u8>,
+    revs: View<u8>,
+    by_path: View<u32>,
+    by_name: View<u32>,
+    by_rev: View<u32>,
+    by_size: View<u32>,
+    by_mtime: View<u32>,
+    by_ctime: View<u32>,
+    dir_ids: View<u32>,
+    file_ids: View<u32>,
+    hidden_ids: View<u32>,
+    system_ids: View<u32>,
+    readonly_ids: View<u32>,
+    reparse_ids: View<u32>,
+}
+
+impl std::ops::Deref for MemIndex {
+    type Target = Sections;
+    fn deref(&self) -> &Sections {
+        &self.sec
+    }
 }
 
 impl MemIndex {
@@ -253,19 +336,15 @@ impl MemIndex {
     }
 
     /// Load a dump written by [`MemIndex::save`] — zero-copy: the file is
-    /// memory-mapped (deliberately leaked for the process lifetime) and every
-    /// section becomes a zero-capacity `Vec` view over the mapping. Queries
-    /// page in only the pages they touch; a ~1 GB index loads in ~1 ms.
+    /// memory-mapped and every section becomes a view over the mapping, so
+    /// queries page in only the pages they touch (a ~1 GB index loads in
+    /// ~1 ms). The mapping is kept alive by the returned index and unmapped
+    /// when it is dropped.
     pub fn load_dump(path: &Path) -> Result<Self> {
         let file = File::open(path)?;
         let len = file.metadata()?.len();
         let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
-        // SAFETY: the mapping is leaked, so its bytes stay valid for the rest
-        // of the process. The zero-capacity Vecs built below never deallocate
-        // this memory (dropping a Vec with capacity 0 performs no free).
-        let buf: &'static [u8] =
-            unsafe { std::slice::from_raw_parts(mmap.as_ptr(), len as usize) };
-        std::mem::forget(mmap);
+        let buf: &[u8] = &mmap;
         if buf.len() < HDR_LEN || buf[0..8] != *MAGIC {
             bail!("not a FERIDX dump: {}", path.display());
         }
@@ -298,37 +377,36 @@ impl MemIndex {
             "dump layout corrupt: {}",
             path.display()
         );
-        let view = |i: usize| -> &'static [u8] { &buf[offs[i] as usize..offs[i + 1] as usize] };
-        let view_at = |start: u64, len: usize| -> &'static [u8] {
+        let view = |i: usize| -> &[u8] { &buf[offs[i] as usize..offs[i + 1] as usize] };
+        let view_at = |start: u64, len: usize| -> &[u8] {
             &buf[start as usize..start as usize + len]
         };
-        // SAFETY (cast): each section starts 8-byte aligned; Entry/u32/u8 have
-        // no invalid bit patterns; capacity 0 means the Vec never frees the
-        // mapped memory it views.
-        fn cast<T: Copy>(b: &'static [u8]) -> Vec<T> {
-            let n = b.len() / std::mem::size_of::<T>();
-            unsafe { Vec::from_raw_parts(b.as_ptr().cast::<T>() as *mut T, n, 0) }
+        // SAFETY (view_of): each section starts 8-byte aligned; Entry/u32/u8
+        // have no invalid bit patterns.
+        fn view_of<T>(b: &[u8]) -> View<T> {
+            View { ptr: b.as_ptr().cast::<T>(), len: b.len() / std::mem::size_of::<T>() }
         }
         let entry_bytes = n * std::mem::size_of::<Entry>();
         let perm_bytes = n * 4;
-        Ok(MemIndex {
-            entries: cast(view_at(offs[0], entry_bytes)),
-            paths: cast(view(1)),
-            names: cast(view(2)),
-            revs: cast(view(3)),
-            by_path: cast(view_at(offs[4], perm_bytes)),
-            by_name: cast(view_at(offs[5], perm_bytes)),
-            by_rev: cast(view_at(offs[6], perm_bytes)),
-            by_size: cast(view_at(offs[7], perm_bytes)),
-            by_mtime: cast(view_at(offs[8], perm_bytes)),
-            by_ctime: cast(view_at(offs[9], perm_bytes)),
-            dir_ids: cast(view_at(offs[10], counts[0] * 4)),
-            file_ids: cast(view_at(offs[11], counts[1] * 4)),
-            hidden_ids: cast(view_at(offs[12], counts[2] * 4)),
-            system_ids: cast(view_at(offs[13], counts[3] * 4)),
-            readonly_ids: cast(view_at(offs[14], counts[4] * 4)),
-            reparse_ids: cast(view_at(offs[15], counts[5] * 4)),
-        })
+        let sec = Sections {
+            entries: view_of(view_at(offs[0], entry_bytes)),
+            paths: view_of(view(1)),
+            names: view_of(view(2)),
+            revs: view_of(view(3)),
+            by_path: view_of(view_at(offs[4], perm_bytes)),
+            by_name: view_of(view_at(offs[5], perm_bytes)),
+            by_rev: view_of(view_at(offs[6], perm_bytes)),
+            by_size: view_of(view_at(offs[7], perm_bytes)),
+            by_mtime: view_of(view_at(offs[8], perm_bytes)),
+            by_ctime: view_of(view_at(offs[9], perm_bytes)),
+            dir_ids: view_of(view_at(offs[10], counts[0] * 4)),
+            file_ids: view_of(view_at(offs[11], counts[1] * 4)),
+            hidden_ids: view_of(view_at(offs[12], counts[2] * 4)),
+            system_ids: view_of(view_at(offs[13], counts[3] * 4)),
+            readonly_ids: view_of(view_at(offs[14], counts[4] * 4)),
+            reparse_ids: view_of(view_at(offs[15], counts[5] * 4)),
+        };
+        Ok(MemIndex { keep: Keep::Mapped(mmap), sec })
     }
 
     pub fn len(&self) -> usize {
@@ -534,9 +612,9 @@ impl MemIndex {
             ),
             Term::IsDir(b) => {
                 if *b {
-                    self.dir_ids.clone()
+                    self.dir_ids.to_vec()
                 } else {
-                    self.file_ids.clone()
+                    self.file_ids.to_vec()
                 }
             }
             Term::Flag { bit, on } => {
@@ -547,7 +625,7 @@ impl MemIndex {
                     _ => &self.reparse_ids,
                 };
                 if *on {
-                    list.clone()
+                    list.to_vec()
                 } else {
                     let mut out = self.all_ids();
                     out.retain(|id| !list.binary_search(id).is_ok());
@@ -793,7 +871,7 @@ fn finalize(entries: Vec<Entry>, paths: Vec<u8>, names: Vec<u8>, revs: Vec<u8>) 
             }
         });
     });
-    MemIndex {
+    MemIndex::from_owned(OwnedData {
         entries,
         paths,
         names,
@@ -810,6 +888,33 @@ fn finalize(entries: Vec<Entry>, paths: Vec<u8>, names: Vec<u8>, revs: Vec<u8>) 
         system_ids,
         readonly_ids,
         reparse_ids,
+    })
+}
+
+impl MemIndex {
+    /// Publish owned sections as views. The Vec heap buffers are stable across
+    /// moves, so the captured pointers stay valid after this — provided the
+    /// Vecs are never mutated again (MemIndex is read-only by contract).
+    fn from_owned(o: OwnedData) -> MemIndex {
+        let sec = Sections {
+            entries: View::from_slice(&o.entries),
+            paths: View::from_slice(&o.paths),
+            names: View::from_slice(&o.names),
+            revs: View::from_slice(&o.revs),
+            by_path: View::from_slice(&o.by_path),
+            by_name: View::from_slice(&o.by_name),
+            by_rev: View::from_slice(&o.by_rev),
+            by_size: View::from_slice(&o.by_size),
+            by_mtime: View::from_slice(&o.by_mtime),
+            by_ctime: View::from_slice(&o.by_ctime),
+            dir_ids: View::from_slice(&o.dir_ids),
+            file_ids: View::from_slice(&o.file_ids),
+            hidden_ids: View::from_slice(&o.hidden_ids),
+            system_ids: View::from_slice(&o.system_ids),
+            readonly_ids: View::from_slice(&o.readonly_ids),
+            reparse_ids: View::from_slice(&o.reparse_ids),
+        };
+        MemIndex { keep: Keep::Owned(o), sec }
     }
 }
 
