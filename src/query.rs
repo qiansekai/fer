@@ -179,8 +179,7 @@ fn parse_size(value: &str) -> Result<(Option<u64>, Option<u64>)> {
     Ok((Some(n), Some(n.saturating_add(1))))
 }
 
-fn parse_bytes(s: &str) -> Result<u64> {
-    let s = s.trim();
+pub fn parse_bytes(s: &str) -> Result<u64> {    let s = s.trim();
     let (num, mult) = if let Some(n) = s.strip_suffix("gb") {
         (n, 1u64 << 30)
     } else if let Some(n) = s.strip_suffix("mb") {

@@ -618,7 +618,7 @@ pub(crate) fn try_suffix_literal(glob: &str) -> Option<String> {
 }
 
 /// Escape a string for inlining as a SQL string literal.
-fn sql_literal(s: &str) -> String {
+pub(crate) fn sql_literal(s: &str) -> String {
     s.replace('\'', "''")
 }
 
@@ -811,7 +811,7 @@ mod tests {
 
     #[test]
     fn suffix_path_with_special_chars() {
-        let (_d, mut store) = test_store();
+        let (_d, store) = test_store();
         {
             let mut rb = store.begin_rebuild().unwrap();
             rb.insert(r"D:\x\100%.txt", meta(false)).unwrap();

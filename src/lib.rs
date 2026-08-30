@@ -9,6 +9,7 @@
 //! * `monitor` — USN journal polling to keep the index live
 //! * `server`  — HTTP API (axum) with a minimal web UI
 
+pub mod dupes;
 pub mod indexer;
 pub mod matcher;
 pub mod mem;

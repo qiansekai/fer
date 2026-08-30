@@ -66,6 +66,18 @@ enum Cmd {
     Stats,
     /// Compact the database file (one-off maintenance after migrations)
     Vacuum,
+    /// Find duplicate files (same size + identical content)
+    Dupes {
+        /// Only consider files at least this big (e.g. 1kb, 10mb)
+        #[arg(long, default_value = "1kb")]
+        min_size: String,
+        /// Only consider files whose name contains this substring
+        #[arg(long)]
+        name: Option<String>,
+        /// Maximum duplicate groups to report
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
 }
 
 fn default_db() -> PathBuf {
@@ -207,6 +219,66 @@ fn main() -> Result<()> {
             store.vacuum()?;
             println!("vacuumed {}", db.display());
         }
+        Cmd::Dupes { min_size, name, limit } => {
+            let min = file_engine_rust::query::parse_bytes(&min_size)?;
+            let store = Store::open(&db)?;
+            let mut last_log = std::time::Instant::now();
+            let report = file_engine_rust::dupes::find(
+                &store,
+                min,
+                name.as_deref(),
+                limit,
+                |n| {
+                    if last_log.elapsed().as_millis() > 2000 {
+                        eprintln!("[dupes] {n} files hashed ...");
+                        last_log = std::time::Instant::now();
+                    }
+                },
+            )?;
+            if cli.json {
+                print_json(json!({
+                    "ok": true,
+                    "groups": report.groups,
+                    "wasted_bytes": report.wasted_bytes,
+                    "files_hashed": report.files_hashed,
+                    "skipped": report.skipped,
+                }))?;
+            } else {
+                for g in &report.groups {
+                    println!(
+                        "{}  x{}  wasted {}",
+                        fmt_bytes(g.size),
+                        g.paths.len(),
+                        fmt_bytes(g.size * (g.paths.len() as u64 - 1))
+                    );
+                    for p in &g.paths {
+                        println!("    {p}");
+                    }
+                }
+                println!(
+                    "{} duplicate groups, {} wasted, {} files hashed ({} skipped)",
+                    report.groups.len(),
+                    fmt_bytes(report.wasted_bytes),
+                    report.files_hashed,
+                    report.skipped
+                );
+            }
+        }
     }
     Ok(())
+}
+
+fn fmt_bytes(n: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    if n >= GB {
+        format!("{:.2} GB", n as f64 / GB as f64)
+    } else if n >= MB {
+        format!("{:.2} MB", n as f64 / MB as f64)
+    } else if n >= KB {
+        format!("{:.2} KB", n as f64 / KB as f64)
+    } else {
+        format!("{n} B")
+    }
 }
