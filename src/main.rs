@@ -50,6 +50,10 @@ enum Cmd {
     Serve {
         #[arg(long, default_value = "127.0.0.1:9876")]
         addr: String,
+        /// Disable the in-memory name index (saves ~120 MB; 1-2 char queries
+        /// fall back to the slower SQL scan)
+        #[arg(long)]
+        no_mem_index: bool,
     },
     /// Watch the USN journal and keep the index live (requires admin)
     Monitor {
@@ -162,10 +166,10 @@ fn main() -> Result<()> {
                 );
             }
         }
-        Cmd::Serve { addr } => {
+        Cmd::Serve { addr, no_mem_index } => {
             let store = Store::open(&db)?;
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(file_engine_rust::server::serve(&addr, store))?;
+            rt.block_on(file_engine_rust::server::serve(&addr, store, !no_mem_index))?;
         }
         Cmd::Monitor {
             volume,

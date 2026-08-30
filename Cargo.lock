@@ -264,6 +264,7 @@ dependencies = [
  "axum",
  "chrono",
  "clap",
+ "memchr",
  "rusqlite",
  "serde",
  "serde_json",

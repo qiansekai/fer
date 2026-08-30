@@ -11,6 +11,7 @@
 
 pub mod indexer;
 pub mod matcher;
+pub mod mem;
 pub mod mft;
 pub mod monitor;
 pub mod query;

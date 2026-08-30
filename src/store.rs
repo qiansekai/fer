@@ -147,6 +147,44 @@ impl Store {
         &self.db_path
     }
 
+    /// Raw connection (for the in-memory index loader).
+    pub fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
+    /// Build the serve-mode in-memory name index from the current data.
+    pub fn load_mem_index(&self) -> Result<crate::mem::MemIndex> {
+        crate::mem::MemIndex::load(&self.conn)
+    }
+
+    /// Fetch full hits for a set of file ids, preserving the input order
+    /// (used by the serve-mode memory index).
+    pub fn fetch_ids(&self, ids: &[i64]) -> Result<Vec<Hit>> {
+        let row = |r: &rusqlite::Row<'_>| -> rusqlite::Result<Hit> {
+            Ok(Hit {
+                path: r.get(0)?,
+                is_dir: r.get::<_, i64>(1)? != 0,
+                size: r.get::<_, i64>(2)? as u64,
+                mtime: r.get(3)?,
+                ctime: r.get(4)?,
+                flags: r.get::<_, i64>(5)? as u8,
+            })
+        };
+        let mut out = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(500) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                "SELECT path, is_dir, size, mtime, ctime, flags FROM files WHERE id IN ({placeholders})"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let params = rusqlite::params_from_iter(chunk.iter().copied());
+            for h in stmt.query_map(params, row)? {
+                out.push(h?);
+            }
+        }
+        Ok(out)
+    }
+
     /// Start a full rebuild. Old rows are wiped; inserts are buffered in one
     /// transaction with `synchronous=OFF` for speed and restored on commit.
     /// Takes `&self` (Connection is internally mutable) so the store stays

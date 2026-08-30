@@ -19,11 +19,33 @@ use crate::usn;
 #[derive(Clone)]
 struct AppState {
     db: Arc<Mutex<Store>>,
+    mem: Option<Arc<crate::mem::MemIndex>>,
 }
 
-pub async fn serve(addr: &str, store: Store) -> Result<()> {
+pub async fn serve(addr: &str, store: Store, mem_index: bool) -> Result<()> {
+    let mem = if mem_index {
+        let t = std::time::Instant::now();
+        match store.load_mem_index() {
+            Ok(m) => {
+                eprintln!(
+                    "[server] memory index loaded: {} entries, {} MB in {} ms",
+                    m.len(),
+                    m.memory_bytes() / (1 << 20),
+                    t.elapsed().as_millis()
+                );
+                Some(Arc::new(m))
+            }
+            Err(e) => {
+                eprintln!("[server] memory index failed ({e:#}) — falling back to SQL");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let state = AppState {
         db: Arc::new(Mutex::new(store)),
+        mem,
     };
     let app = Router::new()
         .route("/", get(index_page))
@@ -55,22 +77,44 @@ struct SearchQuery {
 async fn search(State(st): State<AppState>, Query(q): Query<SearchQuery>) -> Json<Value> {
     let t = std::time::Instant::now();
     let limit = q.limit.map(|l| l.min(10_000));
-    let result = {
-        let store = st.db.lock().unwrap();
-        match crate::query::Query::parse(&q.q) {
-            Err(e) => json!({ "ok": false, "error": e.to_string() }),
-            Ok(query) => match store.search_query(&query, limit) {
-                Ok(r) => json!({
+    let parsed = match crate::query::Query::parse(&q.q) {
+        Ok(p) => p,
+        Err(e) => return Json(json!({ "ok": false, "error": e.to_string() })),
+    };
+    // Short bare name terms ride the in-memory index (Everything-style
+    // ~100 ms latency); everything else stays on SQL.
+    if let Some(mem) = &st.mem {
+        if crate::mem::MemIndex::handles_query(&parsed) {
+            let ids = mem.find_substr(mem.needle(&parsed));
+            let total = ids.len() as u64;
+            let limited: Vec<i64> = ids.into_iter().take(limit.unwrap_or(100)).collect();
+            let store = st.db.lock().unwrap();
+            return match store.fetch_ids(&limited) {
+                Ok(hits) => Json(json!({
                     "ok": true,
                     "query": q.q,
-                    "count": r.hits.len(),
-                    "total": r.total,
+                    "engine": "mem",
+                    "count": hits.len(),
+                    "total": total,
                     "took_ms": t.elapsed().as_millis(),
-                    "hits": r.hits,
-                }),
-                Err(e) => json!({ "ok": false, "error": e.to_string() }),
-            },
+                    "hits": hits,
+                })),
+                Err(e) => Json(json!({ "ok": false, "error": e.to_string() })),
+            };
         }
+    }
+    let store = st.db.lock().unwrap();
+    let result = match store.search_query(&parsed, limit) {
+        Ok(r) => json!({
+            "ok": true,
+            "query": q.q,
+            "engine": "sql",
+            "count": r.hits.len(),
+            "total": r.total,
+            "took_ms": t.elapsed().as_millis(),
+            "hits": r.hits,
+        }),
+        Err(e) => json!({ "ok": false, "error": e.to_string() }),
     };
     Json(result)
 }
@@ -82,6 +126,9 @@ async fn stats(State(st): State<AppState>) -> Json<Value> {
         .iter()
         .map(|v| format!("{}: ({}) [{}]", v.drive, v.label.trim(), v.fs))
         .collect();
+    let mem = st.mem.as_ref().map(|m| {
+        json!({ "entries": m.len(), "bytes": m.memory_bytes() })
+    });
     Json(json!({
         "ok": true,
         "files": files,
@@ -89,6 +136,7 @@ async fn stats(State(st): State<AppState>) -> Json<Value> {
         "entries": files + dirs,
         "db": store.db_path().to_string_lossy(),
         "volumes": vols,
+        "mem_index": mem,
     }))
 }
 
