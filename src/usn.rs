@@ -92,6 +92,10 @@ pub fn list_volumes() -> Vec<VolumeInfo> {
 pub struct UsnVolume {
     handle: HANDLE,
     pub drive: char,
+    /// Reused FSCTL_ENUM_USN_DATA buffer for [`UsnVolume::lookup`] (the
+    /// monitor resolves a parent path per event — allocating 64 KB per call
+    /// would churn the allocator for nothing).
+    lookup_buf: Vec<u8>,
 }
 
 impl UsnVolume {
@@ -116,7 +120,11 @@ impl UsnVolume {
                 unsafe { GetLastError() }
             );
         }
-        Ok(UsnVolume { handle, drive })
+        Ok(UsnVolume {
+            handle,
+            drive,
+            lookup_buf: Vec::with_capacity(64 * 1024),
+        })
     }
 
     /// Raw volume handle (for advanced ioctl calls; `pub(crate)`-adjacent API).
@@ -199,7 +207,7 @@ impl UsnVolume {
     }
 
     /// Look up one MFT record by file reference number (used to resolve parent paths).
-    pub fn lookup(&self, frn: u64) -> Option<(u64, String, bool)> {
+    pub fn lookup(&mut self, frn: u64) -> Option<(u64, String, bool)> {
         let mut mft = MFT_ENUM_DATA_V1 {
             StartFileReferenceNumber: frn.saturating_sub(1),
             LowUsn: 0,
@@ -207,20 +215,22 @@ impl UsnVolume {
             MinMajorVersion: 2,
             MaxMajorVersion: 3,
         };
-        let mut buf = vec![0u8; 64 * 1024];
+        self.lookup_buf.clear();
+        self.lookup_buf.resize(64 * 1024, 0);
+        let (buf_ptr, buf_len) = (self.lookup_buf.as_mut_ptr(), self.lookup_buf.len() as u32);
         let mut returned = 0u32;
         let ok = self.ioctl(
             FSCTL_ENUM_USN_DATA,
             &mut mft as *mut _ as *const c_void,
             size_of::<MFT_ENUM_DATA_V1>() as u32,
-            buf.as_mut_ptr(),
-            buf.len() as u32,
+            buf_ptr,
+            buf_len,
             &mut returned,
         );
         if !ok || returned < 8 {
             return None;
         }
-        parse_usn_buffer(&buf[..returned as usize])
+        parse_usn_buffer(&self.lookup_buf[..returned as usize])
             .into_iter()
             .find(|r| r.frn == frn)
             .map(|r| (r.parent_frn, r.name, r.is_dir))
@@ -485,7 +495,7 @@ fn visit(
 
 /// Resolve an FRN to a full path by walking parent records up to the root.
 pub fn resolve_path(
-    vol: &UsnVolume,
+    vol: &mut UsnVolume,
     drive: char,
     frn: u64,
     cache: &mut HashMap<u64, Option<String>>,

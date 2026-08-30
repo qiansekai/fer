@@ -32,6 +32,10 @@ pub fn find(
 ) -> Result<DupReport> {
     let mut report = DupReport::default();
     let filter_l = name_filter.map(|f| f.to_lowercase());
+    // Reused 1 MB read buffers — one per phase instead of one per file.
+    let mut hash_buf = vec![0u8; 1 << 20];
+    let mut cmp_a = vec![0u8; 1 << 20];
+    let mut cmp_b = vec![0u8; 1 << 20];
 
     // Collect candidates (path, size), sorted by size so each same-size group
     // is processed with bounded memory.
@@ -61,7 +65,7 @@ pub fn find(
         if j - i >= 2 {
             let mut hashed: Vec<(String, u64)> = Vec::with_capacity(j - i);
             for (path, _) in &group[i..j] {
-                match hash_file(path) {
+                match hash_file(path, &mut hash_buf) {
                     Ok(h) => hashed.push((path.clone(), h)),
                     Err(_) => report.skipped += 1,
                 }
@@ -80,7 +84,7 @@ pub fn find(
                     // Byte-verify against the first candidate.
                     let mut paths: Vec<String> = Vec::with_capacity(b - a);
                     for (path, _) in &hashed[a..b] {
-                        if paths.is_empty() || files_equal(&hashed[a].0, path) {
+                        if paths.is_empty() || files_equal(&hashed[a].0, path, &mut cmp_a, &mut cmp_b) {
                             paths.push(path.clone());
                         }
                     }
@@ -117,13 +121,12 @@ fn fnv1a_update(mut h: u64, bytes: &[u8]) -> u64 {
     h
 }
 
-fn hash_file(path: &str) -> Result<u64> {
+fn hash_file(path: &str, buf: &mut [u8]) -> Result<u64> {
     let mut file = std::fs::File::open(path)?;
     use std::io::Read;
-    let mut buf = vec![0u8; 1 << 20];
     let mut h = FNV_OFFSET;
     loop {
-        let n = file.read(&mut buf)?;
+        let n = file.read(buf)?;
         if n == 0 {
             break;
         }
@@ -133,17 +136,15 @@ fn hash_file(path: &str) -> Result<u64> {
 }
 
 /// Streaming byte-compare of two files (returns false on any difference/error).
-fn files_equal(a: &str, b: &str) -> bool {
+fn files_equal(a: &str, b: &str, ba: &mut [u8], bb: &mut [u8]) -> bool {
     use std::io::Read;
     let (mut fa, mut fb) = match (std::fs::File::open(a), std::fs::File::open(b)) {
         (Ok(x), Ok(y)) => (x, y),
         _ => return false,
     };
-    let mut ba = vec![0u8; 1 << 20];
-    let mut bb = vec![0u8; 1 << 20];
     loop {
-        let na = fa.read(&mut ba).unwrap_or(0);
-        let nb = fb.read(&mut bb).unwrap_or(0);
+        let na = fa.read(ba).unwrap_or(0);
+        let nb = fb.read(bb).unwrap_or(0);
         if na != nb || ba[..na] != bb[..nb] {
             return false;
         }

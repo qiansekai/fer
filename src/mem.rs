@@ -506,26 +506,26 @@ impl MemIndex {
 
     /// Evaluate the whole query in memory; returns matching file ids ascending.
     pub fn search(&self, q: &Query) -> Vec<u32> {
-        let mut acc: Option<Vec<u32>> = None;
+        let mut acc: Option<IdSet<'_>> = None;
         for t in &q.include {
             let ids = self.eval(t);
             acc = Some(match acc {
                 None => ids,
-                Some(a) => intersect(&a, &ids),
+                Some(a) => IdSet::Owned(intersect(a.as_slice(), ids.as_slice())),
             });
-            if acc.as_ref().is_some_and(|v| v.is_empty()) {
+            if acc.as_ref().is_some_and(|s| s.as_slice().is_empty()) {
                 return Vec::new();
             }
         }
-        let mut acc = acc.unwrap_or_else(|| self.all_ids());
+        let mut acc = acc.unwrap_or_else(|| IdSet::Owned(self.all_ids()));
         for t in &q.exclude {
             let ids = self.eval(t);
-            acc = subtract(&acc, &ids);
-            if acc.is_empty() {
+            acc = IdSet::Owned(subtract(acc.as_slice(), ids.as_slice()));
+            if acc.as_slice().is_empty() {
                 break;
             }
         }
-        acc
+        acc.into_owned()
     }
 
     /// Build full hits for ids (order preserved), capped at `limit`.
@@ -559,13 +559,13 @@ impl MemIndex {
         self.entries.iter().map(|e| e.id).collect()
     }
 
-    fn eval(&self, t: &Term) -> Vec<u32> {
+    fn eval(&self, t: &Term) -> IdSet<'_> {
         match t {
-            Term::Name(s) => self.scan_names(s.as_bytes()),
-            Term::PathSubstr(s) => self.scan_paths_ci(s.as_bytes()),
+            Term::Name(s) => IdSet::Owned(self.scan_names(s.as_bytes())),
+            Term::PathSubstr(s) => IdSet::Owned(self.scan_paths_ci(s.as_bytes())),
             Term::Suffix(s) => {
                 let rev: String = s.chars().rev().collect();
-                self.range_by_rev(rev.as_bytes())
+                IdSet::Owned(self.range_by_rev(rev.as_bytes()))
             }
             Term::Ext(list) => {
                 let mut out: Vec<u32> = Vec::new();
@@ -573,33 +573,33 @@ impl MemIndex {
                     let rev: String = format!(".{e}").chars().rev().collect();
                     out = union(&out, &self.range_by_rev(rev.as_bytes()));
                 }
-                out
+                IdSet::Owned(out)
             }
-            Term::NameWild(p) => self.scan_glob(&self.names, p, true),
-            Term::PathWild(p) => self.scan_glob(&self.paths, p, false),
-            Term::Size { min, max } => self.range_u64(
+            Term::NameWild(p) => IdSet::Owned(self.scan_glob(&self.names, p, true)),
+            Term::PathWild(p) => IdSet::Owned(self.scan_glob(&self.paths, p, false)),
+            Term::Size { min, max } => IdSet::Owned(self.range_u64(
                 &self.by_size,
                 |e| e.size,
                 min.unwrap_or(0),
                 max.unwrap_or(u64::MAX),
-            ),
-            Term::Mtime { min, max } => self.range_i64(
+            )),
+            Term::Mtime { min, max } => IdSet::Owned(self.range_i64(
                 &self.by_mtime,
                 |e| e.mtime,
                 min.unwrap_or(i64::MIN),
                 max.unwrap_or(i64::MAX),
-            ),
-            Term::Ctime { min, max } => self.range_i64(
+            )),
+            Term::Ctime { min, max } => IdSet::Owned(self.range_i64(
                 &self.by_ctime,
                 |e| e.ctime,
                 min.unwrap_or(i64::MIN),
                 max.unwrap_or(i64::MAX),
-            ),
+            )),
             Term::IsDir(b) => {
                 if *b {
-                    self.dir_ids.to_vec()
+                    IdSet::Borrowed(self.dir_ids.slice())
                 } else {
-                    self.file_ids.to_vec()
+                    IdSet::Borrowed(self.file_ids.slice())
                 }
             }
             Term::Flag { bit, on } => {
@@ -610,15 +610,30 @@ impl MemIndex {
                     _ => &self.reparse_ids,
                 };
                 if *on {
-                    list.to_vec()
+                    IdSet::Borrowed(list.slice())
                 } else {
-                    let mut out = self.all_ids();
-                    out.retain(|id| !list.binary_search(id).is_ok());
-                    out
+                    IdSet::Owned(self.all_minus(list))
                 }
             }
-            Term::PathPrefix(p) => self.range_by_path_prefix(p.as_bytes()),
+            Term::PathPrefix(p) => IdSet::Owned(self.range_by_path_prefix(p.as_bytes())),
         }
+    }
+
+    /// All ids minus `list` (both sorted) via one two-pointer sweep — avoids
+    /// materializing the full id array for `!flag:` terms.
+    fn all_minus(&self, list: &[u32]) -> Vec<u32> {
+        let mut out = Vec::new();
+        let mut j = 0;
+        for e in &self.entries {
+            while j < list.len() && list[j] < e.id {
+                j += 1;
+            }
+            if j < list.len() && list[j] == e.id {
+                continue;
+            }
+            out.push(e.id);
+        }
+        out
     }
 
     /// Substring scan over the (lowercased) name arena; ids come out ascending
@@ -962,6 +977,29 @@ fn ci_cmp(a: &[u8], b: &[u8]) -> Ordering {
 
 fn ci_starts_with(hay: &[u8], needle: &[u8]) -> bool {
     hay.len() >= needle.len() && ci_cmp(&hay[..needle.len()], needle) == Ordering::Equal
+}
+
+/// Term-evaluation result: borrowed when the term maps directly onto a
+/// precomputed id list (no copy), owned when computed. Multi-term queries
+/// then pay one intersect allocation instead of a full-list copy per term.
+enum IdSet<'a> {
+    Borrowed(&'a [u32]),
+    Owned(Vec<u32>),
+}
+
+impl IdSet<'_> {
+    fn as_slice(&self) -> &[u32] {
+        match self {
+            IdSet::Borrowed(s) => s,
+            IdSet::Owned(v) => v,
+        }
+    }
+    fn into_owned(self) -> Vec<u32> {
+        match self {
+            IdSet::Borrowed(s) => s.to_vec(),
+            IdSet::Owned(v) => v,
+        }
+    }
 }
 
 fn intersect(a: &[u32], b: &[u32]) -> Vec<u32> {

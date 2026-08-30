@@ -38,7 +38,7 @@ pub fn run(
     interval: Duration,
     flush_every: Duration,
 ) -> Result<()> {
-    let vol = UsnVolume::open(drive)?;
+    let mut vol = UsnVolume::open(drive)?;
     let usn_sidecar = usn_sidecar_path(&dump);
     let mut start = read_usn(&usn_sidecar, drive).unwrap_or_else(|| sync_to_now(&vol));
     eprintln!("[monitor] watching {drive}: from USN {start} (dump: {})", dump.display());
@@ -73,7 +73,7 @@ pub fn run(
                 }
             }
             if r.reason & (USN_REASON_FILE_CREATE | USN_REASON_RENAME_NEW_NAME) != 0
-                && let Some(parent) = resolve_path(&vol, drive, r.parent_frn, &mut cache)
+                && let Some(parent) = resolve_path(&mut vol, drive, r.parent_frn, &mut cache)
             {
                 let path = if parent.is_empty() {
                     format!("{drive}:\\{}", r.name)
