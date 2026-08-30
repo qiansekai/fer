@@ -1,0 +1,6 @@
+/target
+/target-gnu
+*.db
+*.db-wal
+*.db-shm
+*.log

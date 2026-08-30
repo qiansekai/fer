@@ -1,0 +1,3 @@
+# Keep GNU-toolchain artifacts separate from any MSVC leftovers.
+[build]
+target-dir = "target-gnu"
