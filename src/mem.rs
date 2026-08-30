@@ -21,7 +21,7 @@
 
 use std::cmp::Ordering;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
@@ -34,15 +34,19 @@ use crate::lower_rev;
 use crate::query::{Query, Term};
 use crate::store::Hit;
 
-/// Dump file magic + format version.
+/// Dump file magic + format version. v2 pads every section to 8-byte
+/// alignment so the file can be memory-mapped and viewed in place (zero-copy
+/// loading); v1 had unaligned sections and is rejected.
 const MAGIC: &[u8; 8] = b"FERIDX01";
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 
 /// Fixed dump section order: entries, paths, names, revs, the six sorted
 /// permutations, then the six id lists. The header stores byte offsets for
-/// each section plus the total file length (SEC+1 table entries).
+/// each section plus the total file length (SEC+1 table entries), followed by
+/// the six id-list element counts — logical lengths come from these, so
+/// inter-section alignment padding never leaks into the data.
 const SEC: usize = 16;
-const HDR_LEN: usize = 32 + (SEC + 1) * 8;
+const HDR_LEN: usize = 32 + (SEC + 1) * 8 + 6 * 4; // 192
 
 /// Packed, dump-stable 56-byte record. Field order groups the u64s so there
 /// is no interior padding; the dump is written/read as raw little-endian
@@ -209,6 +213,10 @@ impl MemIndex {
             offs[i] = off;
             w.write_all(bytes)?;
             off += bytes.len() as u64;
+            // pad to 8-byte alignment so the dump can be mmap-viewed in place
+            let pad = (8 - (off as usize) % 8) % 8;
+            w.write_all(&[0u8; 8][..pad])?;
+            off += pad as u64;
         }
         offs[SEC] = off;
         let now = std::time::SystemTime::now()
@@ -224,6 +232,16 @@ impl MemIndex {
         for o in offs {
             hdr.extend_from_slice(&o.to_le_bytes());
         }
+        for c in [
+            self.dir_ids.len(),
+            self.file_ids.len(),
+            self.hidden_ids.len(),
+            self.system_ids.len(),
+            self.readonly_ids.len(),
+            self.reparse_ids.len(),
+        ] {
+            hdr.extend_from_slice(&(c as u32).to_le_bytes());
+        }
         let mut file = w.into_inner()?;
         file.seek(SeekFrom::Start(0))?;
         file.write_all(&hdr)?;
@@ -233,68 +251,82 @@ impl MemIndex {
         Ok(())
     }
 
-    /// Load a dump written by [`MemIndex::save`] — a straight sequential read
-    /// at disk speed, no SQLite walk and no re-sorting.
+    /// Load a dump written by [`MemIndex::save`] — zero-copy: the file is
+    /// memory-mapped (deliberately leaked for the process lifetime) and every
+    /// section becomes a zero-capacity `Vec` view over the mapping. Queries
+    /// page in only the pages they touch; a ~1 GB index loads in ~1 ms.
     pub fn load_dump(path: &Path) -> Result<Self> {
         let file = File::open(path)?;
-        let mut r = BufReader::with_capacity(1 << 21, file);
-        let mut hdr = [0u8; HDR_LEN];
-        r.read_exact(&mut hdr)?;
-        if hdr[0..8] != *MAGIC {
+        let len = file.metadata()?.len();
+        let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
+        // SAFETY: the mapping is leaked, so its bytes stay valid for the rest
+        // of the process. The zero-capacity Vecs built below never deallocate
+        // this memory (dropping a Vec with capacity 0 performs no free).
+        let buf: &'static [u8] =
+            unsafe { std::slice::from_raw_parts(mmap.as_ptr(), len as usize) };
+        std::mem::forget(mmap);
+        if buf.len() < HDR_LEN || buf[0..8] != *MAGIC {
             bail!("not a FERIDX dump: {}", path.display());
         }
-        let version = u32::from_le_bytes(hdr[8..12].try_into().unwrap());
+        let version = u32::from_le_bytes(buf[8..12].try_into().unwrap());
         if version != FORMAT_VERSION {
-            bail!("dump format v{version} unsupported (want v{FORMAT_VERSION})");
+            bail!(
+                "dump format v{version} unsupported (want v{FORMAT_VERSION}) — re-run `fer index`"
+            );
         }
-        let n = u32::from_le_bytes(hdr[12..16].try_into().unwrap()) as usize;
+        let n = u32::from_le_bytes(buf[12..16].try_into().unwrap()) as usize;
         let mut offs = [0u64; SEC + 1];
         for (i, o) in offs.iter_mut().enumerate() {
-            *o = u64::from_le_bytes(hdr[32 + i * 8..40 + i * 8].try_into().unwrap());
+            *o = u64::from_le_bytes(buf[32 + i * 8..40 + i * 8].try_into().unwrap());
         }
-        let file_len = r.get_ref().metadata()?.len();
+        let mut counts = [0usize; 6];
+        for (i, c) in counts.iter_mut().enumerate() {
+            *c = u32::from_le_bytes(
+                buf[32 + (SEC + 1) * 8 + i * 4..32 + (SEC + 1) * 8 + (i + 1) * 4]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+        }
         anyhow::ensure!(
             offs[0] == HDR_LEN as u64
-                && offs[SEC] == file_len
+                && offs[SEC] == len
                 && offs.windows(2).all(|w| w[0] <= w[1])
-                && (offs[1] - offs[0]) as usize == n * std::mem::size_of::<Entry>(),
+                && offs.iter().all(|o| o % 8 == 0)
+                && (offs[1] - offs[0]) as usize == n * std::mem::size_of::<Entry>()
+                && counts[0] + counts[1] == n,
             "dump layout corrupt: {}",
             path.display()
         );
-        let entries = read_pod::<Entry>(&mut r, n)?;
-        let paths = read_pod::<u8>(&mut r, (offs[2] - offs[1]) as usize)?;
-        let names = read_pod::<u8>(&mut r, (offs[3] - offs[2]) as usize)?;
-        let revs = read_pod::<u8>(&mut r, (offs[4] - offs[3]) as usize)?;
-        let by_path = read_pod::<u32>(&mut r, n)?;
-        let by_name = read_pod::<u32>(&mut r, n)?;
-        let by_rev = read_pod::<u32>(&mut r, n)?;
-        let by_size = read_pod::<u32>(&mut r, n)?;
-        let by_mtime = read_pod::<u32>(&mut r, n)?;
-        let by_ctime = read_pod::<u32>(&mut r, n)?;
-        let list_len = |i: usize| ((offs[i + 1] - offs[i]) / 4) as usize;
-        let dir_ids = read_pod::<u32>(&mut r, list_len(10))?;
-        let file_ids = read_pod::<u32>(&mut r, list_len(11))?;
-        let hidden_ids = read_pod::<u32>(&mut r, list_len(12))?;
-        let system_ids = read_pod::<u32>(&mut r, list_len(13))?;
-        let readonly_ids = read_pod::<u32>(&mut r, list_len(14))?;
-        let reparse_ids = read_pod::<u32>(&mut r, list_len(15))?;
+        let view = |i: usize| -> &'static [u8] { &buf[offs[i] as usize..offs[i + 1] as usize] };
+        let view_at = |start: u64, len: usize| -> &'static [u8] {
+            &buf[start as usize..start as usize + len]
+        };
+        // SAFETY (cast): each section starts 8-byte aligned; Entry/u32/u8 have
+        // no invalid bit patterns; capacity 0 means the Vec never frees the
+        // mapped memory it views.
+        fn cast<T: Copy>(b: &'static [u8]) -> Vec<T> {
+            let n = b.len() / std::mem::size_of::<T>();
+            unsafe { Vec::from_raw_parts(b.as_ptr().cast::<T>() as *mut T, n, 0) }
+        }
+        let entry_bytes = n * std::mem::size_of::<Entry>();
+        let perm_bytes = n * 4;
         Ok(MemIndex {
-            entries,
-            paths,
-            names,
-            revs,
-            by_path,
-            by_name,
-            by_rev,
-            by_size,
-            by_mtime,
-            by_ctime,
-            dir_ids,
-            file_ids,
-            hidden_ids,
-            system_ids,
-            readonly_ids,
-            reparse_ids,
+            entries: cast(view_at(offs[0], entry_bytes)),
+            paths: cast(view(1)),
+            names: cast(view(2)),
+            revs: cast(view(3)),
+            by_path: cast(view_at(offs[4], perm_bytes)),
+            by_name: cast(view_at(offs[5], perm_bytes)),
+            by_rev: cast(view_at(offs[6], perm_bytes)),
+            by_size: cast(view_at(offs[7], perm_bytes)),
+            by_mtime: cast(view_at(offs[8], perm_bytes)),
+            by_ctime: cast(view_at(offs[9], perm_bytes)),
+            dir_ids: cast(view_at(offs[10], counts[0] * 4)),
+            file_ids: cast(view_at(offs[11], counts[1] * 4)),
+            hidden_ids: cast(view_at(offs[12], counts[2] * 4)),
+            system_ids: cast(view_at(offs[13], counts[3] * 4)),
+            readonly_ids: cast(view_at(offs[14], counts[4] * 4)),
+            reparse_ids: cast(view_at(offs[15], counts[5] * 4)),
         })
     }
 
@@ -736,21 +768,6 @@ fn pod_bytes<T>(v: &[T]) -> &[u8] {
     // SAFETY: any byte pattern is a valid value of these integer types; the
     // length is scaled by size_of::<T>.
     unsafe { std::slice::from_raw_parts(v.as_ptr().cast(), std::mem::size_of_val(v)) }
-}
-
-/// Read `n` POD values into a freshly allocated, correctly aligned Vec with a
-/// single read_exact.
-fn read_pod<T: Copy>(r: &mut impl Read, n: usize) -> Result<Vec<T>> {
-    let mut v: Vec<T> = Vec::with_capacity(n);
-    // SAFETY: the Vec allocation is aligned and sized for n values of T; the
-    // byte view covers exactly that region; set_len only after a successful
-    // read_exact, and any bytes form valid integer values.
-    let bytes = unsafe {
-        std::slice::from_raw_parts_mut(v.as_mut_ptr().cast(), n * std::mem::size_of::<T>())
-    };
-    r.read_exact(bytes)?;
-    unsafe { v.set_len(n) };
-    Ok(v)
 }
 
 /// Dump file path companion to the SQLite db ("index.db" → "index.db.feridx").
