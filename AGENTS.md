@@ -2,14 +2,20 @@
 
 Everything 级文件搜索引擎的 Rust 重写。本文件是给后续 agent 会话的速查卡。
 
-> ⚠️ **进行中（2026-08-31）**：性能优化会话中途额度耗尽。5 个文件已改未提交
-> （mft/usn/lib/store/mem），`cargo check` 已过但**测试未跑、未实测**。
-> 状态、dump 格式契约、剩余 TODO 全在 **[HANDOFF.md](HANDOFF.md)**——先读它再动手。
-
 ## 一句话
 
 `fer`（本仓库产物）用原始 NTFS `$MFT` 扫描建索引（硬链接别名/大小/时间/属性全量），
-SQLite + FTS5 trigram 毫秒查询，CLI `--json` 与 HTTP API 双通道。
+SQLite + FTS5 trigram 毫秒查询 + **FERIDX01 dump 内存引擎**（serve/CLI 慢查询用），
+CLI `--json` 与 HTTP API 双通道。
+
+## 数据流（重要）
+
+- 构建：MFT 扫描 → 同时喂 SQLite（持久/监控落点）和 MemBuilder → 收尾并行 finalize
+  排序 → 原子写 dump `index.db.feridx`（~1GB，格式契约见 mem.rs 顶部注释）
+- serve：`dump_is_fresh` 优先加载 dump（~1s），否则 SQLite 物化（~10s）
+- CLI：`MemIndex::prefers_dump(q)` 门控——路径子串/通配符走 dump；其余走 SQLite
+- monitor：仍写 SQLite；非空 WAL 会让 dump 判过期（空 WAL 忽略 mtime）
+- 构建 ~91s（MFT 扫描 43s + SQLite 落库 + dump 6.5s）；serve 查询 0-67ms 全覆盖
 
 ## 关键路径
 
@@ -49,7 +55,14 @@ cargo test --test live_volume -- --ignored --nocapture       # 真实卷（管�
 - FTS5 特殊命令 `delete-all` 只允许 contentless 表 → 重建时 DROP/CREATE 虚拟表
 - 内存引擎 `partition_point` 的谓词必须单调（`starts_with` 是假-真-假会二分出垃圾值，
   用 `小于或前缀` 的假→真→假形式）；区间结果要排序后才能进交集
-- 本仓库有 git（commit 节点：基线/测试全绿/真实卷全绿/性能优化/内存引擎/dupes），改动前先看 `git log`
+- **dump 新鲜度**：空 WAL 忽略 mtime（连接关闭会碰 mtime 但 0 字节写入）；非空 WAL
+  才参与判断
+- **路径子串扫描必须 CI**（paths arena 存原始大小写，memchr 定位首字节折叠变体 +
+  `ci_eq_at` 校验；byte-exact memmem 会漏掉全部大写路径）
+- **dump Entry 布局是二进制契约**（56B repr(C) 无填充），改字段必须 bump FORMAT_VERSION
+- release 开了 `fat LTO + codegen-units=1 + panic=abort + target-cpu=native`（本机专用）
+- 本仓库有 git（commit 节点：基线/测试全绿/真实卷全绿/性能优化/内存引擎/dupes/极致性能），
+  改动前先看 `git log`
 
 ## 常用命令
 
