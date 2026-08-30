@@ -97,13 +97,8 @@ async fn search(State(st): State<AppState>, Query(q): Query<SearchQuery>) -> Jso
 
 async fn stats(State(st): State<AppState>) -> Json<Value> {
     let mem = st.mem.read().unwrap().clone();
-    let (files, dirs): (u64, u64) = (0..mem.len()).fold((0, 0), |(f, d), i| {
-        if mem.meta_at(i).is_dir {
-            (f, d + 1)
-        } else {
-            (f + 1, d)
-        }
-    });
+    let files = mem.file_count() as u64;
+    let dirs = mem.dir_count() as u64;
     let dump = dump_path(&st.db);
     let dump_mb = std::fs::metadata(&dump).map(|m| m.len() / (1 << 20)).unwrap_or(0);
     Json(json!({

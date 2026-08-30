@@ -419,6 +419,16 @@ impl MemIndex {
         self.entries.len()
     }
 
+    /// Number of directory entries (from the precomputed id lists, no scan).
+    pub fn dir_count(&self) -> usize {
+        self.dir_ids.len()
+    }
+
+    /// Number of file entries (from the precomputed id lists, no scan).
+    pub fn file_count(&self) -> usize {
+        self.file_ids.len()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -522,6 +532,9 @@ impl MemIndex {
     pub fn hits(&self, ids: &[u32], limit: usize) -> Vec<Hit> {
         let mut out = Vec::with_capacity(ids.len().min(limit));
         for &id in ids.iter().take(limit) {
+            // Binary search rather than id-as-index: dump/mem ids are 0..n
+            // sequential, but the SQL-loaded oracle index carries SQLite
+            // rowids (1-based, possibly with gaps).
             let Ok(idx) = self.entries.binary_search_by_key(&id, |e| e.id) else {
                 continue;
             };

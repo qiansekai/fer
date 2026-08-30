@@ -107,14 +107,15 @@ fn main() -> Result<()> {
     let db = cli.db.clone().unwrap_or_else(default_db);
     match cli.command {
         Cmd::Volumes => {
-            let vols: Vec<serde_json::Value> = usn::list_volumes()
+            let vols = usn::list_volumes();
+            let json_vols: Vec<serde_json::Value> = vols
                 .iter()
                 .map(|v| json!({ "drive": v.drive.to_string(), "fs": v.fs, "label": v.label }))
                 .collect();
             if cli.json {
-                print_json(json!({ "ok": true, "volumes": vols }))?;
+                print_json(json!({ "ok": true, "volumes": json_vols }))?;
             } else {
-                for v in usn::list_volumes() {
+                for v in &vols {
                     println!("{}:  [{:5}]  {}", v.drive, v.fs, v.label);
                 }
             }
@@ -219,13 +220,8 @@ fn main() -> Result<()> {
         }
         Cmd::Stats => {
             let mem = load_index(&db)?;
-            let (files, dirs): (u64, u64) = (0..mem.len()).fold((0, 0), |(f, d), i| {
-                if mem.meta_at(i).is_dir {
-                    (f, d + 1)
-                } else {
-                    (f + 1, d)
-                }
-            });
+            let files = mem.file_count() as u64;
+            let dirs = mem.dir_count() as u64;
             let dump = dump_path(&db);
             let dump_mb = std::fs::metadata(&dump).map(|m| m.len() / (1 << 20)).unwrap_or(0);
             if cli.json {

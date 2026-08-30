@@ -29,8 +29,8 @@ const MASK: u32 = USN_REASON_FILE_CREATE
     | USN_REASON_RENAME_OLD_NAME;
 
 /// Watch one volume forever, applying journal events every `interval` and
-/// flushing the index to `dump` every `flush_every` seconds or after a large
-/// batch. The in-memory index is authoritative between flushes.
+/// flushing the index to `dump` every `flush_every` seconds whenever changes
+/// are pending. The in-memory index is authoritative between flushes.
 pub fn run(
     mut mem: MemIndex,
     drive: char,
@@ -107,14 +107,24 @@ pub fn run(
         if cache.len() > 1_000_000 {
             cache.clear();
         }
-        let due = !appended.is_empty() && last_flush.elapsed() >= flush_every;
+        let pending = !appended.is_empty() || !removed.is_empty();
+        let due = pending && last_flush.elapsed() >= flush_every;
         if due {
             let kept = mem.len() - removed.len() + appended.len();
             mem = flush(&mem, &removed, &appended, &dump)?;
             write_usn(&usn_sidecar, drive, start)?;
+            // FRN map delta: deletions were already removed at event time; the
+            // appended entries now live at the tail of the rebuilt index.
+            // (Rebuilding the whole map would churn ~100 MB of HashMap on
+            // every flush.)
+            let base = kept - appended.len();
+            for (j, (_, meta)) in appended.iter().enumerate() {
+                if let Some(f) = meta.frn {
+                    frn.insert(f, (base + j) as u32);
+                }
+            }
             removed.clear();
             appended.clear();
-            frn = mem.frn_map();
             last_flush = std::time::Instant::now();
             eprintln!("[monitor] flushed: {kept} entries -> {}", dump.display());
         }
