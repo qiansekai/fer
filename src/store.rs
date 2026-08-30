@@ -24,7 +24,6 @@ CREATE TABLE IF NOT EXISTS files (
     name    TEXT NOT NULL,
     name_l  TEXT NOT NULL,
     name_r  TEXT NOT NULL DEFAULT '',
-    path_r  TEXT NOT NULL DEFAULT '',
     is_dir  INTEGER NOT NULL DEFAULT 0,
     size    INTEGER NOT NULL DEFAULT 0,
     mtime   INTEGER NOT NULL DEFAULT 0,
@@ -34,7 +33,6 @@ CREATE TABLE IF NOT EXISTS files (
 );
 CREATE INDEX IF NOT EXISTS idx_files_name_l ON files(name_l);
 CREATE INDEX IF NOT EXISTS idx_files_name_r ON files(name_r);
-CREATE INDEX IF NOT EXISTS idx_files_path_r ON files(path_r);
 CREATE INDEX IF NOT EXISTS idx_files_path_l ON files(path_l);
 CREATE INDEX IF NOT EXISTS idx_files_frn ON files(frn);
 CREATE INDEX IF NOT EXISTS idx_files_mtime ON files(mtime);
@@ -44,7 +42,7 @@ CREATE INDEX IF NOT EXISTS idx_flags_hidden ON files(flags) WHERE (flags & 1) !=
 CREATE INDEX IF NOT EXISTS idx_flags_system ON files(flags) WHERE (flags & 2) != 0;
 CREATE INDEX IF NOT EXISTS idx_flags_readonly ON files(flags) WHERE (flags & 4) != 0;
 CREATE INDEX IF NOT EXISTS idx_flags_reparse ON files(flags) WHERE (flags & 8) != 0;
-CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(path_l, name_l, tokenize='trigram');
+CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(path_l, name_l, content='files', content_rowid='id', tokenize='trigram', detail=none);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 "#;
 
@@ -60,7 +58,6 @@ CREATE TABLE files (
     name    TEXT NOT NULL,
     name_l  TEXT NOT NULL,
     name_r  TEXT NOT NULL DEFAULT '',
-    path_r  TEXT NOT NULL DEFAULT '',
     is_dir  INTEGER NOT NULL DEFAULT 0,
     size    INTEGER NOT NULL DEFAULT 0,
     mtime   INTEGER NOT NULL DEFAULT 0,
@@ -70,7 +67,6 @@ CREATE TABLE files (
 );
 CREATE INDEX idx_files_name_l ON files(name_l);
 CREATE INDEX idx_files_name_r ON files(name_r);
-CREATE INDEX idx_files_path_r ON files(path_r);
 CREATE INDEX idx_files_path_l ON files(path_l);
 CREATE INDEX idx_files_frn ON files(frn);
 CREATE INDEX idx_files_mtime ON files(mtime);
@@ -80,7 +76,7 @@ CREATE INDEX idx_flags_hidden ON files(flags) WHERE (flags & 1) != 0;
 CREATE INDEX idx_flags_system ON files(flags) WHERE (flags & 2) != 0;
 CREATE INDEX idx_flags_readonly ON files(flags) WHERE (flags & 4) != 0;
 CREATE INDEX idx_flags_reparse ON files(flags) WHERE (flags & 8) != 0;
-CREATE VIRTUAL TABLE files_fts USING fts5(path_l, name_l, tokenize='trigram');
+CREATE VIRTUAL TABLE files_fts USING fts5(path_l, name_l, content='files', content_rowid='id', tokenize='trigram', detail=none);
 "#;
 
 #[derive(Debug, Clone, Serialize)]
@@ -132,7 +128,26 @@ impl Store {
                 .collect::<rusqlite::Result<_>>()?;
             MIGRATION_COLS.iter().any(|c| !cols.iter().any(|x| x == c))
         };
-        if missing {
+        // fts5 table shape matters too: contentless (trigram-indexed LIKE,
+        // no stored text — we always join back to `files`) vs older layouts.
+        // The old dead path_r column is also detected here so it gets dropped
+        // on the next rebuild (saves ~1.3GB).
+        let fts_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name = 'files_fts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or_default();
+        let fts_ok = fts_sql.contains("content='files'");
+        let has_path_r = {
+            let mut stmt = conn.prepare("SELECT name FROM pragma_table_info('files')")?;
+            let cols: Vec<String> = stmt
+                .query_map([], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            cols.iter().any(|x| x == "path_r")
+        };
+        if missing || !fts_ok || has_path_r {
             conn.execute_batch("DROP TABLE IF EXISTS files; DROP TABLE IF EXISTS files_fts;")?;
             conn.execute_batch(CREATE_FILES_DDL)?;
             eprintln!("[store] schema upgraded — index cleared, run `fer index`");
@@ -145,6 +160,13 @@ impl Store {
 
     pub fn db_path(&self) -> &Path {
         &self.db_path
+    }
+
+    /// One-off maintenance: compact the database file (rewrites it, reclaiming
+    /// free pages left by schema migrations and rebuilds).
+    pub fn vacuum(&self) -> Result<()> {
+        self.conn.execute_batch("VACUUM;")?;
+        Ok(())
     }
 
     /// Raw connection (for the in-memory index loader).
@@ -185,23 +207,44 @@ impl Store {
         Ok(out)
     }
 
-    /// Start a full rebuild. Old rows are wiped; inserts are buffered in one
-    /// transaction with `synchronous=OFF` for speed and restored on commit.
+    /// Start a full rebuild. Bulk-load optimizations (SQLite standard
+    /// playbook): all secondary indexes are dropped and rebuilt afterwards,
+    /// the rollback journal is disabled for the load (WAL would double-write),
+    /// and a large page cache avoids btree thrash. Everything is restored on
+    /// commit; a crash mid-build may corrupt the DB (just re-run `fer index`).
     /// Takes `&self` (Connection is internally mutable) so the store stays
     /// usable for `set_meta` while the rebuild is in flight.
     pub fn begin_rebuild(&self) -> Result<Rebuild<'_>> {
         self.conn.execute_batch(
+            "PRAGMA journal_mode=OFF;
+             PRAGMA synchronous=OFF;
+             PRAGMA temp_store=MEMORY;
+             PRAGMA locking_mode=EXCLUSIVE;
+             PRAGMA cache_size=-131072;",
+        )?;
+        self.conn.execute_batch(
             "BEGIN;
              DELETE FROM files;
              DROP TABLE IF EXISTS files_fts;
-             CREATE VIRTUAL TABLE files_fts USING fts5(path_l, name_l, tokenize='trigram');
+             DROP INDEX IF EXISTS idx_files_name_l;
+             DROP INDEX IF EXISTS idx_files_name_r;
+             DROP INDEX IF EXISTS idx_files_path_r;
+             DROP INDEX IF EXISTS idx_files_path_l;
+             DROP INDEX IF EXISTS idx_files_frn;
+             DROP INDEX IF EXISTS idx_files_mtime;
+             DROP INDEX IF EXISTS idx_files_size;
+             DROP INDEX IF EXISTS idx_files_is_dir;
+             DROP INDEX IF EXISTS idx_flags_hidden;
+             DROP INDEX IF EXISTS idx_flags_system;
+             DROP INDEX IF EXISTS idx_flags_readonly;
+             DROP INDEX IF EXISTS idx_flags_reparse;
+             CREATE VIRTUAL TABLE files_fts USING fts5(path_l, name_l, content='files', content_rowid='id', tokenize='trigram', detail=none);
              COMMIT;",
         )?;
-        self.conn.pragma_update(None, "synchronous", "OFF")?;
         self.conn.execute_batch("BEGIN;")?;
         let files_stmt = self.conn.prepare(
-            "INSERT OR IGNORE INTO files(path, path_l, name, name_l, name_r, path_r, is_dir, size, mtime, ctime, flags, frn)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT OR IGNORE INTO files(path, path_l, name, name_l, name_r, is_dir, size, mtime, ctime, flags, frn)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         )?;
         let fts_stmt = self.conn
             .prepare("INSERT INTO files_fts(rowid, path_l, name_l) VALUES (?1, ?2, ?3)")?;
@@ -378,15 +421,17 @@ impl Store {
 
     /// Delete by NTFS file reference number (monitor fast path; deletions often
     /// cannot be resolved to a path because the MFT record is already gone).
+    /// The FTS row goes first: with an external-content table the index may
+    /// not outlive its content row.
     pub fn delete_by_frn(&self, frn: u64) -> Result<()> {
         let id: Option<i64> = self
             .conn
             .query_row("SELECT id FROM files WHERE frn = ?1", [frn as i64], |r| r.get(0))
             .optional()?;
         if let Some(id) = id {
-            self.conn.execute("DELETE FROM files WHERE id = ?1", [id])?;
             self.conn
                 .execute("DELETE FROM files_fts WHERE rowid = ?1", [id])?;
+            self.conn.execute("DELETE FROM files WHERE id = ?1", [id])?;
         }
         Ok(())
     }
@@ -396,7 +441,6 @@ impl Store {
         let name = basename(path).to_owned();
         let name_l = name.to_lowercase();
         let name_r: String = name_l.chars().rev().collect();
-        let path_r: String = path_l.chars().rev().collect();
         let existing: Option<i64> = self
             .conn
             .query_row("SELECT id FROM files WHERE path = ?1", [path], |r| r.get(0))
@@ -404,10 +448,10 @@ impl Store {
         match existing {
             Some(id) => {
                 self.conn.execute(
-                    "UPDATE files SET path_l = ?2, name = ?3, name_l = ?4, name_r = ?5, path_r = ?6, \
-                     is_dir = ?7, size = ?8, mtime = ?9, ctime = ?10, flags = ?11, frn = ?12 WHERE id = ?1",
+                    "UPDATE files SET path_l = ?2, name = ?3, name_l = ?4, name_r = ?5, \
+                     is_dir = ?6, size = ?7, mtime = ?8, ctime = ?9, flags = ?10, frn = ?11 WHERE id = ?1",
                     params![
-                        id, &path_l, &name, &name_l, &name_r, &path_r,
+                        id, &path_l, &name, &name_l, &name_r,
                         meta.is_dir as i64, meta.size as i64, meta.mtime, meta.ctime,
                         meta.flags as i64, meta.frn.map(|f| f as i64)
                     ],
@@ -421,10 +465,10 @@ impl Store {
             }
             None => {
                 self.conn.execute(
-                    "INSERT INTO files(path, path_l, name, name_l, name_r, path_r, is_dir, size, mtime, ctime, flags, frn)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    "INSERT INTO files(path, path_l, name, name_l, name_r, is_dir, size, mtime, ctime, flags, frn)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                     params![
-                        path, &path_l, &name, &name_l, &name_r, &path_r,
+                        path, &path_l, &name, &name_l, &name_r,
                         meta.is_dir as i64, meta.size as i64, meta.mtime, meta.ctime,
                         meta.flags as i64, meta.frn.map(|f| f as i64)
                     ],
@@ -454,10 +498,9 @@ impl Rebuild<'_> {
         let path_l = path.to_lowercase();
         let name = basename(path).to_owned();
         let name_l = name.to_lowercase();
-        // Reversed columns turn suffix wildcards (`*.rs`) into indexed prefix
-        // lookups (see `search`).
+        // Reversed name column turns suffix wildcards (`*.rs`) into indexed
+        // prefix lookups (see `search`).
         let name_r: String = name_l.chars().rev().collect();
-        let path_r: String = path_l.chars().rev().collect();
         let changed = self
             .files_stmt
             .as_mut()
@@ -468,7 +511,6 @@ impl Rebuild<'_> {
                 &name,
                 &name_l,
                 &name_r,
-                &path_r,
                 meta.is_dir as i64,
                 meta.size as i64,
                 meta.mtime,
@@ -494,7 +536,31 @@ impl Rebuild<'_> {
         self.files_stmt.take();
         self.fts_stmt.take();
         self.conn.execute_batch("COMMIT;")?;
-        self.conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // Recreate the secondary indexes in bulk (sorted input beats
+        // incremental btree maintenance), refresh planner statistics, then
+        // restore the normal journal/pragmas. ANALYZE runs with temp_store
+        // back on FILE to keep the transient memory footprint low.
+        self.conn.execute_batch("PRAGMA temp_store=FILE;")?;
+        self.conn.execute_batch(
+            "CREATE INDEX idx_files_name_l ON files(name_l);
+             CREATE INDEX idx_files_name_r ON files(name_r);
+             CREATE INDEX idx_files_path_l ON files(path_l);
+             CREATE INDEX idx_files_frn ON files(frn);
+             CREATE INDEX idx_files_mtime ON files(mtime);
+             CREATE INDEX idx_files_size ON files(size);
+             CREATE INDEX idx_files_is_dir ON files(is_dir);
+             CREATE INDEX idx_flags_hidden ON files(flags) WHERE (flags & 1) != 0;
+             CREATE INDEX idx_flags_system ON files(flags) WHERE (flags & 2) != 0;
+             CREATE INDEX idx_flags_readonly ON files(flags) WHERE (flags & 4) != 0;
+             CREATE INDEX idx_flags_reparse ON files(flags) WHERE (flags & 8) != 0;
+             ANALYZE;",
+        )?;
+        self.conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=NORMAL;
+             PRAGMA cache_size=-2000;
+             PRAGMA locking_mode=NORMAL;",
+        )?;
         self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
         self.committed = true;
         Ok(self.count)
@@ -505,7 +571,12 @@ impl Drop for Rebuild<'_> {
     fn drop(&mut self) {
         if !self.committed {
             let _ = self.conn.execute_batch("ROLLBACK;");
-            let _ = self.conn.pragma_update(None, "synchronous", "NORMAL");
+            let _ = self.conn.execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA synchronous=NORMAL;
+                 PRAGMA cache_size=-2000;
+                 PRAGMA locking_mode=NORMAL;",
+            );
         }
     }
 }
@@ -570,15 +641,27 @@ fn lim_sql(lim: Option<i64>) -> String {
     }
 }
 
-/// Substring condition on a lowercased column: FTS5 trigram (>= 3 chars) or
-/// `instr` (1-2 chars). The hits form wraps the scan in a rowid subquery so
+/// Substring condition on a lowercased column. >= 3 chars rides the
+/// trigram-indexed LIKE on the FTS5 table (detail=none keeps the index slim);
+/// 1-2 chars use `instr`. The hits form wraps the scan in a rowid subquery so
 /// the planner scans the slim index instead of the whole table.
 fn name_substring_sql(s: &str, col: &str, for_count: bool) -> String {
     if s.chars().count() >= 3 {
-        let q = format!("{col} : \"{}\"", s.replace('"', "\"\""));
+        if s.contains('%') || s.contains('_') || s.contains('\\') {
+            // Rare: LIKE metacharacters can't be safely escaped in the
+            // trigram-LIKE form — fall back to the exact instr scan.
+            return if for_count {
+                format!("instr({col}, '{}') > 0", sql_literal(s))
+            } else {
+                format!(
+                    "id IN (SELECT id FROM files WHERE instr({col}, '{}') > 0)",
+                    sql_literal(s)
+                )
+            };
+        }
+        let lit = sql_literal(&format!("%{s}%"));
         format!(
-            "id IN (SELECT rowid FROM files_fts WHERE files_fts MATCH '{}')",
-            sql_literal(&q)
+            "id IN (SELECT rowid FROM files_fts WHERE {col} LIKE '{lit}')"
         )
     } else if for_count {
         format!("instr({col}, '{}') > 0", sql_literal(s))

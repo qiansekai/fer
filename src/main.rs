@@ -64,6 +64,8 @@ enum Cmd {
     },
     /// Index statistics
     Stats,
+    /// Compact the database file (one-off maintenance after migrations)
+    Vacuum,
 }
 
 fn default_db() -> PathBuf {
@@ -199,6 +201,11 @@ fn main() -> Result<()> {
                 println!("dirs:    {dirs}");
                 println!("entries: {}", files + dirs);
             }
+        }
+        Cmd::Vacuum => {
+            let store = Store::open(&db)?;
+            store.vacuum()?;
+            println!("vacuumed {}", db.display());
         }
     }
     Ok(())

@@ -41,6 +41,7 @@ fer search "foo" --limit 50 --count-only     # 只看命中数
 fer serve --addr 127.0.0.1:9876      # HTTP API + 网页 UI
 fer monitor --volume D               # USN 实时增量（需管理员）
 fer stats                            # 索引统计
+fer vacuum                           # 压缩索引库文件（迁移后一次性维护）
 fer --db <path> <cmd>                # 自定义索引库（默认 %LOCALAPPDATA%\file-engine-rust\index.db）
 ```
 
@@ -146,7 +147,8 @@ cargo test --test live_volume -- --ignored --nocapture   # 真实卷（需管理
 | `报告`（2 字 CJK） | 41 | 436 ms（SQL）/ **71 ms（serve 内存索引）** |
 | `rs`（2 字，18 万命中） | 183,505 | 465 ms（SQL）/ **78 ms（serve 内存索引）** |
 
-索引构建：全盘 ~415 万条（MFT 路径含硬链接别名），峰值内存 ~309 MB。
+索引构建：全盘 ~415 万条（MFT 路径含硬链接别名），**~164s，峰值内存 ~667MB**。
+索引库体积 **~3.4GB**（迁移/重建后用 `fer vacuum` 压缩一次）。
 serve 模式常驻 ~530MB 工作集（内存索引 156MB + mmap 页缓存，OS 可按需回收）。
 
 ## 已知限制 / TODO
