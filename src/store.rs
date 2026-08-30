@@ -42,7 +42,7 @@ CREATE INDEX IF NOT EXISTS idx_flags_hidden ON files(flags) WHERE (flags & 1) !=
 CREATE INDEX IF NOT EXISTS idx_flags_system ON files(flags) WHERE (flags & 2) != 0;
 CREATE INDEX IF NOT EXISTS idx_flags_readonly ON files(flags) WHERE (flags & 4) != 0;
 CREATE INDEX IF NOT EXISTS idx_flags_reparse ON files(flags) WHERE (flags & 8) != 0;
-CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(path_l, name_l, content='files', content_rowid='id', tokenize='trigram', detail=none);
+CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(name_l, content='files', content_rowid='id', tokenize='trigram', detail=none);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 "#;
 
@@ -76,7 +76,7 @@ CREATE INDEX idx_flags_hidden ON files(flags) WHERE (flags & 1) != 0;
 CREATE INDEX idx_flags_system ON files(flags) WHERE (flags & 2) != 0;
 CREATE INDEX idx_flags_readonly ON files(flags) WHERE (flags & 4) != 0;
 CREATE INDEX idx_flags_reparse ON files(flags) WHERE (flags & 8) != 0;
-CREATE VIRTUAL TABLE files_fts USING fts5(path_l, name_l, content='files', content_rowid='id', tokenize='trigram', detail=none);
+CREATE VIRTUAL TABLE files_fts USING fts5(name_l, content='files', content_rowid='id', tokenize='trigram', detail=none);
 "#;
 
 #[derive(Debug, Clone, Serialize)]
@@ -128,10 +128,10 @@ impl Store {
                 .collect::<rusqlite::Result<_>>()?;
             MIGRATION_COLS.iter().any(|c| !cols.iter().any(|x| x == c))
         };
-        // fts5 table shape matters too: contentless (trigram-indexed LIKE,
-        // no stored text — we always join back to `files`) vs older layouts.
-        // The old dead path_r column is also detected here so it gets dropped
-        // on the next rebuild (saves ~1.3GB).
+        // fts5 table shape matters too: external-content + name-only column
+        // (path trigrams were dropped — the serve mem engine covers path
+        // substrings, and path postings made the build ~8x slower). Older
+        // layouts trigger the destructive migration below.
         let fts_sql: String = conn
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE name = 'files_fts'",
@@ -139,7 +139,7 @@ impl Store {
                 |r| r.get(0),
             )
             .unwrap_or_default();
-        let fts_ok = fts_sql.contains("content='files'");
+        let fts_ok = fts_sql.contains("content='files'") && !fts_sql.contains("path_l");
         let has_path_r = {
             let mut stmt = conn.prepare("SELECT name FROM pragma_table_info('files')")?;
             let cols: Vec<String> = stmt
@@ -238,7 +238,7 @@ impl Store {
              DROP INDEX IF EXISTS idx_flags_system;
              DROP INDEX IF EXISTS idx_flags_readonly;
              DROP INDEX IF EXISTS idx_flags_reparse;
-             CREATE VIRTUAL TABLE files_fts USING fts5(path_l, name_l, content='files', content_rowid='id', tokenize='trigram', detail=none);
+             CREATE VIRTUAL TABLE files_fts USING fts5(name_l, content='files', content_rowid='id', tokenize='trigram', detail=none);
              COMMIT;",
         )?;
         self.conn.execute_batch("BEGIN;")?;
@@ -247,7 +247,7 @@ impl Store {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         )?;
         let fts_stmt = self.conn
-            .prepare("INSERT INTO files_fts(rowid, path_l, name_l) VALUES (?1, ?2, ?3)")?;
+            .prepare("INSERT INTO files_fts(rowid, name_l) VALUES (?1, ?2)")?;
         Ok(Rebuild {
             conn: &self.conn,
             files_stmt: Some(files_stmt),
@@ -358,8 +358,8 @@ impl Store {
     fn term_sql(t: &crate::query::Term, for_count: bool) -> String {
         use crate::query::Term;
         match t {
-            Term::Name(s) => name_substring_sql(s, "name_l", for_count),
-            Term::PathSubstr(s) => name_substring_sql(s, "path_l", for_count),
+            Term::Name(s) => name_substring_sql(s, for_count),
+            Term::PathSubstr(s) => path_substring_sql(s, for_count),
             Term::Suffix(s) => suffix_sql(s, "name_r", for_count),
             Term::NameWild(p) => like_sql("name_l", p, for_count),
             Term::PathWild(p) => like_sql("path_l", p, for_count),
@@ -459,8 +459,8 @@ impl Store {
                 self.conn
                     .execute("DELETE FROM files_fts WHERE rowid = ?1", [id])?;
                 self.conn.execute(
-                    "INSERT INTO files_fts(rowid, path_l, name_l) VALUES (?1, ?2, ?3)",
-                    params![id, &path_l, &name_l],
+                    "INSERT INTO files_fts(rowid, name_l) VALUES (?1, ?2)",
+                    params![id, &name_l],
                 )?;
             }
             None => {
@@ -475,8 +475,8 @@ impl Store {
                 )?;
                 let id = self.conn.last_insert_rowid();
                 self.conn.execute(
-                    "INSERT INTO files_fts(rowid, path_l, name_l) VALUES (?1, ?2, ?3)",
-                    params![id, &path_l, &name_l],
+                    "INSERT INTO files_fts(rowid, name_l) VALUES (?1, ?2)",
+                    params![id, &name_l],
                 )?;
             }
         }
@@ -527,7 +527,7 @@ impl Rebuild<'_> {
         self.fts_stmt
             .as_mut()
             .unwrap()
-            .execute(params![id, &path_l, &name_l])?;
+            .execute(params![id, &name_l])?;
         self.count += 1;
         Ok(())
     }
@@ -641,33 +641,44 @@ fn lim_sql(lim: Option<i64>) -> String {
     }
 }
 
-/// Substring condition on a lowercased column. >= 3 chars rides the
-/// trigram-indexed LIKE on the FTS5 table (detail=none keeps the index slim);
+/// Name substring: >= 3 chars rides the trigram-indexed LIKE on the FTS5
+/// table (name-only column — path trigrams were dropped for build speed);
 /// 1-2 chars use `instr`. The hits form wraps the scan in a rowid subquery so
 /// the planner scans the slim index instead of the whole table.
-fn name_substring_sql(s: &str, col: &str, for_count: bool) -> String {
+fn name_substring_sql(s: &str, for_count: bool) -> String {
     if s.chars().count() >= 3 {
         if s.contains('%') || s.contains('_') || s.contains('\\') {
             // Rare: LIKE metacharacters can't be safely escaped in the
             // trigram-LIKE form — fall back to the exact instr scan.
             return if for_count {
-                format!("instr({col}, '{}') > 0", sql_literal(s))
+                format!("instr(name_l, '{}') > 0", sql_literal(s))
             } else {
                 format!(
-                    "id IN (SELECT id FROM files WHERE instr({col}, '{}') > 0)",
+                    "id IN (SELECT id FROM files WHERE instr(name_l, '{}') > 0)",
                     sql_literal(s)
                 )
             };
         }
         let lit = sql_literal(&format!("%{s}%"));
-        format!(
-            "id IN (SELECT rowid FROM files_fts WHERE {col} LIKE '{lit}')"
-        )
+        format!("id IN (SELECT rowid FROM files_fts WHERE name_l LIKE '{lit}')")
     } else if for_count {
-        format!("instr({col}, '{}') > 0", sql_literal(s))
+        format!("instr(name_l, '{}') > 0", sql_literal(s))
     } else {
         format!(
-            "id IN (SELECT id FROM files WHERE instr({col}, '{}') > 0)",
+            "id IN (SELECT id FROM files WHERE instr(name_l, '{}') > 0)",
+            sql_literal(s)
+        )
+    }
+}
+
+/// Full-path substring: plain instr over path_l (the serve mem engine covers
+/// this with a SIMD scan; CLI one-shots accept the ~0.4s scan).
+fn path_substring_sql(s: &str, for_count: bool) -> String {
+    if for_count {
+        format!("instr(path_l, '{}') > 0", sql_literal(s))
+    } else {
+        format!(
+            "id IN (SELECT id FROM files WHERE instr(path_l, '{}') > 0)",
             sql_literal(s)
         )
     }
