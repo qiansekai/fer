@@ -16,12 +16,13 @@
 - 🔍 **过滤查询语言**：`ext: size: dm: dc: type: hidden: parent: path: name:` + 取反（`!`）
 - 🔄 **实时监控**：`fer monitor` 轮询 USN 日志增量更新（删除按 FRN 直删）
 - 🌐 **HTTP API + 网页 UI** + **CLI --json**（稳定 JSON 输出，面向 agent）
-- 🧠 **serve 模式全内存搜索引擎**（Everything 路线）：启动时把全量索引装进
-  紧凑内存结构（~970MB，15s），查询在内存的排序数组 + SIMD 扫描上完成；
-  混合分发——≥3 字子串走 SQLite FTS5 trigram（12-25ms），其余全部内存
-  （0-70ms）；`--no-mem-index` 可关闭
-- ✅ 测试闭环：单元 + 端到端 + 真实卷（`#[ignore]`）+ 内存引擎与 SQL 结果
-  一致性测试（18 种查询）+ 与 Everything(es) 交叉验证
+- 🧠 **Everything 架构**：`fer index` 一次性把全盘扫进内存引擎并写成
+  **FERIDX01 dump**（~1GB）；查询全靠内存的排序数组 + SIMD 扫描，dump 用
+  **mmap 零拷贝加载**（serve 启动 ~135ms，CLI 全查询 17-336ms）
+- 🔄 **USN 实时监控**（需管理员）：monitor 常驻内存增量追平 + 防抖写回 dump，
+  崩溃后从 USN 日志回放，无需重建
+- ✅ 测试闭环：单元 + 端到端 + 真实卷（`#[ignore]`）+ SQLite 交叉验证
+  （store.rs 保留为测试参照 oracle，不进生产路径）
 
 ## 构建
 
@@ -149,29 +150,29 @@ cargo test --test live_volume -- --ignored --nocapture   # 真实卷（需管理
 | `hidden:true`（部分索引） | 583 | ~0 ms |
 | `ext:mp4 size:>100mb` | 42 | 9 ms |
 | `parent:D:\Kita-Tools\Coding` | 77,899 | 57 ms |
-| `报告`（2 字 CJK） | 41 | 67 ms（内存扫描）/ 361 ms（CLI·SQL） |
-| `Cargo.toml`（≥3 字，FTS5） | 2,603 | 15-29 ms |
-| `dm:thisweek`（127 万命中） | 1,267,550 | 24-155 ms |
-| `*.rs` / `ext:mp4 size:>100mb` | 40,075 / 42 | **0-1 ms** |
-| `main*.rs`（通配符） | 161 | 2 ms + dump 加载 0.3s（CLI） |
-| 路径子串（含 `\` 裸词） | 82,538 | 91 ms + dump 加载 0.38s（CLI） |
+| `报告`（2 字 CJK） | 41 | 61-153 ms（内存扫描） |
+| `Cargo.toml`（名字子串） | 2,603 | 55 ms |
+| `dm:thisweek`（127 万命中） | 1,267,567 | 29-51 ms |
+| `*.rs` / `main*.rs` | 40,075 / 161 | **0-6 ms** |
+| 路径子串（含 `\` 裸词） | 84,166 | 232-290 ms |
 
-索引构建：全盘 ~416 万条（MFT 路径含硬链接别名），**~91s**，构建收尾自动写
-**FERIDX01 dump**（~1GB，原子替换）。
-- **serve**：优先加载 dump（**启动 ~1s**），不新鲜/缺失时回退 SQLite 物化（~10s）
-- **CLI**：快查询走 SQLite（20-50ms）；路径子串/通配符等慢扫描查询按需加载 dump
-  走 SIMD（查询 ~90ms + 加载 ~0.3-0.4s）
-- **monitor**：仍写 SQLite；其写入使 dump 过期（非空 WAL mtime 判断），下次加载自动回退
+索引构建：全盘 ~416 万条（MFT 路径含硬链接别名），**热缓存 ~11s / 冷盘 ~40-50s**
+（MFT 扫描 43s 是磁盘物理下限），构建收尾原子写 **FERIDX01 dump**（~1GB）。
+- **serve**：mmap 零拷贝加载，**启动 ~135ms**（含进程启动），全查询 0-232ms
+- **CLI**：同样零拷贝，**全查询 17-336ms**（含进程启动），无 SQLite、无门控
+- **monitor**：USN 增量进内存，默认每 60s 防抖写回 dump（`--flush-secs` 可调）
+
+索引构建：全盘 ~416 万条（MFT 路径含硬链接别名），**热缓存 ~11s / 冷盘 ~40-50s**，
+构建收尾原子写 **FERIDX01 dump**（~1GB，mmap 零拷贝加载，加载 ~1ms）。
 serve 模式：内存引擎加载 **15s / 970MB**，工作集 ~2GB（含 mmap 页缓存，OS 可回收）；
 CLI 一次性查询不吃这份内存（~0-90ms，SQL）。
 
 ## 已知限制 / TODO
 
-- serve/CLI 的 dump 是构建时快照：monitor 的增量使 dump 过期，需重建或
-  `POST /api/rescan` 刷新
-- dump 加载是整读进堆（~0.3-0.4s）；零拷贝 mmap 版视图留作升级
-- 内存引擎的路径排序只折叠 ASCII 大小写（非 ASCII 大小写字母如 É/Ö 按字节比较，
-  SQL 回退路径会 Unicode 小写化）——Windows 路径中极少见
+- 索引 = dump 快照 + monitor 增量；monitor 不在线时文件变动不反映（下次
+  `fer index` 或 monitor 启动回放 USN 日志补齐）
+- 内存引擎的路径排序只折叠 ASCII 大小写（非 ASCII 大小写字母如 É/Ö 按字节比较）
+  ——Windows 路径中极少见
 - 8.3 短名（namespace=2）不入索引（避免噪音）；分片 `$MFT` 回退 USN 路径会丢失
   硬链接别名与大小/时间元数据
 - FAT/exFAT 卷不支持（监控需 ReadDirectoryChangesW，列为 TODO）

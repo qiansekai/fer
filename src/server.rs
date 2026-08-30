@@ -1,6 +1,9 @@
-//! HTTP API server (axum) with a minimal web UI.
+//! HTTP API server (axum) with a minimal web UI. Queries run entirely
+//! against the in-memory engine; `/api/rescan` rebuilds from the volumes and
+//! refreshes the dump + the live engine.
 
-use std::sync::{Arc, Mutex, RwLock};
+use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
 use axum::{
@@ -13,28 +16,24 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::indexer::{self, Method};
-use crate::mem::MemIndex;
-use crate::store::Store;
+use crate::mem::{MemIndex, dump_path};
 use crate::usn;
 
 #[derive(Clone)]
 struct AppState {
-    db: Arc<Mutex<Store>>,
-    mem: Arc<RwLock<Option<Arc<MemIndex>>>>,
+    mem: Arc<RwLock<Arc<MemIndex>>>,
+    db: PathBuf,
 }
 
-pub async fn serve(addr: &str, store: Store, mem_index: bool) -> Result<()> {
-    let mem = if mem_index {
-        match load_mem(&store) {
-            Some(m) => Some(Arc::new(m)),
-            None => None,
-        }
-    } else {
-        None
-    };
+pub async fn serve(addr: &str, mem: MemIndex, db: &std::path::Path) -> Result<()> {
+    eprintln!(
+        "[server] memory index ready: {} entries, {} MB",
+        mem.len(),
+        mem.memory_bytes() / (1 << 20)
+    );
     let state = AppState {
-        db: Arc::new(Mutex::new(store)),
-        mem: Arc::new(RwLock::new(mem)),
+        mem: Arc::new(RwLock::new(Arc::new(mem))),
+        db: db.to_path_buf(),
     };
     let app = Router::new()
         .route("/", get(index_page))
@@ -47,45 +46,6 @@ pub async fn serve(addr: &str, store: Store, mem_index: bool) -> Result<()> {
     eprintln!("[server] listening on http://{addr}");
     axum::serve(listener, app).await?;
     Ok(())
-}
-
-/// Load the in-memory engine: prefer the pre-built dump (sub-second), fall
-/// back to materializing from SQLite when the dump is missing or stale.
-fn load_mem(store: &Store) -> Option<MemIndex> {
-    let t = std::time::Instant::now();
-    let db = store.db_path();
-    let dump = crate::mem::dump_path(db);
-    if crate::mem::dump_is_fresh(db) {
-        match MemIndex::load_dump(&dump) {
-            Ok(m) => {
-                eprintln!(
-                    "[server] memory index loaded from dump: {} entries, {} MB in {} ms",
-                    m.len(),
-                    m.memory_bytes() / (1 << 20),
-                    t.elapsed().as_millis()
-                );
-                return Some(m);
-            }
-            Err(e) => {
-                eprintln!("[server] dump load failed ({e:#}) — falling back to SQL materialization");
-            }
-        }
-    }
-    match store.load_mem_index() {
-        Ok(m) => {
-            eprintln!(
-                "[server] memory index materialized from SQL: {} entries, {} MB in {} ms",
-                m.len(),
-                m.memory_bytes() / (1 << 20),
-                t.elapsed().as_millis()
-            );
-            Some(m)
-        }
-        Err(e) => {
-            eprintln!("[server] memory index failed ({e:#}) — falling back to SQL");
-            None
-        }
-    }
 }
 
 async fn index_page() -> Html<&'static str> {
@@ -109,91 +69,68 @@ async fn search(State(st): State<AppState>, Query(q): Query<SearchQuery>) -> Jso
         Ok(p) => p,
         Err(e) => return Json(json!({ "ok": false, "error": e.to_string() })),
     };
-    // Hybrid dispatch: ≥3-char substrings ride the FTS5 trigram index (SQL
-    // wins there); everything else — short substrings, suffix, prefix, ranges,
-    // flags, globs — runs in the memory engine (Everything-style). The mem
-    // scan (up to ~70ms) runs off the executor via spawn_blocking.
-    let use_sql = crate::mem::MemIndex::prefers_sql(&parsed);
-    if !use_sql {
-        // NB: bind the clone to a variable first — a temporary RwLock guard
-        // in an if-let scrutinee would live across the `.await` below and
-        // make the handler future !Send.
-        let mem = st.mem.read().unwrap().clone();
-        if let Some(mem) = mem {
-            let qq = q.q.clone();
-            let pq = parsed.clone();
-            let outcome = tokio::task::spawn_blocking(move || {
-                let ids = mem.search(&pq);
-                let total = ids.len() as u64;
-                let hits = mem.hits(&ids, limit);
-                (total, hits)
-            })
-            .await;
-            if let Ok((total, hits)) = outcome {
-                return Json(json!({
-                    "ok": true,
-                    "query": qq,
-                    "engine": "mem",
-                    "count": hits.len(),
-                    "total": total,
-                    "took_ms": t.elapsed().as_millis(),
-                    "hits": hits,
-                }));
-            }
-        }
-    }
-    let store = st.db.lock().unwrap();
-    let result = match store.search_query(&parsed, Some(limit)) {
-        Ok(r) => json!({
+    // Bind the Arc clone to a local first: a temporary RwLock guard in the
+    // if-let scrutinee would live across the `.await` and make the handler
+    // future !Send. The scan (up to ~70ms) runs off the executor.
+    let mem = st.mem.read().unwrap().clone();
+    let qq = q.q.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        let ids = mem.search(&parsed);
+        let total = ids.len() as u64;
+        let hits = mem.hits(&ids, limit);
+        (total, hits)
+    })
+    .await;
+    match outcome {
+        Ok((total, hits)) => Json(json!({
             "ok": true,
-            "query": q.q,
-            "engine": "sql",
-            "count": r.hits.len(),
-            "total": r.total,
+            "query": qq,
+            "engine": "mem",
+            "count": hits.len(),
+            "total": total,
             "took_ms": t.elapsed().as_millis(),
-            "hits": r.hits,
-        }),
-        Err(e) => json!({ "ok": false, "error": e.to_string() }),
-    };
-    Json(result)
+            "hits": hits,
+        })),
+        Err(e) => Json(json!({ "ok": false, "error": e.to_string() })),
+    }
 }
 
 async fn stats(State(st): State<AppState>) -> Json<Value> {
-    let store = st.db.lock().unwrap();
-    let (files, dirs) = store.counts().unwrap_or((0, 0));
-    let vols: Vec<String> = usn::list_volumes()
-        .iter()
-        .map(|v| format!("{}: ({}) [{}]", v.drive, v.label.trim(), v.fs))
-        .collect();
-    let mem = st.mem.read().unwrap().as_ref().map(|m| {
-        json!({ "entries": m.len(), "bytes": m.memory_bytes() })
+    let mem = st.mem.read().unwrap().clone();
+    let (files, dirs): (u64, u64) = (0..mem.len()).fold((0, 0), |(f, d), i| {
+        if mem.meta_at(i).is_dir {
+            (f, d + 1)
+        } else {
+            (f + 1, d)
+        }
     });
+    let dump = dump_path(&st.db);
+    let dump_mb = std::fs::metadata(&dump).map(|m| m.len() / (1 << 20)).unwrap_or(0);
     Json(json!({
         "ok": true,
         "files": files,
         "dirs": dirs,
         "entries": files + dirs,
-        "db": store.db_path().to_string_lossy(),
-        "volumes": vols,
-        "mem_index": mem,
+        "dump": dump.to_string_lossy(),
+        "dump_mb": dump_mb,
+        "mem_bytes": mem.memory_bytes(),
     }))
 }
 
 async fn rescan(State(st): State<AppState>) -> Json<Value> {
     let db = st.db.clone();
-    let mem_slot = st.mem.clone();
-    let outcome = tokio::task::spawn_blocking(move || -> anyhow::Result<crate::BuildReport> {
-        let mut store = db.lock().unwrap();
+    let slot = st.mem.clone();
+    let outcome = tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
         let vols = usn::list_volumes();
-        let report = indexer::build(&mut store, &vols, Method::Auto)?;
-        // Reload the in-memory engine so it reflects the new index.
-        let mem = load_mem(&store);
-        *mem_slot.write().unwrap() = mem.map(Arc::new);
-        Ok(report)
+        let (report, mem, _max_usns) = indexer::build(&vols, Method::Auto)?;
+        let dump = dump_path(&db);
+        mem.save(&dump)?;
+        *slot.write().unwrap() = Arc::new(mem);
+        Ok(json!({ "report": report, "dump": dump.to_string_lossy() }))
     })
     .await;
     match outcome {
-        Ok(Ok(report)) => Json(json!({ "ok": true, "report": report })),
+        Ok(Ok(v)) => Json(json!({ "ok": true, "result": v })),
         Ok(Err(e)) => Json(json!({ "ok": false, "error": format!("{e:#}") })),
         Err(e) => Json(json!({ "ok": false, "error": e.to_string() })),
     }
@@ -225,18 +162,13 @@ const q=document.getElementById('q'),res=document.getElementById('res'),meta=doc
 let t;
 q.addEventListener('input',()=>{clearTimeout(t);t=setTimeout(run,120);});
 async function run(){
-  const v=q.value;
-  if(!v){res.innerHTML='';meta.textContent='';return;}
-  const url='/api/search?q='+encodeURIComponent(v)+'&limit=200'+(document.getElementById('p').checked?'&path=true':'');
-  const j=await (await fetch(url)).json();
-  res.innerHTML='';meta.textContent=(j.total??0)+' 条命中 · '+(j.took_ms??0)+' ms';
-  for(const h of (j.hits||[])){
-    const li=document.createElement('li');
-    if(h.is_dir)li.className='dir';
-    li.textContent=h.path;
-    res.appendChild(li);
-  }
+  const v=q.value.trim();if(!v){res.innerHTML='';meta.textContent='';return;}
+  const s=Date.now();
+  const r=await fetch('/api/search?q='+encodeURIComponent(v)+'&limit=100').then(x=>x.json());
+  meta.textContent=r.total+' 个结果 · '+(Date.now()-s)+' ms · '+r.engine;
+  res.innerHTML=(r.hits||[]).map(h=>'<li'+(h.is_dir?' class="dir"':'')+'>'+h.path.replace(/&/g,'&amp;').replace(/</g,'&lt;')+'</li>').join('');
 }
+run();
 </script>
-</body></html>
-"#;
+</body>
+</html>"#;

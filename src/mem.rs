@@ -20,6 +20,7 @@
 //! lowercases them. Extremely rare in Windows paths.
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -336,6 +337,56 @@ impl MemIndex {
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Path of entry `i` reconstructed from the arena (display casing).
+    pub fn path_at(&self, i: usize) -> String {
+        let e = &self.entries[i];
+        String::from_utf8_lossy(
+            &self.paths[e.path_off as usize..(e.path_off as usize + e.path_len as usize)],
+        )
+        .into_owned()
+    }
+
+    /// Metadata of entry `i` (monitor / dupes / flush use).
+    pub fn meta_at(&self, i: usize) -> EntryMeta {
+        let e = &self.entries[i];
+        EntryMeta {
+            is_dir: e.is_dir != 0,
+            size: e.size,
+            mtime: e.mtime,
+            ctime: e.ctime,
+            flags: e.flags,
+            frn: (e.frn != 0).then_some(e.frn),
+        }
+    }
+
+    /// FRN → entry-index map for the monitor's delete-by-FRN fast path.
+    pub fn frn_map(&self) -> HashMap<u64, u32> {
+        let mut m = HashMap::with_capacity(self.entries.len());
+        for (i, e) in self.entries.iter().enumerate() {
+            if e.frn != 0 {
+                m.insert(e.frn, i as u32);
+            }
+        }
+        m
+    }
+
+    /// Exact (ASCII-CI) path lookup — the monitor dedupes create/rename events
+    /// against existing entries via the CI-sorted path permutation.
+    pub fn find_path_idx(&self, path: &str) -> Option<usize> {
+        let needle = path.as_bytes();
+        let lo = self.by_path.partition_point(|&i| {
+            ci_cmp(path_of(&self.entries, &self.paths, i), needle) == Ordering::Less
+        });
+        let hi = self.by_path.partition_point(|&i| {
+            let p = path_of(&self.entries, &self.paths, i);
+            ci_cmp(p, needle) == Ordering::Less || ci_starts_with(p, needle)
+        });
+        self.by_path[lo..hi]
+            .iter()
+            .find(|&&i| ci_cmp(path_of(&self.entries, &self.paths, i), needle) == Ordering::Equal)
+            .map(|&i| i as usize)
     }
 
     pub fn memory_bytes(&self) -> usize {

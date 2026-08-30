@@ -6,7 +6,8 @@
 use std::time::Instant;
 
 use file_engine_rust::indexer::{self, Method};
-use file_engine_rust::store::Store;
+use file_engine_rust::mem::MemIndex;
+use file_engine_rust::query::Query;
 use file_engine_rust::usn::UsnVolume;
 
 fn drive() -> char {
@@ -56,48 +57,48 @@ fn live_build_and_instant_search() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let mut store = Store::open(&dir.path().join("live.db")).unwrap();
     let vols = indexer::resolve_volumes(&d.to_string());
     assert_eq!(vols.len(), 1);
 
     let t = Instant::now();
-    let report = indexer::build(&mut store, &vols, Method::Mft).unwrap();
+    let (report, mem, _max_usns) = indexer::build(&vols, Method::Mft).unwrap();
     let build_ms = t.elapsed().as_millis();
 
+    // dump roundtrip: save → zero-copy load → query
+    let dump = dir.path().join("live.db");
+    mem.save(&dump).unwrap();
+    let loaded = MemIndex::load_dump(&dump).unwrap();
     let t2 = Instant::now();
-    let r = store.search("ntdll.dll", false, None).unwrap();
+    let q = Query::parse("ntdll.dll").unwrap();
+    let r = loaded.hits(&loaded.search(&q), 100);
     let search_ms = t2.elapsed().as_millis();
-    let r2 = store.search("hosts", false, None).unwrap();
-    // Hard-link parity: the raw MFT scan resolves System32\ntdll.dll → WinSxS.
-    let r3 = store.search("ntdll.dll", false, None).unwrap();
+    let q2 = Query::parse("hosts").unwrap();
+    let r2 = loaded.hits(&loaded.search(&q2), 100);
 
     eprintln!(
         "[{d}:] build: {build_ms} ms -> {} files + {} dirs (skipped {})",
         report.files, report.dirs, report.skipped
     );
-    eprintln!("[{d}:] search 'ntdll.dll': {} hits in {search_ms} ms", r.hits.len());
+    eprintln!("[{d}:] search 'ntdll.dll': {} hits in {search_ms} ms", r.len());
 
     assert!(report.files > 100_000, "unexpectedly few files indexed");
-    assert!(r.hits.len() >= 6, "expected several ntdll.dll hits, got {}", r.hits.len());
+    assert!(r.len() >= 6, "expected several ntdll.dll hits, got {}", r.len());
     assert!(
-        r2.hits
-            .iter()
+        r2.iter()
             .any(|h| h.path.to_ascii_lowercase() == "c:\\windows\\system32\\drivers\\etc\\hosts"),
         "hosts not found by search"
     );
     assert!(
-        r3.hits
-            .iter()
+        r.iter()
             .any(|h| h.path.to_ascii_lowercase() == "c:\\windows\\system32\\ntdll.dll"),
         "hard-link alias System32\\ntdll.dll not resolved by raw MFT scan"
     );
-    // metadata sanity: ntdll.dll hits carry real sizes (a rare NTFS quirk can
-    // leave a single stale 0-size $FILE_NAME — allow a couple)
-    let with_size = r3.hits.iter().filter(|h| h.size > 0).count();
+    // metadata sanity: ntdll.dll hits carry real sizes
+    let with_size = r.iter().filter(|h| h.size > 0).count();
     assert!(
-        with_size >= r3.hits.len().saturating_sub(2),
+        with_size >= r.len().saturating_sub(2),
         "expected real sizes from the MFT scan: {with_size}/{}",
-        r3.hits.len()
+        r.len()
     );
     assert!(search_ms < 1000, "search took {search_ms} ms — not instant enough");
 }

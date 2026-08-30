@@ -1,13 +1,14 @@
 //! Index build orchestration: raw $MFT scan (full parity, admin) with USN and
-//! walk fallbacks.
+//! walk fallbacks. The build streams straight into the in-memory engine —
+//! SQLite is no longer on the build path (it survives only as a dev-time
+//! query oracle in the test suite).
 
 use std::time::Instant;
 
 use anyhow::{Result, bail};
 
 use crate::mft::MftScanner;
-use crate::mem::{self, MemBuilder};
-use crate::store::{Rebuild, Store};
+use crate::mem::{MemBuilder, MemIndex};
 use crate::usn::{self, UsnVolume, VolumeInfo};
 use crate::{BuildReport, EntryMeta};
 
@@ -46,7 +47,10 @@ pub fn resolve_volumes(volumes: &str) -> Vec<VolumeInfo> {
     all.into_iter().filter(|v| wanted.contains(&v.drive)).collect()
 }
 
-pub fn build(store: &mut Store, volumes: &[VolumeInfo], method: Method) -> Result<BuildReport> {
+/// Full rebuild: streams every volume straight into the in-memory engine and
+/// returns it (the caller saves the dump). Also returns the per-volume max
+/// USN so the monitor can start from the current journal position.
+pub fn build(volumes: &[VolumeInfo], method: Method) -> Result<(BuildReport, MemIndex, Vec<(char, i64)>)> {
     let start = Instant::now();
     let mut report = BuildReport {
         volumes: volumes
@@ -55,18 +59,18 @@ pub fn build(store: &mut Store, volumes: &[VolumeInfo], method: Method) -> Resul
             .collect(),
         ..Default::default()
     };
-    let mut rb = store.begin_rebuild()?;
     let mut mb = MemBuilder::default();
     let mut methods: Vec<&str> = Vec::new();
+    let mut max_usns: Vec<(char, i64)> = Vec::new();
     for vol in volumes {
-        let stats = index_volume(vol, method, &mut rb, &mut mb)?;
-        if stats.max_usn > 0 {
-            store.set_meta(&format!("last_usn:{}", vol.drive), &stats.max_usn.to_string())?;
-        }
+        let stats = index_volume(vol, method, &mut mb)?;
         report.files += stats.files;
         report.dirs += stats.dirs;
         report.skipped += stats.skipped;
         report.max_usn = report.max_usn.max(stats.max_usn);
+        if stats.max_usn > 0 {
+            max_usns.push((vol.drive, stats.max_usn));
+        }
         if !methods.contains(&stats.method) {
             methods.push(stats.method);
         }
@@ -75,27 +79,14 @@ pub fn build(store: &mut Store, volumes: &[VolumeInfo], method: Method) -> Resul
             stats.method, vol.drive, vol.label.trim(), stats.files, stats.dirs, stats.skipped
         );
     }
-    rb.commit()?;
-    // Build the in-memory engine from the same stream and dump it atomically —
-    // serve/CLI then load this instead of re-materializing from SQLite.
-    let t_dump = Instant::now();
-    let mem = mb.finish();
-    let dump = mem::dump_path(store.db_path());
-    mem.save(&dump)?;
-    eprintln!(
-        "[dump] {} entries, {} MB written to {} in {} ms",
-        mem.len(),
-        mem.memory_bytes() / (1 << 20),
-        dump.display(),
-        t_dump.elapsed().as_millis()
-    );
     report.elapsed_ms = start.elapsed().as_millis();
     report.method = if methods.len() == 1 {
         methods[0].to_string()
     } else {
         "mixed".to_string()
     };
-    Ok(report)
+    let mem = mb.finish();
+    Ok((report, mem, max_usns))
 }
 
 struct VolStats {
@@ -106,34 +97,29 @@ struct VolStats {
     method: &'static str,
 }
 
-fn index_volume(
-    vol: &VolumeInfo,
-    method: Method,
-    rb: &mut Rebuild<'_>,
-    mb: &mut MemBuilder,
-) -> Result<VolStats> {
+fn index_volume(vol: &VolumeInfo, method: Method, mb: &mut MemBuilder) -> Result<VolStats> {
     match method {
-        Method::Walk => index_walk(vol, rb, mb),
-        Method::Usn => index_usn(vol, rb, mb),
-        Method::Mft => index_mft(vol, rb, mb),
+        Method::Walk => index_walk(vol, mb),
+        Method::Usn => index_usn(vol, mb),
+        Method::Mft => index_mft(vol, mb),
         Method::Auto => {
             // Full-parity MFT scan first; USN enumeration as middle fallback;
             // directory walk as last resort.
-            match index_mft(vol, rb, mb) {
+            match index_mft(vol, mb) {
                 Ok(stats) => Ok(stats),
                 Err(e) => {
                     eprintln!(
                         "[warn] raw MFT scan failed for {}: — falling back to USN: {e:#}",
                         vol.drive
                     );
-                    match index_usn(vol, rb, mb) {
+                    match index_usn(vol, mb) {
                         Ok(stats) => Ok(stats),
                         Err(e2) => {
                             eprintln!(
                                 "[warn] USN indexing failed for {}: — falling back to walk: {e2:#}",
                                 vol.drive
                             );
-                            index_walk(vol, rb, mb)
+                            index_walk(vol, mb)
                         }
                     }
                 }
@@ -143,7 +129,7 @@ fn index_volume(
 }
 
 /// Raw $MFT scan: full parity — hard-link aliases, size, mtime, flags.
-fn index_mft(vol: &VolumeInfo, rb: &mut Rebuild<'_>, mb: &mut MemBuilder) -> Result<VolStats> {
+fn index_mft(vol: &VolumeInfo, mb: &mut MemBuilder) -> Result<VolStats> {
     let t = Instant::now();
     eprintln!("[mft] indexing {}: via raw $MFT ...", vol.drive);
     let scanner = MftScanner::open(vol.drive)?;
@@ -181,7 +167,6 @@ fn index_mft(vol: &VolumeInfo, rb: &mut Rebuild<'_>, mb: &mut MemBuilder) -> Res
     );
     let mut stats = VolStats { files: 0, dirs: 0, skipped: 0, max_usn: 0, method: "mft" };
     let mut processed = 0u64;
-    let mut first_err: Option<anyhow::Error> = None;
     stats.skipped = builder.build(|path, meta| {
         if meta.is_dir {
             stats.dirs += 1;
@@ -192,21 +177,13 @@ fn index_mft(vol: &VolumeInfo, rb: &mut Rebuild<'_>, mb: &mut MemBuilder) -> Res
         if processed % 200_000 == 0 {
             eprintln!("[mft] {}: {processed} entries inserted ...", vol.drive);
         }
-        if let Err(err) = rb.insert(path, meta) {
-            if first_err.is_none() {
-                first_err = Some(err);
-            }
-        }
         mb.push(path, meta);
     });
-    if let Some(err) = first_err {
-        return Err(err);
-    }
     Ok(stats)
 }
 
 /// USN/MFT enumeration fallback: primary names only, no size/timestamps.
-fn index_usn(vol: &VolumeInfo, rb: &mut Rebuild<'_>, mb: &mut MemBuilder) -> Result<VolStats> {
+fn index_usn(vol: &VolumeInfo, mb: &mut MemBuilder) -> Result<VolStats> {
     let t = Instant::now();
     eprintln!("[usn] indexing {}: via NTFS USN ...", vol.drive);
     let handle = UsnVolume::open(vol.drive)?;
@@ -228,7 +205,6 @@ fn index_usn(vol: &VolumeInfo, rb: &mut Rebuild<'_>, mb: &mut MemBuilder) -> Res
     );
     let mut stats = VolStats { files: 0, dirs: 0, skipped: 0, max_usn, method: "usn" };
     let mut processed = 0u64;
-    let mut first_err: Option<anyhow::Error> = None;
     stats.skipped = builder.build(|path, meta| {
         if meta.is_dir {
             stats.dirs += 1;
@@ -239,25 +215,16 @@ fn index_usn(vol: &VolumeInfo, rb: &mut Rebuild<'_>, mb: &mut MemBuilder) -> Res
         if processed % 200_000 == 0 {
             eprintln!("[usn] {}: {processed} entries inserted ...", vol.drive);
         }
-        if let Err(err) = rb.insert(path, meta) {
-            if first_err.is_none() {
-                first_err = Some(err);
-            }
-        }
         mb.push(path, meta);
     });
-    if let Some(err) = first_err {
-        return Err(err);
-    }
     Ok(stats)
 }
 
-fn index_walk(vol: &VolumeInfo, rb: &mut Rebuild<'_>, mb: &mut MemBuilder) -> Result<VolStats> {
+fn index_walk(vol: &VolumeInfo, mb: &mut MemBuilder) -> Result<VolStats> {
     let root = format!("{}:\\", vol.drive);
     eprintln!("[walk] indexing {root} ...");
     let mut stats = VolStats { files: 0, dirs: 0, skipped: 0, max_usn: 0, method: "walk" };
     let mut processed = 0u64;
-    let mut first_err: Option<anyhow::Error> = None;
     stats.skipped = crate::walk::scan_tree(&root, |path: &str, meta: EntryMeta| {
         if meta.is_dir {
             stats.dirs += 1;
@@ -268,15 +235,7 @@ fn index_walk(vol: &VolumeInfo, rb: &mut Rebuild<'_>, mb: &mut MemBuilder) -> Re
         if processed % 200_000 == 0 {
             eprintln!("[walk] {}: {processed} entries inserted ...", vol.drive);
         }
-        if let Err(err) = rb.insert(path, meta) {
-            if first_err.is_none() {
-                first_err = Some(err);
-            }
-        }
         mb.push(path, meta);
     });
-    if let Some(err) = first_err {
-        return Err(err);
-    }
     Ok(stats)
 }

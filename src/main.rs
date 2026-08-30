@@ -6,8 +6,8 @@ use clap::{Parser, Subcommand};
 use serde_json::json;
 
 use file_engine_rust::indexer::{self, Method};
+use file_engine_rust::mem::{MemIndex, dump_path};
 use file_engine_rust::query::Query;
-use file_engine_rust::store::Store;
 use file_engine_rust::usn;
 
 #[derive(Parser)]
@@ -15,7 +15,8 @@ use file_engine_rust::usn;
 struct Cli {
     #[command(subcommand)]
     command: Cmd,
-    /// SQLite index path (default: %LOCALAPPDATA%\file-engine-rust\index.db)
+    /// Index base path (default: %LOCALAPPDATA%\file-engine-rust\index.db;
+    /// the actual index is the .feridx dump next to it)
     #[arg(long, global = true)]
     db: Option<PathBuf>,
     /// Machine-readable JSON output (stable for agents)
@@ -27,7 +28,7 @@ struct Cli {
 enum Cmd {
     /// List fixed NTFS volumes
     Volumes,
-    /// (Re)build the index
+    /// (Re)build the index (writes the .feridx dump)
     Index {
         /// Comma-separated drive letters; empty = all fixed NTFS volumes
         #[arg(long, default_value = "")]
@@ -50,10 +51,6 @@ enum Cmd {
     Serve {
         #[arg(long, default_value = "127.0.0.1:9876")]
         addr: String,
-        /// Disable the in-memory name index (saves ~120 MB; 1-2 char queries
-        /// fall back to the slower SQL scan)
-        #[arg(long)]
-        no_mem_index: bool,
     },
     /// Watch the USN journal and keep the index live (requires admin)
     Monitor {
@@ -61,11 +58,12 @@ enum Cmd {
         volume: char,
         #[arg(long, default_value_t = 5)]
         interval_secs: u64,
+        /// Flush the in-memory index back to the dump at least this often
+        #[arg(long, default_value_t = 60)]
+        flush_secs: u64,
     },
     /// Index statistics
     Stats,
-    /// Compact the database file (one-off maintenance after migrations)
-    Vacuum,
     /// Find duplicate files (same size + identical content)
     Dupes {
         /// Only consider files at least this big (e.g. 1kb, 10mb)
@@ -90,6 +88,18 @@ fn default_db() -> PathBuf {
 fn print_json(value: serde_json::Value) -> Result<()> {
     println!("{}", serde_json::to_string(&value)?);
     Ok(())
+}
+
+/// Load the dump; if missing, point the user at the one-time index build.
+fn load_index(db: &PathBuf) -> Result<MemIndex> {
+    let dump = dump_path(db);
+    if !dump.exists() {
+        anyhow::bail!(
+            "no index at {} — run `fer index` once (builds it in ~1 minute)",
+            dump.display()
+        );
+    }
+    MemIndex::load_dump(&dump)
 }
 
 fn main() -> Result<()> {
@@ -118,19 +128,32 @@ fn main() -> Result<()> {
             for v in &vols {
                 eprintln!("target: {}: ({}) [{}]", v.drive, v.label.trim(), v.fs);
             }
-            let mut store = Store::open(&db)?;
-            let report = indexer::build(&mut store, &vols, method)?;
+            let (report, mem, _max_usns) = indexer::build(&vols, method)?;
+            let t_dump = Instant::now();
+            let dump = dump_path(&db);
+            mem.save(&dump)?;
+            eprintln!(
+                "[dump] {} entries, {} MB written to {} in {} ms",
+                mem.len(),
+                mem.memory_bytes() / (1 << 20),
+                dump.display(),
+                t_dump.elapsed().as_millis()
+            );
             if cli.json {
-                print_json(json!({ "ok": true, "report": report, "db": db.display().to_string() }))?;
+                print_json(json!({
+                    "ok": true,
+                    "report": report,
+                    "dump": dump.display().to_string(),
+                }))?;
             } else {
                 println!(
-                    "indexed {} files + {} dirs in {:.2}s (method: {}, skipped: {}, db: {})",
+                    "indexed {} files + {} dirs in {:.2}s (method: {}, skipped: {}, dump: {})",
                     report.files,
                     report.dirs,
                     report.elapsed_ms as f64 / 1000.0,
                     report.method,
                     report.skipped,
-                    db.display()
+                    dump.display()
                 );
             }
         }
@@ -145,130 +168,89 @@ fn main() -> Result<()> {
                     return Err(e);
                 }
             };
-            // Gated engine choice for CLI one-shots: slow-scan queries (short
-            // substrings, wildcards, path substrings) load the dump and ride
-            // the SIMD memory engine; fast SQL queries stay on SQLite.
-            if file_engine_rust::mem::MemIndex::prefers_dump(&q)
-                && file_engine_rust::mem::dump_is_fresh(&db)
-            {
-                let t_load = Instant::now();
-                if let Ok(mem) =
-                    file_engine_rust::mem::MemIndex::load_dump(&file_engine_rust::mem::dump_path(&db))
-                {
-                    let load_ms = t_load.elapsed().as_millis();
-                    let t = Instant::now();
-                    let ids = mem.search(&q);
-                    let total = ids.len() as u64;
-                    let hits = mem.hits(&ids, limit);
-                    let took = t.elapsed().as_millis();
-                    if cli.json {
-                        print_json(json!({
-                            "ok": true,
-                            "query": query,
-                            "engine": "mem",
-                            "total": total,
-                            "count": hits.len(),
-                            "took_ms": took,
-                            "load_ms": load_ms,
-                            "hits": hits,
-                        }))?;
-                    } else if count_only {
-                        println!("{total}");
-                        eprintln!(
-                            "{total} total results in {took} ms (dump load {load_ms} ms)"
-                        );
-                    } else {
-                        for h in &hits {
-                            println!("{}", h.path);
-                        }
-                        eprintln!(
-                            "{} results (total {total}) in {took} ms (dump load {load_ms} ms)",
-                            hits.len()
-                        );
-                    }
-                    return Ok(());
-                }
-            }
-            let store = Store::open(&db)?;
+            let mem = load_index(&db)?;
             let t = Instant::now();
-            if count_only && !cli.json {
-                // skip the hits query entirely — halved latency on scan-bound
-                // queries (2-char CJK, big wildcards)
-                let total = store.count_query(&q)?;
-                eprintln!("{total} total results in {} ms", t.elapsed().as_millis());
-                return Ok(());
-            }
-            let r = store.search_query(&q, Some(limit))?;
+            let ids = mem.search(&q);
+            let total = ids.len() as u64;
+            let hits = mem.hits(&ids, limit);
             let took = t.elapsed().as_millis();
             if cli.json {
                 print_json(json!({
                     "ok": true,
                     "query": query,
-                    "total": r.total,
-                    "count": r.hits.len(),
+                    "engine": "mem",
+                    "total": total,
+                    "count": hits.len(),
                     "took_ms": took,
-                    "hits": r.hits,
+                    "hits": hits,
                 }))?;
             } else if count_only {
-                println!("{}", r.total);
-                eprintln!("{} total results in {} ms", r.total, took);
+                println!("{total}");
+                eprintln!("{total} total results in {took} ms");
             } else {
-                for h in &r.hits {
+                for h in &hits {
                     println!("{}", h.path);
                 }
                 eprintln!(
-                    "{} results (total {}) in {} ms",
-                    r.hits.len(),
-                    r.total,
-                    took
+                    "{} results (total {total}) in {took} ms",
+                    hits.len()
                 );
             }
         }
-        Cmd::Serve { addr, no_mem_index } => {
-            let store = Store::open(&db)?;
+        Cmd::Serve { addr } => {
+            let mem = load_index(&db)?;
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(file_engine_rust::server::serve(&addr, store, !no_mem_index))?;
+            rt.block_on(file_engine_rust::server::serve(&addr, mem, &db))?;
         }
         Cmd::Monitor {
             volume,
             interval_secs,
+            flush_secs,
         } => {
-            let mut store = Store::open(&db)?;
+            let mem = load_index(&db)?;
+            let dump = dump_path(&db);
             file_engine_rust::monitor::run(
-                &mut store,
+                mem,
                 volume.to_ascii_uppercase(),
+                dump,
                 Duration::from_secs(interval_secs),
+                Duration::from_secs(flush_secs),
             )?;
         }
         Cmd::Stats => {
-            let store = Store::open(&db)?;
-            let (files, dirs) = store.counts()?;
+            let mem = load_index(&db)?;
+            let (files, dirs): (u64, u64) = (0..mem.len()).fold((0, 0), |(f, d), i| {
+                if mem.meta_at(i).is_dir {
+                    (f, d + 1)
+                } else {
+                    (f + 1, d)
+                }
+            });
+            let dump = dump_path(&db);
+            let dump_mb = std::fs::metadata(&dump).map(|m| m.len() / (1 << 20)).unwrap_or(0);
             if cli.json {
                 print_json(json!({
                     "ok": true,
-                    "db": db.display().to_string(),
+                    "dump": dump.display().to_string(),
+                    "dump_mb": dump_mb,
                     "files": files,
                     "dirs": dirs,
                     "entries": files + dirs,
                 }))?;
             } else {
-                println!("db:      {}", db.display());
+                println!("dump:    {}", dump.display());
                 println!("files:   {files}");
                 println!("dirs:    {dirs}");
                 println!("entries: {}", files + dirs);
+                println!("size:    {dump_mb} MB");
             }
-        }
-        Cmd::Vacuum => {
-            let store = Store::open(&db)?;
-            store.vacuum()?;
-            println!("vacuumed {}", db.display());
         }
         Cmd::Dupes { min_size, name, limit } => {
             let min = file_engine_rust::query::parse_bytes(&min_size)?;
-            let store = Store::open(&db)?;
+            let mem = load_index(&db)?;
             let mut last_log = std::time::Instant::now();
             let report = file_engine_rust::dupes::find(
-                &store,
+                &mem,
                 min,
                 name.as_deref(),
                 limit,

@@ -10,12 +10,16 @@ CLI `--json` 与 HTTP API 双通道。
 
 ## 数据流（重要）
 
-- 构建：MFT 扫描 → 同时喂 SQLite（持久/监控落点）和 MemBuilder → 收尾并行 finalize
-  排序 → 原子写 dump `index.db.feridx`（~1GB，格式契约见 mem.rs 顶部注释）
-- serve：`dump_is_fresh` 优先加载 dump（~1s），否则 SQLite 物化（~10s）
-- CLI：`MemIndex::prefers_dump(q)` 门控——路径子串/通配符走 dump；其余走 SQLite
-- monitor：仍写 SQLite；非空 WAL 会让 dump 判过期（空 WAL 忽略 mtime）
-- 构建 ~91s（MFT 扫描 43s + SQLite 落库 + dump 6.5s）；serve 查询 0-67ms 全覆盖
+- **SQLite 已退出生产路径**（store.rs 仅作测试交叉验证 oracle）：索引 =
+  `fer index` 全盘扫描 → 内存引擎 → 原子写 **FERIDX01 dump**（`index.db.feridx`，
+  ~1GB）；构建热缓存 ~11s / 冷盘 ~40-50s
+- dump **mmap 零拷贝加载**（映射泄漏 + 零容量 Vec 视图，加载 ~1ms，页按需缺页）：
+  serve 启动 ~135ms，CLI 全查询 17-336ms（含进程启动）
+- dump 二进制契约：56B repr(C) Entry + 8 字节对齐段 + 头部 17 偏移 + 6 列表计数
+  （v2）；改布局必须 bump FORMAT_VERSION
+- monitor：load dump → USN 增量进内存（frn 映射/删除集/追加列表）→ 默认每 60s
+  防抖重建成新 dump；USN 位置存 `*.feridx.usn` 边车，崩溃靠日志回放补齐
+- serve：全查询走内存引擎；`/api/rescan` 重建 + 换 dump + 热替换引擎
 
 ## 关键路径
 
@@ -60,6 +64,10 @@ cargo test --test live_volume -- --ignored --nocapture       # 真实卷（管�
 - **路径子串扫描必须 CI**（paths arena 存原始大小写，memchr 定位首字节折叠变体 +
   `ci_eq_at` 校验；byte-exact memmem 会漏掉全部大写路径）
 - **dump Entry 布局是二进制契约**（56B repr(C) 无填充），改字段必须 bump FORMAT_VERSION
+- **零容量 Vec 视图**（`Vec::from_raw_parts(ptr, n, 0)` + `mem::forget(mmap)`）：cap=0
+  的 Vec 析构不释放映射内存——这是 mmap 零拷贝的正确姿势；段必须 8 字节对齐
+- monitor 追加项**不要**塞进 frn 映射（删除集偏移会失真）——追加后未落盘即删的
+  直接从追加列表 swap_remove；同窗口同路径多次创建同理去重
 - release 开了 `fat LTO + codegen-units=1 + panic=abort + target-cpu=native`（本机专用）
 - 本仓库有 git（commit 节点：基线/测试全绿/真实卷全绿/性能优化/内存引擎/dupes/极致性能），
   改动前先看 `git log`

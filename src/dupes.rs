@@ -1,10 +1,10 @@
-//! Duplicate-file finder: same-size groups from the index, then content hash
-//! (FNV-1a streaming) + byte-verification to confirm true duplicates.
+//! Duplicate-file finder: same-size groups from the in-memory index, then
+//! content hash (FNV-1a streaming) + byte-verification to confirm duplicates.
 
 use anyhow::Result;
 use serde::Serialize;
 
-use crate::store::Store;
+use crate::mem::MemIndex;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DupGroup {
@@ -24,90 +24,83 @@ pub struct DupReport {
 /// `min_size` bytes, optionally narrowed to a name substring. Groups are
 /// returned most-wasteful first, capped at `limit`.
 pub fn find(
-    store: &Store,
+    mem: &MemIndex,
     min_size: u64,
     name_filter: Option<&str>,
     limit: usize,
     mut progress: impl FnMut(u64),
 ) -> Result<DupReport> {
     let mut report = DupReport::default();
-    let conn = store.conn();
-    // Stream in size order so each same-size group is processed with bounded
-    // memory (group size is small in practice).
-    let sql = match name_filter {
-        Some(f) => format!(
-            "SELECT path, size FROM files WHERE is_dir = 0 AND size >= ?1 AND instr(name_l, '{}') > 0 ORDER BY size, path",
-            crate::store::sql_literal(&f.to_lowercase())
-        ),
-        None => "SELECT path, size FROM files WHERE is_dir = 0 AND size >= ?1 ORDER BY size, path"
-            .to_string(),
-    };
-    let mut stmt = conn.prepare(&sql)?;
-    let mut rows = stmt.query([min_size as i64])?;
+    let filter_l = name_filter.map(|f| f.to_lowercase());
 
+    // Collect candidates (path, size), sorted by size so each same-size group
+    // is processed with bounded memory.
     let mut group: Vec<(String, u64)> = Vec::new();
-    let mut cur_size: u64 = u64::MAX;
-    let flush = |report: &mut DupReport,
-                 group: &mut Vec<(String, u64)>,
-                 limit: usize,
-                 progress: &mut dyn FnMut(u64)| {
-        if group.len() < 2 {
-            group.clear();
-            return;
+    for i in 0..mem.len() {
+        let meta = mem.meta_at(i);
+        if meta.is_dir || meta.size < min_size {
+            continue;
         }
-        let size = group[0].1;
-        let mut hashed: Vec<(String, u64)> = Vec::with_capacity(group.len());
-        for (path, _) in group.drain(..) {
-            match hash_file(&path) {
-                Ok(h) => hashed.push((path, h)),
-                Err(_) => report.skipped += 1,
+        if let Some(f) = &filter_l {
+            let name = crate::basename(mem.path_at(i).as_str()).to_lowercase();
+            if !name.contains(f.as_str()) {
+                continue;
             }
-            report.files_hashed += 1;
-            progress(report.files_hashed);
         }
-        hashed.sort_unstable_by_key(|(_, h)| *h);
-        let mut i = 0;
-        while i < hashed.len() {
-            let h = hashed[i].1;
-            let mut j = i + 1;
-            while j < hashed.len() && hashed[j].1 == h {
-                j += 1;
+        group.push((mem.path_at(i), meta.size));
+    }
+    group.sort_unstable_by_key(|(_, s)| *s);
+
+    let mut i = 0;
+    while i < group.len() {
+        let size = group[i].1;
+        let mut j = i + 1;
+        while j < group.len() && group[j].1 == size {
+            j += 1;
+        }
+        if j - i >= 2 {
+            let mut hashed: Vec<(String, u64)> = Vec::with_capacity(j - i);
+            for (path, _) in &group[i..j] {
+                match hash_file(path) {
+                    Ok(h) => hashed.push((path.clone(), h)),
+                    Err(_) => report.skipped += 1,
+                }
+                report.files_hashed += 1;
+                progress(report.files_hashed);
             }
-            if j - i >= 2 {
-                // Byte-verify against the first candidate (streaming compare).
-                let mut paths: Vec<String> = Vec::with_capacity(j - i);
-                for (path, _) in &hashed[i..j] {
-                    if paths.is_empty() || files_equal(&hashed[i].0, path) {
-                        paths.push(path.clone());
+            hashed.sort_unstable_by_key(|(_, h)| *h);
+            let mut a = 0;
+            while a < hashed.len() {
+                let h = hashed[a].1;
+                let mut b = a + 1;
+                while b < hashed.len() && hashed[b].1 == h {
+                    b += 1;
+                }
+                if b - a >= 2 {
+                    // Byte-verify against the first candidate.
+                    let mut paths: Vec<String> = Vec::with_capacity(b - a);
+                    for (path, _) in &hashed[a..b] {
+                        if paths.is_empty() || files_equal(&hashed[a].0, path) {
+                            paths.push(path.clone());
+                        }
+                    }
+                    if paths.len() >= 2 {
+                        let wasted = size * (paths.len() as u64 - 1);
+                        report.wasted_bytes += wasted;
+                        report.groups.push(DupGroup { size, paths });
                     }
                 }
-                if paths.len() >= 2 {
-                    let wasted = size * (paths.len() as u64 - 1);
-                    report.wasted_bytes += wasted;
-                    report.groups.push(DupGroup { size, paths });
-                }
+                a = b;
             }
-            i = j;
         }
-        report.groups.sort_unstable_by(|a, b| {
-            let wa = b.size * (b.paths.len() as u64 - 1);
-            let wb = a.size * (a.paths.len() as u64 - 1);
-            wa.cmp(&wb)
-        });
-        report.groups.truncate(limit);
-    };
-
-    while let Some(row) = rows.next()? {
-        let path: String = row.get(0)?;
-        let size: i64 = row.get(1)?;
-        let size = size as u64;
-        if size != cur_size {
-            flush(&mut report, &mut group, limit, &mut progress);
-            cur_size = size;
-        }
-        group.push((path, size));
+        i = j;
     }
-    flush(&mut report, &mut group, limit, &mut progress);
+    report.groups.sort_unstable_by(|a, b| {
+        let wa = b.size * (b.paths.len() as u64 - 1);
+        let wb = a.size * (a.paths.len() as u64 - 1);
+        wa.cmp(&wb)
+    });
+    report.groups.truncate(limit);
     Ok(report)
 }
 
@@ -164,7 +157,28 @@ fn files_equal(a: &str, b: &str) -> bool {
 mod tests {
     use super::*;
     use crate::EntryMeta;
-    use crate::walk::scan_tree;
+    use crate::mem::MemBuilder;
+
+    fn build_mem(dir: &std::path::Path) -> MemIndex {
+        let mut b = MemBuilder::default();
+        b.push(
+            &dir.join("a.txt").to_string_lossy(),
+            EntryMeta { size: 4096, ..Default::default() },
+        );
+        b.push(
+            &dir.join("b.txt").to_string_lossy(),
+            EntryMeta { size: 4096, ..Default::default() },
+        );
+        b.push(
+            &dir.join("c.txt").to_string_lossy(),
+            EntryMeta { size: 4096, ..Default::default() },
+        );
+        b.push(
+            &dir.join("d.txt").to_string_lossy(),
+            EntryMeta { size: 8192, ..Default::default() },
+        );
+        b.finish()
+    }
 
     #[test]
     fn finds_identical_files() {
@@ -174,15 +188,8 @@ mod tests {
         std::fs::write(dir.path().join("c.txt"), vec![9u8; 4096]).unwrap(); // same size, different
         std::fs::write(dir.path().join("d.txt"), vec![7u8; 8192]).unwrap(); // different size
 
-        let dbdir = tempfile::tempdir().unwrap();
-        let mut store = Store::open(&dbdir.path().join("t.db")).unwrap();
-        let mut rb = store.begin_rebuild().unwrap();
-        scan_tree(dir.path().to_str().unwrap(), |p, m: EntryMeta| {
-            rb.insert(p, m).unwrap();
-        });
-        rb.commit().unwrap();
-
-        let report = find(&store, 0, None, 10, |_| {}).unwrap();
+        let mem = build_mem(dir.path());
+        let report = find(&mem, 0, None, 10, |_| {}).unwrap();
         assert_eq!(report.groups.len(), 1);
         assert_eq!(report.groups[0].size, 4096);
         assert_eq!(report.groups[0].paths.len(), 2);
@@ -191,7 +198,7 @@ mod tests {
         assert_eq!(report.files_hashed, 3);
 
         // name filter narrows to nothing
-        let report = find(&store, 0, Some("zzz"), 10, |_| {}).unwrap();
+        let report = find(&mem, 0, Some("zzz"), 10, |_| {}).unwrap();
         assert_eq!(report.groups.len(), 0);
     }
 
