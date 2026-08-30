@@ -61,16 +61,15 @@ fn live_build_and_instant_search() {
     assert_eq!(vols.len(), 1);
 
     let t = Instant::now();
-    let report = indexer::build(&mut store, &vols, Method::Usn).unwrap();
+    let report = indexer::build(&mut store, &vols, Method::Mft).unwrap();
     let build_ms = t.elapsed().as_millis();
 
     let t2 = Instant::now();
     let r = store.search("ntdll.dll", false, None).unwrap();
     let search_ms = t2.elapsed().as_millis();
-    // `hosts` is a real (non-hardlink) file — hardlink aliases such as
-    // System32\ntdll.dll point to WinSxS and only expose their primary
-    // name via FSCTL_ENUM_USN_DATA (see README, known limitations).
     let r2 = store.search("hosts", false, None).unwrap();
+    // Hard-link parity: the raw MFT scan resolves System32\ntdll.dll → WinSxS.
+    let r3 = store.search("ntdll.dll", false, None).unwrap();
 
     eprintln!(
         "[{d}:] build: {build_ms} ms -> {} files + {} dirs (skipped {})",
@@ -85,6 +84,20 @@ fn live_build_and_instant_search() {
             .iter()
             .any(|h| h.path.to_ascii_lowercase() == "c:\\windows\\system32\\drivers\\etc\\hosts"),
         "hosts not found by search"
+    );
+    assert!(
+        r3.hits
+            .iter()
+            .any(|h| h.path.to_ascii_lowercase() == "c:\\windows\\system32\\ntdll.dll"),
+        "hard-link alias System32\\ntdll.dll not resolved by raw MFT scan"
+    );
+    // metadata sanity: ntdll.dll hits carry real sizes (a rare NTFS quirk can
+    // leave a single stale 0-size $FILE_NAME — allow a couple)
+    let with_size = r3.hits.iter().filter(|h| h.size > 0).count();
+    assert!(
+        with_size >= r3.hits.len().saturating_sub(2),
+        "expected real sizes from the MFT scan: {with_size}/{}",
+        r3.hits.len()
     );
     assert!(search_ms < 1000, "search took {search_ms} ms — not instant enough");
 }

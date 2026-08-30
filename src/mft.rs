@@ -122,7 +122,9 @@ impl MftScanner {
         }
 
         // Read record 0 ($MFT) and pull its $DATA run list.
-        let rec0_off = vd.mft_start_lcn as u64 * sector_size as u64;
+        // MftStartLcn is a *cluster* number — multiply by bytes per cluster,
+        // not by the sector size.
+        let rec0_off = vd.mft_start_lcn as u64 * vd.bytes_per_cluster as u64;
         let raw0 = read_raw(handle, rec0_off, record_size)
             .with_context(|| format!("reading $MFT record 0 on {drive}"))?;
         let rec0 = apply_fixups(&raw0, sector_size)?;
@@ -192,12 +194,20 @@ impl MftScanner {
                     Err(_) => continue,
                 };
                 records += 1;
+                // FRNs are normalized to the plain record index (no sequence
+                // bits): $FILE_NAME parent references only carry the index,
+                // and this also keeps MFT/USN/monitor FRNs mutually consistent.
                 let frn = if hdr.base_frn != 0 {
                     hdr.base_frn & FRN_MASK
                 } else {
-                    ((hdr.seq as u64) << 48) | hdr.record_number as u64
+                    hdr.record_number as u64 & FRN_MASK
                 };
                 let is_dir = flags & 0x02 != 0;
+                // Collect every $FILE_NAME of this record first: hard-linked
+                // files carry one attribute per link, and (NTFS quirk) some of
+                // them can report a stale 0 size — use the record-wide maximum.
+                let mut names: Vec<(u64, String, i64, i64, u32, bool, bool, bool, bool)> = Vec::new();
+                let mut max_size = 0u64;
                 for attr in iterate_attributes(&fixed, hdr.attr_off, hdr.bytes_in_use) {
                     if attr.attr_type != 0x30 || attr.non_resident || attr.value_len < 66 {
                         continue;
@@ -221,18 +231,32 @@ impl MftScanner {
                         utf16.push(u16::from_le_bytes([v[66 + i * 2], v[67 + i * 2]]));
                     }
                     let name = String::from_utf16_lossy(&utf16);
+                    max_size = max_size.max(size);
+                    names.push((
+                        parent_frn,
+                        name,
+                        mtime,
+                        ctime,
+                        dos_flags,
+                        dos_flags & 0x02 != 0,
+                        dos_flags & 0x04 != 0,
+                        dos_flags & 0x01 != 0,
+                        dos_flags & 0x0400 != 0,
+                    ));
+                }
+                for (parent_frn, name, mtime, ctime, _dos, hidden, system, readonly, reparse) in names {
                     on_entry(&MftEntry {
                         frn,
                         parent_frn,
                         name,
                         is_dir,
-                        size,
+                        size: max_size,
                         mtime,
                         ctime,
-                        hidden: dos_flags & 0x02 != 0,
-                        system: dos_flags & 0x04 != 0,
-                        readonly: dos_flags & 0x01 != 0,
-                        reparse: dos_flags & 0x0400 != 0,
+                        hidden,
+                        system,
+                        readonly,
+                        reparse,
                     });
                 }
             }
@@ -280,7 +304,6 @@ impl MftScanner {
 struct FileHeader {
     usa_off: usize,
     usa_count: usize,
-    seq: u16,
     attr_off: usize,
     bytes_in_use: usize,
     base_frn: u64,
@@ -294,7 +317,6 @@ fn parse_file_header(rec: &[u8]) -> Result<FileHeader> {
     Ok(FileHeader {
         usa_off: u16::from_le_bytes([rec[4], rec[5]]) as usize,
         usa_count: u16::from_le_bytes([rec[6], rec[7]]) as usize,
-        seq: u16::from_le_bytes([rec[16], rec[17]]),
         attr_off: u16::from_le_bytes([rec[20], rec[21]]) as usize,
         bytes_in_use: u32::from_le_bytes(rec[24..28].try_into().unwrap()) as usize,
         base_frn: u64::from_le_bytes(rec[32..40].try_into().unwrap()),
@@ -535,7 +557,7 @@ mod tests {
         assert_eq!(entries[1].0, 77);
         assert_eq!(entries[0].2, 1234);
         assert!(entries[0].4); // hidden
-        assert_eq!((hdr.seq as u64) << 48 | hdr.record_number as u64, (3u64 << 48) | 100);
+        assert_eq!(hdr.record_number, 100);
     }
 
     #[test]
