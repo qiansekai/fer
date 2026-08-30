@@ -1,6 +1,6 @@
 //! HTTP API server (axum) with a minimal web UI.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::Result;
 use axum::{
@@ -13,39 +13,28 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::indexer::{self, Method};
+use crate::mem::MemIndex;
 use crate::store::Store;
 use crate::usn;
 
 #[derive(Clone)]
 struct AppState {
     db: Arc<Mutex<Store>>,
-    mem: Option<Arc<crate::mem::MemIndex>>,
+    mem: Arc<RwLock<Option<Arc<MemIndex>>>>,
 }
 
 pub async fn serve(addr: &str, store: Store, mem_index: bool) -> Result<()> {
     let mem = if mem_index {
-        let t = std::time::Instant::now();
-        match store.load_mem_index() {
-            Ok(m) => {
-                eprintln!(
-                    "[server] memory index loaded: {} entries, {} MB in {} ms",
-                    m.len(),
-                    m.memory_bytes() / (1 << 20),
-                    t.elapsed().as_millis()
-                );
-                Some(Arc::new(m))
-            }
-            Err(e) => {
-                eprintln!("[server] memory index failed ({e:#}) — falling back to SQL");
-                None
-            }
+        match load_mem(&store) {
+            Some(m) => Some(Arc::new(m)),
+            None => None,
         }
     } else {
         None
     };
     let state = AppState {
         db: Arc::new(Mutex::new(store)),
-        mem,
+        mem: Arc::new(RwLock::new(mem)),
     };
     let app = Router::new()
         .route("/", get(index_page))
@@ -58,6 +47,26 @@ pub async fn serve(addr: &str, store: Store, mem_index: bool) -> Result<()> {
     eprintln!("[server] listening on http://{addr}");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Load the in-memory engine, logging size and time (returns None on failure).
+fn load_mem(store: &Store) -> Option<MemIndex> {
+    let t = std::time::Instant::now();
+    match store.load_mem_index() {
+        Ok(m) => {
+            eprintln!(
+                "[server] memory index loaded: {} entries, {} MB in {} ms",
+                m.len(),
+                m.memory_bytes() / (1 << 20),
+                t.elapsed().as_millis()
+            );
+            Some(m)
+        }
+        Err(e) => {
+            eprintln!("[server] memory index failed ({e:#}) — falling back to SQL");
+            None
+        }
+    }
 }
 
 async fn index_page() -> Html<&'static str> {
@@ -76,35 +85,33 @@ struct SearchQuery {
 
 async fn search(State(st): State<AppState>, Query(q): Query<SearchQuery>) -> Json<Value> {
     let t = std::time::Instant::now();
-    let limit = q.limit.map(|l| l.min(10_000));
+    let limit = q.limit.map(|l| l.min(10_000)).unwrap_or(100);
     let parsed = match crate::query::Query::parse(&q.q) {
         Ok(p) => p,
         Err(e) => return Json(json!({ "ok": false, "error": e.to_string() })),
     };
-    // Short bare name terms ride the in-memory index (Everything-style
-    // ~100 ms latency); everything else stays on SQL.
-    if let Some(mem) = &st.mem {
-        if crate::mem::MemIndex::handles_query(&parsed) {
-            let ids = mem.find_substr(mem.needle(&parsed));
+    // Hybrid dispatch: ≥3-char substrings ride the FTS5 trigram index (SQL
+    // wins there); everything else — short substrings, suffix, prefix, ranges,
+    // flags, globs — runs in the memory engine (Everything-style).
+    let use_sql = crate::mem::MemIndex::prefers_sql(&parsed);
+    if !use_sql {
+        if let Some(mem) = st.mem.read().unwrap().clone() {
+            let ids = mem.search(&parsed);
             let total = ids.len() as u64;
-            let limited: Vec<i64> = ids.into_iter().take(limit.unwrap_or(100)).collect();
-            let store = st.db.lock().unwrap();
-            return match store.fetch_ids(&limited) {
-                Ok(hits) => Json(json!({
-                    "ok": true,
-                    "query": q.q,
-                    "engine": "mem",
-                    "count": hits.len(),
-                    "total": total,
-                    "took_ms": t.elapsed().as_millis(),
-                    "hits": hits,
-                })),
-                Err(e) => Json(json!({ "ok": false, "error": e.to_string() })),
-            };
+            let hits = mem.hits(&ids, limit);
+            return Json(json!({
+                "ok": true,
+                "query": q.q,
+                "engine": "mem",
+                "count": hits.len(),
+                "total": total,
+                "took_ms": t.elapsed().as_millis(),
+                "hits": hits,
+            }));
         }
     }
     let store = st.db.lock().unwrap();
-    let result = match store.search_query(&parsed, limit) {
+    let result = match store.search_query(&parsed, Some(limit)) {
         Ok(r) => json!({
             "ok": true,
             "query": q.q,
@@ -126,7 +133,7 @@ async fn stats(State(st): State<AppState>) -> Json<Value> {
         .iter()
         .map(|v| format!("{}: ({}) [{}]", v.drive, v.label.trim(), v.fs))
         .collect();
-    let mem = st.mem.as_ref().map(|m| {
+    let mem = st.mem.read().unwrap().as_ref().map(|m| {
         json!({ "entries": m.len(), "bytes": m.memory_bytes() })
     });
     Json(json!({
@@ -142,10 +149,15 @@ async fn stats(State(st): State<AppState>) -> Json<Value> {
 
 async fn rescan(State(st): State<AppState>) -> Json<Value> {
     let db = st.db.clone();
-    let outcome = tokio::task::spawn_blocking(move || {
+    let mem_slot = st.mem.clone();
+    let outcome = tokio::task::spawn_blocking(move || -> anyhow::Result<crate::BuildReport> {
         let mut store = db.lock().unwrap();
         let vols = usn::list_volumes();
-        indexer::build(&mut store, &vols, Method::Auto)
+        let report = indexer::build(&mut store, &vols, Method::Auto)?;
+        // Reload the in-memory engine so it reflects the new index.
+        let mem = load_mem(&store);
+        *mem_slot.write().unwrap() = mem.map(Arc::new);
+        Ok(report)
     })
     .await;
     match outcome {

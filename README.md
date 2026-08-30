@@ -16,9 +16,12 @@
 - 🔍 **过滤查询语言**：`ext: size: dm: dc: type: hidden: parent: path: name:` + 取反（`!`）
 - 🔄 **实时监控**：`fer monitor` 轮询 USN 日志增量更新（删除按 FRN 直删）
 - 🌐 **HTTP API + 网页 UI** + **CLI --json**（稳定 JSON 输出，面向 agent）
-- 🧠 **serve 模式内存索引**：启动时加载 415 万名字的紧凑内存索引（156MB），
-  1-2 字短查询单次 SIMD 扫描 ~70ms（Everything 同款方案）；`--no-mem-index` 关闭
-- ✅ 测试闭环：单元 + 端到端 + 真实卷（`#[ignore]`）+ 与 Everything(es) 交叉验证
+- 🧠 **serve 模式全内存搜索引擎**（Everything 路线）：启动时把全量索引装进
+  紧凑内存结构（~970MB，15s），查询在内存的排序数组 + SIMD 扫描上完成；
+  混合分发——≥3 字子串走 SQLite FTS5 trigram（12-25ms），其余全部内存
+  （0-70ms）；`--no-mem-index` 可关闭
+- ✅ 测试闭环：单元 + 端到端 + 真实卷（`#[ignore]`）+ 内存引擎与 SQL 结果
+  一致性测试（18 种查询）+ 与 Everything(es) 交叉验证
 
 ## 构建
 
@@ -144,17 +147,23 @@ cargo test --test live_volume -- --ignored --nocapture   # 真实卷（需管理
 | `hidden:true`（部分索引） | 583 | ~0 ms |
 | `ext:mp4 size:>100mb` | 42 | 9 ms |
 | `parent:D:\Kita-Tools\Coding` | 77,899 | 57 ms |
-| `报告`（2 字 CJK） | 41 | 436 ms（SQL）/ **71 ms（serve 内存索引）** |
-| `rs`（2 字，18 万命中） | 183,505 | 465 ms（SQL）/ **78 ms（serve 内存索引）** |
+| `报告`（2 字 CJK） | 41 | 67 ms（内存扫描） |
+| `Cargo.toml`（≥3 字，FTS5） | 2,603 | 15 ms |
+| `dm:thisweek`（170 万命中） | 1,701,599 | 29 ms（内存二分） |
+| `*.rs` / `ext:mp4 size:>100mb` | 40,069 / 42 | **0 ms** |
+| `main*.rs`（通配符+前缀收窄） | 161 | 2 ms |
 
 索引构建：全盘 ~415 万条（MFT 路径含硬链接别名），**~164s，峰值内存 ~667MB**。
 索引库体积 **~3.4GB**（迁移/重建后用 `fer vacuum` 压缩一次）。
-serve 模式常驻 ~530MB 工作集（内存索引 156MB + mmap 页缓存，OS 可按需回收）。
+serve 模式：内存引擎加载 **15s / 970MB**，工作集 ~2GB（含 mmap 页缓存，OS 可回收）；
+CLI 一次性查询不吃这份内存（~0-90ms，SQL）。
 
 ## 已知限制 / TODO
 
-- 2 字短查询：serve 模式走内存索引 ~70ms；CLI 一次性查询仍走 SQL ~0.4s
-  （不在单次 CLI 查询里加载 156MB 索引）
+- serve 内存引擎是启动时的**快照**：monitor 的增量不自动反映，`POST /api/rescan`
+  后会重建并自动重载
+- 内存引擎的路径排序只折叠 ASCII 大小写（非 ASCII 大小写字母如 É/Ö 按字节比较，
+  SQL 回退路径会 Unicode 小写化）——Windows 路径中极少见
 - 单个 `$FILE_NAME` 残留 0 大小（NTFS 自身行为，Everything 同样显示未知），不影响搜索
 - 8.3 短名（namespace=2）不入索引（避免噪音）；分片 `$MFT` 回退 USN 路径会丢失硬链接别名
 - FAT/exFAT 卷不支持（监控需 ReadDirectoryChangesW，列为 TODO）
