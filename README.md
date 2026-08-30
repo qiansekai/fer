@@ -155,8 +155,8 @@ cargo test --test live_volume -- --ignored --nocapture   # 真实卷（需管理
 | `*.rs` / `ext:mp4 size:>100mb` | 40,069 / 42 | **0 ms** |
 | `main*.rs`（通配符+前缀收窄） | 161 | 2 ms |
 
-索引构建：全盘 ~415 万条（MFT 路径含硬链接别名），**~164s，峰值内存 ~667MB**。
-索引库体积 **~3.4GB**（迁移/重建后用 `fer vacuum` 压缩一次）。
+索引构建：全盘 ~415 万条（MFT 路径含硬链接别名），**~107s（MFT 扫描 43s + SQLite 落库 64s）**，
+峰值内存 ~667MB。索引库体积 **~3.4GB**（迁移/重建后用 `fer vacuum` 压缩一次）。
 serve 模式：内存引擎加载 **15s / 970MB**，工作集 ~2GB（含 mmap 页缓存，OS 可回收）；
 CLI 一次性查询不吃这份内存（~0-90ms，SQL）。
 
@@ -164,6 +164,8 @@ CLI 一次性查询不吃这份内存（~0-90ms，SQL）。
 
 - serve 内存引擎是启动时的**快照**：monitor 的增量不自动反映，`POST /api/rescan`
   后会重建并自动重载
+- **CLI 的路径子串查询（含 `\` 的 ≥3 字裸词）走 instr 全扫描 ~1s**（serve 内存引擎
+  同查询 ~65ms）；名字子串不受影响（FTS5 trigram）
 - 内存引擎的路径排序只折叠 ASCII 大小写（非 ASCII 大小写字母如 É/Ö 按字节比较，
   SQL 回退路径会 Unicode 小写化）——Windows 路径中极少见
 - 8.3 短名（namespace=2）不入索引（避免噪音）；分片 `$MFT` 回退 USN 路径会丢失
