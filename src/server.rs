@@ -49,13 +49,32 @@ pub async fn serve(addr: &str, store: Store, mem_index: bool) -> Result<()> {
     Ok(())
 }
 
-/// Load the in-memory engine, logging size and time (returns None on failure).
+/// Load the in-memory engine: prefer the pre-built dump (sub-second), fall
+/// back to materializing from SQLite when the dump is missing or stale.
 fn load_mem(store: &Store) -> Option<MemIndex> {
     let t = std::time::Instant::now();
+    let db = store.db_path();
+    let dump = crate::mem::dump_path(db);
+    if crate::mem::dump_is_fresh(db) {
+        match MemIndex::load_dump(&dump) {
+            Ok(m) => {
+                eprintln!(
+                    "[server] memory index loaded from dump: {} entries, {} MB in {} ms",
+                    m.len(),
+                    m.memory_bytes() / (1 << 20),
+                    t.elapsed().as_millis()
+                );
+                return Some(m);
+            }
+            Err(e) => {
+                eprintln!("[server] dump load failed ({e:#}) — falling back to SQL materialization");
+            }
+        }
+    }
     match store.load_mem_index() {
         Ok(m) => {
             eprintln!(
-                "[server] memory index loaded: {} entries, {} MB in {} ms",
+                "[server] memory index materialized from SQL: {} entries, {} MB in {} ms",
                 m.len(),
                 m.memory_bytes() / (1 << 20),
                 t.elapsed().as_millis()
@@ -92,22 +111,35 @@ async fn search(State(st): State<AppState>, Query(q): Query<SearchQuery>) -> Jso
     };
     // Hybrid dispatch: ≥3-char substrings ride the FTS5 trigram index (SQL
     // wins there); everything else — short substrings, suffix, prefix, ranges,
-    // flags, globs — runs in the memory engine (Everything-style).
+    // flags, globs — runs in the memory engine (Everything-style). The mem
+    // scan (up to ~70ms) runs off the executor via spawn_blocking.
     let use_sql = crate::mem::MemIndex::prefers_sql(&parsed);
     if !use_sql {
-        if let Some(mem) = st.mem.read().unwrap().clone() {
-            let ids = mem.search(&parsed);
-            let total = ids.len() as u64;
-            let hits = mem.hits(&ids, limit);
-            return Json(json!({
-                "ok": true,
-                "query": q.q,
-                "engine": "mem",
-                "count": hits.len(),
-                "total": total,
-                "took_ms": t.elapsed().as_millis(),
-                "hits": hits,
-            }));
+        // NB: bind the clone to a variable first — a temporary RwLock guard
+        // in an if-let scrutinee would live across the `.await` below and
+        // make the handler future !Send.
+        let mem = st.mem.read().unwrap().clone();
+        if let Some(mem) = mem {
+            let qq = q.q.clone();
+            let pq = parsed.clone();
+            let outcome = tokio::task::spawn_blocking(move || {
+                let ids = mem.search(&pq);
+                let total = ids.len() as u64;
+                let hits = mem.hits(&ids, limit);
+                (total, hits)
+            })
+            .await;
+            if let Ok((total, hits)) = outcome {
+                return Json(json!({
+                    "ok": true,
+                    "query": qq,
+                    "engine": "mem",
+                    "count": hits.len(),
+                    "total": total,
+                    "took_ms": t.elapsed().as_millis(),
+                    "hits": hits,
+                }));
+            }
         }
     }
     let store = st.db.lock().unwrap();

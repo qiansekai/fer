@@ -145,6 +145,50 @@ fn main() -> Result<()> {
                     return Err(e);
                 }
             };
+            // Gated engine choice for CLI one-shots: slow-scan queries (short
+            // substrings, wildcards, path substrings) load the dump and ride
+            // the SIMD memory engine; fast SQL queries stay on SQLite.
+            if file_engine_rust::mem::MemIndex::prefers_dump(&q)
+                && file_engine_rust::mem::dump_is_fresh(&db)
+            {
+                let t_load = Instant::now();
+                if let Ok(mem) =
+                    file_engine_rust::mem::MemIndex::load_dump(&file_engine_rust::mem::dump_path(&db))
+                {
+                    let load_ms = t_load.elapsed().as_millis();
+                    let t = Instant::now();
+                    let ids = mem.search(&q);
+                    let total = ids.len() as u64;
+                    let hits = mem.hits(&ids, limit);
+                    let took = t.elapsed().as_millis();
+                    if cli.json {
+                        print_json(json!({
+                            "ok": true,
+                            "query": query,
+                            "engine": "mem",
+                            "total": total,
+                            "count": hits.len(),
+                            "took_ms": took,
+                            "load_ms": load_ms,
+                            "hits": hits,
+                        }))?;
+                    } else if count_only {
+                        println!("{total}");
+                        eprintln!(
+                            "{total} total results in {took} ms (dump load {load_ms} ms)"
+                        );
+                    } else {
+                        for h in &hits {
+                            println!("{}", h.path);
+                        }
+                        eprintln!(
+                            "{} results (total {total}) in {took} ms (dump load {load_ms} ms)",
+                            hits.len()
+                        );
+                    }
+                    return Ok(());
+                }
+            }
             let store = Store::open(&db)?;
             let t = Instant::now();
             if count_only && !cli.json {

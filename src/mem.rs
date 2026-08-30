@@ -2,7 +2,7 @@
 //! queries never touch the database, they run against compact sorted arrays
 //! and SIMD scans.
 //!
-//! Layout (~40 bytes/entry + string arenas, ≈600 MB for 4M files):
+//! Layout (56-byte packed `Entry` + string arenas, ≈1 GB for 4M files):
 //! * one packed `Entry` per file (id, arena offsets, size, timestamps, flags)
 //! * `paths` (original case, for display + CI prefix search),
 //!   `names` (lowercased, for substring/glob scans),
@@ -345,6 +345,22 @@ impl MemIndex {
         q.include.iter().any(check) || q.exclude.iter().any(check)
     }
 
+    /// Inverse gate for CLI one-shots: true when SQL would fall back to a slow
+    /// scan AND the dump-backed SIMD path beats it even after the ~300-500ms
+    /// load cost. Measured: path substrings (SQL instr over path_l ~1.1s) and
+    /// wildcards (SQL LIKE scans) qualify; short *name* substrings do not
+    /// (SQL instr over the slim name index ~0.28s < dump load + scan).
+    pub fn prefers_dump(q: &Query) -> bool {
+        let check = |t: &Term| -> bool {
+            match t {
+                Term::PathSubstr(_) => true,
+                Term::NameWild(_) | Term::PathWild(_) => true,
+                _ => false,
+            }
+        };
+        q.include.iter().any(check) || q.exclude.iter().any(check)
+    }
+
     /// Evaluate the whole query in memory; returns matching file ids ascending.
     pub fn search(&self, q: &Query) -> Vec<u32> {
         let mut acc: Option<Vec<u32>> = None;
@@ -400,7 +416,7 @@ impl MemIndex {
     fn eval(&self, t: &Term) -> Vec<u32> {
         match t {
             Term::Name(s) => self.scan(&self.names, s.as_bytes(), true),
-            Term::PathSubstr(s) => self.scan(&self.paths, s.as_bytes(), false),
+            Term::PathSubstr(s) => self.scan_paths_ci(s.as_bytes()),
             Term::Suffix(s) => {
                 let rev: String = s.chars().rev().collect();
                 self.range_by_rev(rev.as_bytes())
@@ -473,6 +489,53 @@ impl MemIndex {
                 &arena[e.path_off as usize..e.path_off as usize + e.path_len as usize]
             };
             if memchr::memmem::find(slice, needle).is_some() {
+                out.push(e.id);
+            }
+        }
+        out
+    }
+
+    /// ASCII-case-insensitive substring scan over the (original-case) path
+    /// arena: memchr locates candidates by the folded first byte (both case
+    /// variants for ASCII letters), then the tail is verified folded.
+    fn scan_paths_ci(&self, needle: &[u8]) -> Vec<u32> {
+        let mut out = Vec::new();
+        if needle.is_empty() {
+            return self.all_ids();
+        }
+        let f = fold(needle[0]);
+        let alt = if f.is_ascii_lowercase() {
+            Some(f - 32)
+        } else if f.is_ascii_uppercase() {
+            Some(f + 32)
+        } else {
+            None
+        };
+        for e in &self.entries {
+            let path = &self.paths[e.path_off as usize..e.path_off as usize + e.path_len as usize];
+            if path.len() < needle.len() {
+                continue;
+            }
+            let limit = path.len() - needle.len();
+            let scan = &path[..=limit];
+            let mut found = false;
+            for pos in memchr::memchr_iter(f, scan) {
+                if ci_eq_at(path, pos, needle) {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                if let Some(a) = alt {
+                    for pos in memchr::memchr_iter(a, scan) {
+                        if ci_eq_at(path, pos, needle) {
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if found {
                 out.push(e.id);
             }
         }
@@ -700,6 +763,10 @@ pub fn dump_path(db: &Path) -> PathBuf {
 /// True when a dump exists and is at least as new as the db, including its
 /// -wal sidecar (monitor writes land there between checkpoints). A stale dump
 /// must not answer queries — callers fall back to SQL.
+///
+/// An EMPTY -wal is ignored: closing a connection can touch the sidecar's
+/// mtime without writing data (the build checkpoints to TRUNCATE), which would
+/// otherwise falsify staleness right after `fer index`.
 pub fn dump_is_fresh(db: &Path) -> bool {
     let dump = dump_path(db);
     let Ok(dump_m) = std::fs::metadata(&dump).and_then(|m| m.modified()) else {
@@ -707,13 +774,18 @@ pub fn dump_is_fresh(db: &Path) -> bool {
     };
     let mut wal = std::ffi::OsString::from(db.as_os_str());
     wal.push("-wal");
-    let db_m = [db.to_path_buf(), PathBuf::from(wal)]
-        .iter()
-        .filter_map(|p| std::fs::metadata(p).ok())
-        .filter_map(|m| m.modified().ok())
-        .max();
-    match db_m {
-        Some(t) => dump_m >= t,
+    let wal_path = PathBuf::from(wal);
+    let wal_meta = std::fs::metadata(&wal_path).ok();
+    // Non-empty WAL = un-checkpointed changes that must outdate the dump.
+    if wal_meta.as_ref().map(|m| m.len() > 0).unwrap_or(false) {
+        if let Some(wal_t) = wal_meta.and_then(|m| m.modified().ok()) {
+            if dump_m < wal_t {
+                return false;
+            }
+        }
+    }
+    match std::fs::metadata(db).and_then(|m| m.modified()).ok() {
+        Some(db_t) => dump_m >= db_t,
         None => true,
     }
 }
@@ -740,6 +812,15 @@ fn fold(b: u8) -> u8 {
     } else {
         b
     }
+}
+
+/// Folded comparison of `hay[pos..pos+len]` against the (lowercased) needle.
+#[inline]
+fn ci_eq_at(hay: &[u8], pos: usize, needle: &[u8]) -> bool {
+    hay[pos..pos + needle.len()]
+        .iter()
+        .zip(needle)
+        .all(|(h, n)| fold(*h) == *n)
 }
 
 /// ASCII-case-insensitive byte comparison (non-ASCII compares raw).
@@ -931,6 +1012,7 @@ mod tests {
             "dm:thismonth",
             r"parent:D:\proj",
             r"path:D:\proj\src",
+            r"D:\proj\src", // bare path token → CI path-substring scan
             "main*",
             "*.jpg",
             "ext:rs size:>1mb",

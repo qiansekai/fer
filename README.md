@@ -149,29 +149,34 @@ cargo test --test live_volume -- --ignored --nocapture   # 真实卷（需管理
 | `hidden:true`（部分索引） | 583 | ~0 ms |
 | `ext:mp4 size:>100mb` | 42 | 9 ms |
 | `parent:D:\Kita-Tools\Coding` | 77,899 | 57 ms |
-| `报告`（2 字 CJK） | 41 | 67 ms（内存扫描） |
-| `Cargo.toml`（≥3 字，FTS5） | 2,603 | 15 ms |
-| `dm:thisweek`（170 万命中） | 1,701,599 | 29 ms（内存二分） |
-| `*.rs` / `ext:mp4 size:>100mb` | 40,069 / 42 | **0 ms** |
-| `main*.rs`（通配符+前缀收窄） | 161 | 2 ms |
+| `报告`（2 字 CJK） | 41 | 67 ms（内存扫描）/ 361 ms（CLI·SQL） |
+| `Cargo.toml`（≥3 字，FTS5） | 2,603 | 15-29 ms |
+| `dm:thisweek`（127 万命中） | 1,267,550 | 24-155 ms |
+| `*.rs` / `ext:mp4 size:>100mb` | 40,075 / 42 | **0-1 ms** |
+| `main*.rs`（通配符） | 161 | 2 ms + dump 加载 0.3s（CLI） |
+| 路径子串（含 `\` 裸词） | 82,538 | 91 ms + dump 加载 0.38s（CLI） |
 
-索引构建：全盘 ~415 万条（MFT 路径含硬链接别名），**~107s（MFT 扫描 43s + SQLite 落库 64s）**，
-峰值内存 ~667MB。索引库体积 **~3.4GB**（迁移/重建后用 `fer vacuum` 压缩一次）。
+索引构建：全盘 ~416 万条（MFT 路径含硬链接别名），**~91s**，构建收尾自动写
+**FERIDX01 dump**（~1GB，原子替换）。
+- **serve**：优先加载 dump（**启动 ~1s**），不新鲜/缺失时回退 SQLite 物化（~10s）
+- **CLI**：快查询走 SQLite（20-50ms）；路径子串/通配符等慢扫描查询按需加载 dump
+  走 SIMD（查询 ~90ms + 加载 ~0.3-0.4s）
+- **monitor**：仍写 SQLite；其写入使 dump 过期（非空 WAL mtime 判断），下次加载自动回退
 serve 模式：内存引擎加载 **15s / 970MB**，工作集 ~2GB（含 mmap 页缓存，OS 可回收）；
 CLI 一次性查询不吃这份内存（~0-90ms，SQL）。
 
 ## 已知限制 / TODO
 
-- serve 内存引擎是启动时的**快照**：monitor 的增量不自动反映，`POST /api/rescan`
-  后会重建并自动重载
-- **CLI 的路径子串查询（含 `\` 的 ≥3 字裸词）走 instr 全扫描 ~1s**（serve 内存引擎
-  同查询 ~65ms）；名字子串不受影响（FTS5 trigram）
+- serve/CLI 的 dump 是构建时快照：monitor 的增量使 dump 过期，需重建或
+  `POST /api/rescan` 刷新
+- dump 加载是整读进堆（~0.3-0.4s）；零拷贝 mmap 版视图留作升级
 - 内存引擎的路径排序只折叠 ASCII 大小写（非 ASCII 大小写字母如 É/Ö 按字节比较，
   SQL 回退路径会 Unicode 小写化）——Windows 路径中极少见
 - 8.3 短名（namespace=2）不入索引（避免噪音）；分片 `$MFT` 回退 USN 路径会丢失
   硬链接别名与大小/时间元数据
 - FAT/exFAT 卷不支持（监控需 ReadDirectoryChangesW，列为 TODO）
 - 多卷监控需逐个 `fer monitor`；USN 日志回卷会报错提示重建
+- release 构建开 `target-cpu=native`（本机专用，exe 不可分发）
 
 ## 与上游对照
 

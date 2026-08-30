@@ -886,7 +886,7 @@ mod tests {
 
     #[test]
     fn query_language_filters() {
-        let (_d, mut store) = test_store();
+        let (_d, store) = test_store();
         {
             let mut rb = store.begin_rebuild().unwrap();
             let now = chrono::Local::now().timestamp();

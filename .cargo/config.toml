@@ -1,3 +1,5 @@
 # Keep GNU-toolchain artifacts separate from any MSVC leftovers.
 [build]
 target-dir = "target-gnu"
+# Native-CPU codegen: this machine only (the exe is not redistributable).
+rustflags = ["-C", "target-cpu=native"]

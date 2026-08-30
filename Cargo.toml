@@ -29,4 +29,6 @@ windows-sys = { version = "0.61.2", features = [
 tempfile = "3"
 
 [profile.release]
-lto = "thin"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
