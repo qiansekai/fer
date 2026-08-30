@@ -37,7 +37,13 @@ CREATE INDEX IF NOT EXISTS idx_files_name_r ON files(name_r);
 CREATE INDEX IF NOT EXISTS idx_files_path_r ON files(path_r);
 CREATE INDEX IF NOT EXISTS idx_files_path_l ON files(path_l);
 CREATE INDEX IF NOT EXISTS idx_files_frn ON files(frn);
-CREATE INDEX IF NOT EXISTS idx_files_name_path ON files(name_l, path, is_dir);
+CREATE INDEX IF NOT EXISTS idx_files_mtime ON files(mtime);
+CREATE INDEX IF NOT EXISTS idx_files_size ON files(size);
+CREATE INDEX IF NOT EXISTS idx_files_is_dir ON files(is_dir);
+CREATE INDEX IF NOT EXISTS idx_flags_hidden ON files(flags) WHERE (flags & 1) != 0;
+CREATE INDEX IF NOT EXISTS idx_flags_system ON files(flags) WHERE (flags & 2) != 0;
+CREATE INDEX IF NOT EXISTS idx_flags_readonly ON files(flags) WHERE (flags & 4) != 0;
+CREATE INDEX IF NOT EXISTS idx_flags_reparse ON files(flags) WHERE (flags & 8) != 0;
 CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(path_l, name_l, tokenize='trigram');
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 "#;
@@ -67,7 +73,13 @@ CREATE INDEX idx_files_name_r ON files(name_r);
 CREATE INDEX idx_files_path_r ON files(path_r);
 CREATE INDEX idx_files_path_l ON files(path_l);
 CREATE INDEX idx_files_frn ON files(frn);
-CREATE INDEX idx_files_name_path ON files(name_l, path, is_dir);
+CREATE INDEX idx_files_mtime ON files(mtime);
+CREATE INDEX idx_files_size ON files(size);
+CREATE INDEX idx_files_is_dir ON files(is_dir);
+CREATE INDEX idx_flags_hidden ON files(flags) WHERE (flags & 1) != 0;
+CREATE INDEX idx_flags_system ON files(flags) WHERE (flags & 2) != 0;
+CREATE INDEX idx_flags_readonly ON files(flags) WHERE (flags & 4) != 0;
+CREATE INDEX idx_flags_reparse ON files(flags) WHERE (flags & 8) != 0;
 CREATE VIRTUAL TABLE files_fts USING fts5(path_l, name_l, tokenize='trigram');
 "#;
 
@@ -107,6 +119,9 @@ impl Store {
             let _ = conn.pragma_update(None, "mmap_size", file_size.min(1 << 30) as i64);
         }
         conn.execute_batch(SCHEMA)?;
+        // Superseded fat covering index: it no longer covers the metadata
+        // columns but still lures the planner away from the slim indexes.
+        conn.execute_batch("DROP INDEX IF EXISTS idx_files_name_path;")?;
         // Schema migration: DBs missing any current column get their data
         // tables recreated — index is lost and the caller must reindex;
         // half-migrating 4M rows is not worth it.
@@ -200,23 +215,33 @@ impl Store {
                 flags: r.get::<_, i64>(5)? as u8,
             })
         };
-        let mut conds: Vec<String> = Vec::with_capacity(q.include.len() + q.exclude.len());
+        let mut hit_conds: Vec<String> = Vec::with_capacity(q.include.len() + q.exclude.len());
+        let mut count_conds: Vec<String> = Vec::with_capacity(q.include.len() + q.exclude.len());
         for t in &q.include {
-            conds.push(Self::term_sql(t));
+            hit_conds.push(Self::term_sql(t, false));
+            count_conds.push(Self::term_sql(t, true));
         }
         for t in &q.exclude {
-            conds.push(format!("NOT ({})", Self::term_sql(t)));
+            hit_conds.push(format!("NOT ({})", Self::term_sql(t, false)));
+            count_conds.push(format!("NOT ({})", Self::term_sql(t, true)));
         }
-        let where_sql = if conds.is_empty() {
+        let where_sql = if hit_conds.is_empty() {
             "1=1".to_string()
         } else {
-            conds.join(" AND ")
+            hit_conds.join(" AND ")
+        };
+        let count_where = if count_conds.is_empty() {
+            "1=1".to_string()
+        } else {
+            count_conds.join(" AND ")
         };
         let lsql = lim_sql(lim);
         let sql_hits = format!(
             "SELECT path, is_dir, size, mtime, ctime, flags FROM files WHERE {where_sql} {lsql}"
         );
-        let sql_count = format!("SELECT COUNT(*) FROM files WHERE {where_sql}");
+        // COUNT variants avoid rowid subqueries: direct ranges run over the
+        // covering slim indexes (name_r/path_l/mtime/size/is_dir/flags).
+        let sql_count = format!("SELECT COUNT(*) FROM files WHERE {count_where}");
         let mut stmt = self.conn.prepare(&sql_hits)?;
         let hits: Vec<Hit> = stmt.query_map([], row)?.collect::<rusqlite::Result<_>>()?;
         let total: u64 = if lim.is_some() {
@@ -228,13 +253,14 @@ impl Store {
     }
 
     /// Translate one query term into a SQL condition (all literals inlined and
-    /// escaped; the query language is trusted input by design).
-    fn term_sql(t: &crate::query::Term) -> String {
+    /// escaped; the query language is trusted input by design). `for_count`
+    /// emits the rowid-subquery-free form so COUNT runs over covering indexes.
+    fn term_sql(t: &crate::query::Term, for_count: bool) -> String {
         use crate::query::Term;
         match t {
             Term::Name(s) => name_substring_sql(s, "name_l"),
             Term::PathSubstr(s) => name_substring_sql(s, "path_l"),
-            Term::Suffix(s) => suffix_sql(s, "name_r"),
+            Term::Suffix(s) => suffix_sql(s, "name_r", for_count),
             Term::NameWild(p) => format!(
                 "name_l LIKE '{}' ESCAPE '\\'",
                 sql_literal(&glob_to_like(p))
@@ -246,7 +272,7 @@ impl Store {
             Term::Ext(list) => {
                 let parts: Vec<String> = list
                     .iter()
-                    .map(|e| suffix_sql(&format!(".{e}"), "name_r"))
+                    .map(|e| suffix_sql(&format!(".{e}"), "name_r", for_count))
                     .collect();
                 format!("({})", parts.join(" OR "))
             }
@@ -270,17 +296,7 @@ impl Store {
                     format!("(flags & {bit}) = 0")
                 }
             }
-            Term::PathPrefix(p) => {
-                if let Some((lo, hi)) = prefix_bounds(p) {
-                    format!(
-                        "path_l >= '{}' AND path_l < '{}'",
-                        sql_literal(&lo),
-                        sql_literal(&hi)
-                    )
-                } else {
-                    format!("path_l >= '{}'", sql_literal(p))
-                }
-            }
+            Term::PathPrefix(p) => prefix_sql("path_l", p, for_count),
         }
     }
 
@@ -517,17 +533,38 @@ fn name_substring_sql(s: &str, col: &str) -> String {
     }
 }
 
-/// Exact-suffix condition via the reversed column's index range.
-fn suffix_sql(suffix: &str, col_r: &str) -> String {
+/// Exact-suffix condition via the reversed column's index range. The COUNT
+/// form uses the direct range (covering index), the hits form wraps it in a
+/// rowid subquery so the metadata columns resolve via cheap point lookups.
+fn suffix_sql(suffix: &str, col_r: &str, for_count: bool) -> String {
     let rev: String = suffix.chars().rev().collect();
     if let Some((lo, hi)) = prefix_bounds(&rev) {
-        format!(
-            "id IN (SELECT id FROM files WHERE {col_r} >= '{}' AND {col_r} < '{}')",
-            sql_literal(&lo),
-            sql_literal(&hi)
-        )
+        let lo = sql_literal(&lo);
+        let hi = sql_literal(&hi);
+        if for_count {
+            format!("{col_r} >= '{lo}' AND {col_r} < '{hi}'")
+        } else {
+            format!(
+                "id IN (SELECT id FROM files WHERE {col_r} >= '{lo}' AND {col_r} < '{hi}')"
+            )
+        }
     } else {
         format!("instr({col_r}, '{}') > 0", sql_literal(&rev))
+    }
+}
+
+/// Full-path prefix condition (`parent:` / `path:`).
+fn prefix_sql(col: &str, prefix: &str, for_count: bool) -> String {
+    if let Some((lo, hi)) = prefix_bounds(prefix) {
+        let lo = sql_literal(&lo);
+        let hi = sql_literal(&hi);
+        if for_count {
+            format!("{col} >= '{lo}' AND {col} < '{hi}'")
+        } else {
+            format!("id IN (SELECT id FROM files WHERE {col} >= '{lo}' AND {col} < '{hi}')")
+        }
+    } else {
+        format!("{col} >= '{}'", sql_literal(prefix))
     }
 }
 
