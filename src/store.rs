@@ -695,7 +695,7 @@ mod tests {
         let (_d, mut store) = test_store();
         {
             let mut rb = store.begin_rebuild().unwrap();
-            let now = 1_700_000_000i64;
+            let now = chrono::Local::now().timestamp();
             rb.insert(r"D:\photos\a.jpg", EntryMeta { is_dir: false, size: 2 << 20, mtime: now, ctime: now - 100, frn: None, flags: EntryMeta::FLAG_HIDDEN }).unwrap();
             rb.insert(r"D:\photos\b.png", EntryMeta { is_dir: false, size: 500, mtime: now - 999_999, ctime: now, frn: None, flags: 0 }).unwrap();
             rb.insert(r"D:\photos\sub", EntryMeta { is_dir: true, size: 0, mtime: now, ctime: 0, frn: None, flags: 0 }).unwrap();
@@ -717,7 +717,7 @@ mod tests {
         assert_eq!(store.search_query(&q, None).unwrap().total, 3); // a.jpg, sub, c.jpg
         let q = crate::query::Query::parse(r"parent:D:\photos").unwrap();
         assert_eq!(store.search_query(&q, None).unwrap().total, 4); // subtree incl. sub\c.jpg
-        let q = crate::query::Query::parse("ext:jpg !hidden:").unwrap();
+        let q = crate::query::Query::parse("ext:jpg !hidden:true").unwrap();
         assert_eq!(store.search_query(&q, None).unwrap().total, 1); // only sub\c.jpg
     }
 }

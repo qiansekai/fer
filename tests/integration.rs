@@ -17,13 +17,13 @@ fn walk_index_then_search() {
     let mut rb = store.begin_rebuild().unwrap();
     let mut files = 0;
     let mut dirs = 0;
-    let skipped = file_engine_rust::walk::scan_tree(dir.path().to_str().unwrap(), |path: &str, is_dir: bool, _size: u64| {
-        if is_dir {
+    let skipped = file_engine_rust::walk::scan_tree(dir.path().to_str().unwrap(), |path: &str, m: file_engine_rust::EntryMeta| {
+        if m.is_dir {
             dirs += 1;
         } else {
             files += 1;
         }
-        rb.insert(path, is_dir, 0, None).unwrap();
+        rb.insert(path, m).unwrap();
     });
     rb.commit().unwrap();
 
@@ -52,7 +52,7 @@ fn walk_index_then_search() {
     assert!(r.hits.iter().any(|h| h.path.ends_with("年度报告.md")));
 
     // delete + upsert keep FTS consistent
-    store.upsert("D:\\tmp\\zzz.txt", false, Some(1)).unwrap();
+    store.upsert("D:\\tmp\\zzz.txt", file_engine_rust::EntryMeta { is_dir: false, frn: Some(1), ..Default::default() }).unwrap();
     assert_eq!(store.search("zzz", false, None).unwrap().total, 1);
     store.delete_by_frn(1).unwrap();
     assert_eq!(store.search("zzz", false, None).unwrap().total, 0);

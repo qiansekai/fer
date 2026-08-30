@@ -83,10 +83,24 @@ impl Query {
 
 fn parse_term(body: &str) -> Result<Term> {
     if let Some((field, value)) = body.split_once(':') {
+        let f = field.to_ascii_lowercase();
+        const FIELDS: &[&str] = &[
+            "ext", "size", "dm", "dc", "type", "hidden", "system", "readonly", "reparse",
+            "parent", "path", "name",
+        ];
+        if !FIELDS.contains(&f.as_str()) {
+            // `D:\proj`-style tokens: the colon is a drive letter, not a field.
+            if body.contains('\\') || body.contains('/') {
+                return Ok(name_term(body));
+            }
+            bail!(
+                "unknown field '{field}:' (supported: ext size dm dc type hidden system readonly reparse parent path name)"
+            );
+        }
         if value.is_empty() {
             bail!("empty value for '{field}:'");
         }
-        match field.to_ascii_lowercase().as_str() {
+        match f.as_str() {
             "ext" => {
                 let exts: Vec<String> = value
                     .split(',')
@@ -230,12 +244,12 @@ mod tests {
     #[test]
     fn parse_basic_terms() {
         let q = Query::parse("foo *.rs ext:jpg,png size:>1mb type:file !temp").unwrap();
-        assert_eq!(q.include.len(), 4);
+        assert_eq!(q.include.len(), 5);
         assert_eq!(q.exclude.len(), 1);
         assert!(matches!(q.include[0], Term::Name(ref s) if s == "foo"));
         assert!(matches!(q.include[1], Term::Suffix(ref s) if s == ".rs"));
         assert!(matches!(q.include[2], Term::Ext(ref e) if e == &vec!["jpg".to_string(), "png".to_string()]));
-        assert!(matches!(q.include[3], Term::IsDir(false)));
+        assert!(matches!(q.include[4], Term::IsDir(false)));
     }
 
     #[test]

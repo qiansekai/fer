@@ -64,7 +64,7 @@ pub struct MftEntry {
     pub reparse: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Run {
     vcn: u64,
     lcn: i64,
@@ -375,6 +375,9 @@ fn parse_runlist(buf: &[u8]) -> Result<Vec<Run>> {
     let mut vcn = 0u64;
     let mut lcn = 0i64;
     loop {
+        if off >= buf.len() {
+            break;
+        }
         let header = buf[off];
         off += 1;
         if header == 0 {
@@ -461,6 +464,7 @@ mod tests {
         put_u16(&mut rec, 6, 2); // usa_count (2 sectors)
         put_u16(&mut rec, 16, seq);
         put_u16(&mut rec, 18, 1); // link count
+        put_u16(&mut rec, 20, 56); // attr_off
         put_u16(&mut rec, 22, 0x01 | if is_dir { 0x02 } else { 0 });
         put_u32(&mut rec, 24, 1024); // bytes in use
         put_u32(&mut rec, 28, 1024);
@@ -536,8 +540,8 @@ mod tests {
 
     #[test]
     fn parse_runlist_contiguous_and_fragmented() {
-        // [len=0x10, lcn=0x100], [len=0x08, lcn=+0x40]
-        let buf: Vec<u8> = vec![0x11, 0x10, 0x00, 0x01, 0x11, 0x08, 0x40];
+        // [len=0x10, lcn=0x100], [len=0x08, lcn=+0x40], terminator
+        let buf: Vec<u8> = vec![0x21, 0x10, 0x00, 0x01, 0x21, 0x08, 0x40, 0x00, 0x00];
         let runs = parse_runlist(&buf).unwrap();
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0], Run { vcn: 0, lcn: 0x100, len: 0x10 });
