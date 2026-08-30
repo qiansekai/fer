@@ -45,6 +45,8 @@ fer serve --addr 127.0.0.1:9876      # HTTP API + 网页 UI
 fer monitor --volume D               # USN 实时增量（需管理员）
 fer stats                            # 索引统计
 fer vacuum                           # 压缩索引库文件（迁移后一次性维护）
+fer dupes --min-size 1kb --limit 50  # 找重复文件（同大小分组 + 内容哈希 + 字节校验）
+fer dupes --name adb.exe             # 只看文件名含 adb.exe 的重复组
 fer --db <path> <cmd>                # 自定义索引库（默认 %LOCALAPPDATA%\file-engine-rust\index.db）
 ```
 
@@ -164,8 +166,8 @@ CLI 一次性查询不吃这份内存（~0-90ms，SQL）。
   后会重建并自动重载
 - 内存引擎的路径排序只折叠 ASCII 大小写（非 ASCII 大小写字母如 É/Ö 按字节比较，
   SQL 回退路径会 Unicode 小写化）——Windows 路径中极少见
-- 单个 `$FILE_NAME` 残留 0 大小（NTFS 自身行为，Everything 同样显示未知），不影响搜索
-- 8.3 短名（namespace=2）不入索引（避免噪音）；分片 `$MFT` 回退 USN 路径会丢失硬链接别名
+- 8.3 短名（namespace=2）不入索引（避免噪音）；分片 `$MFT` 回退 USN 路径会丢失
+  硬链接别名与大小/时间元数据
 - FAT/exFAT 卷不支持（监控需 ReadDirectoryChangesW，列为 TODO）
 - 多卷监控需逐个 `fer monitor`；USN 日志回卷会报错提示重建
 
