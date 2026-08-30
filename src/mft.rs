@@ -203,10 +203,36 @@ impl MftScanner {
                     hdr.record_number as u64 & FRN_MASK
                 };
                 let is_dir = flags & 0x02 != 0;
-                // Collect every $FILE_NAME of this record first: hard-linked
-                // files carry one attribute per link, and (NTFS quirk) some of
-                // them can report a stale 0 size — use the record-wide maximum.
-                let mut names: Vec<(u64, String, i64, i64, u32, bool, bool, bool, bool)> = Vec::new();
+                // Per-record metadata from the authoritative attributes:
+                // * size — the $DATA attribute's real size ($FILE_NAME's size
+                //   fields are stale directory-entry caches NTFS no longer
+                //   maintains; they read 0 for most user files)
+                // * mtime/ctime — $STANDARD_INFORMATION (same staleness issue)
+                let mut std_mtime = 0i64;
+                let mut std_ctime = 0i64;
+                let mut data_size: Option<u64> = None;
+                for attr in iterate_attributes(&fixed, hdr.attr_off, hdr.bytes_in_use) {
+                    match attr.attr_type {
+                        0x10 if !attr.non_resident && attr.value_len >= 24 => {
+                            let v = &fixed[attr.value_off..attr.value_off + attr.value_len as usize];
+                            std_ctime = filetime_to_unix(u64::from_le_bytes(v[0..8].try_into().unwrap()));
+                            std_mtime = filetime_to_unix(u64::from_le_bytes(v[8..16].try_into().unwrap()));
+                        }
+                        0x80 => {
+                            data_size = if attr.non_resident {
+                                Some(attr.real_size)
+                            } else {
+                                Some(attr.value_len as u64)
+                            };
+                        }
+                        _ => {}
+                    }
+                }
+                let mtime = if std_mtime > 0 { std_mtime } else { 0 };
+                let ctime = if std_ctime > 0 { std_ctime } else { 0 };
+                // Collect every $FILE_NAME of this record: hard-linked files
+                // carry one attribute per link.
+                let mut names: Vec<(u64, String, bool, bool, bool, bool)> = Vec::new();
                 let mut max_size = 0u64;
                 for attr in iterate_attributes(&fixed, hdr.attr_off, hdr.bytes_in_use) {
                     if attr.attr_type != 0x30 || attr.non_resident || attr.value_len < 66 {
@@ -214,8 +240,6 @@ impl MftScanner {
                     }
                     let v = &fixed[attr.value_off..attr.value_off + attr.value_len as usize];
                     let parent_frn = u64::from_le_bytes(v[0..8].try_into().unwrap()) & FRN_MASK;
-                    let ctime = filetime_to_unix(u64::from_le_bytes(v[8..16].try_into().unwrap()));
-                    let mtime = filetime_to_unix(u64::from_le_bytes(v[16..24].try_into().unwrap()));
                     let size = u64::from_le_bytes(v[48..56].try_into().unwrap());
                     let dos_flags = u32::from_le_bytes(v[56..60].try_into().unwrap());
                     let name_len = v[64] as usize;
@@ -235,22 +259,20 @@ impl MftScanner {
                     names.push((
                         parent_frn,
                         name,
-                        mtime,
-                        ctime,
-                        dos_flags,
                         dos_flags & 0x02 != 0,
                         dos_flags & 0x04 != 0,
                         dos_flags & 0x01 != 0,
                         dos_flags & 0x0400 != 0,
                     ));
                 }
-                for (parent_frn, name, mtime, ctime, _dos, hidden, system, readonly, reparse) in names {
+                let size = data_size.unwrap_or(max_size);
+                for (parent_frn, name, hidden, system, readonly, reparse) in names {
                     on_entry(&MftEntry {
                         frn,
                         parent_frn,
                         name,
                         is_dir,
-                        size: max_size,
+                        size,
                         mtime,
                         ctime,
                         hidden,
@@ -478,8 +500,9 @@ mod tests {
     fn put_u64(b: &mut [u8], o: usize, v: u64) { b[o..o + 8].copy_from_slice(&v.to_le_bytes()); }
 
     /// Build a synthetic 1024-byte FILE record with `file_names` $FILE_NAME
-    /// attributes, with a valid USA covering two 512-byte sectors.
-    fn make_file_record(record_number: u32, seq: u16, is_dir: bool, file_names: &[(u64, &str, u64, u32)]) -> Vec<u8> {
+    /// attributes (and an optional non-resident $DATA attribute), with a valid
+    /// USA covering two 512-byte sectors.
+    fn make_file_record(record_number: u32, seq: u16, is_dir: bool, file_names: &[(u64, &str, u64, u32)], data_size: Option<u64>) -> Vec<u8> {
         let mut rec = vec![0u8; 1024];
         rec[0..4].copy_from_slice(b"FILE");
         put_u16(&mut rec, 4, 48); // usa_off
@@ -516,6 +539,14 @@ mod tests {
             rec[v + 66..v + 66 + name16.len()].copy_from_slice(&name16);
             off += attr_len;
         }
+        if let Some(ds) = data_size {
+            // non-resident $DATA attribute (no runlist), real size = ds
+            put_u32(&mut rec, off, 0x80);
+            put_u32(&mut rec, off + 4, 64);
+            rec[off + 8] = 1;
+            put_u64(&mut rec, off + 48, ds);
+            off += 64;
+        }
         put_u32(&mut rec, off, 0xFFFF_FFFF);
         rec
     }
@@ -530,6 +561,7 @@ mod tests {
                 (5, "target.txt", 1234, 0x02), // hidden
                 (77, "alias.txt", 1234, 0x02), // second $FILE_NAME = hard link
             ],
+            None,
         );
         let fixed = apply_fixups(&rec, 512).unwrap();
         let hdr = parse_file_header(&fixed).unwrap();
@@ -568,6 +600,20 @@ mod tests {
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0], Run { vcn: 0, lcn: 0x100, len: 0x10 });
         assert_eq!(runs[1], Run { vcn: 0x10, lcn: 0x140, len: 0x08 });
+    }
+
+    #[test]
+    fn data_attribute_size_parsing() {
+        let rec = make_file_record(201, 1, false, &[(5, "big.bin", 0, 0)], Some(7777));
+        let fixed = apply_fixups(&rec, 512).unwrap();
+        let hdr = parse_file_header(&fixed).unwrap();
+        let data: Vec<(bool, u64, u32)> = iterate_attributes(&fixed, hdr.attr_off, hdr.bytes_in_use)
+            .filter(|a| a.attr_type == 0x80)
+            .map(|a| (a.non_resident, a.real_size, a.value_len))
+            .collect();
+        assert_eq!(data.len(), 1);
+        assert!(data[0].0); // non-resident
+        assert_eq!(data[0].1, 7777); // real_size read from offset 48
     }
 
     #[test]

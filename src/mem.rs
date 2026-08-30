@@ -352,7 +352,7 @@ impl MemIndex {
         if needle.is_empty() {
             return self.all_ids();
         }
-        for (i, e) in self.entries.iter().enumerate() {
+        for e in &self.entries {
             let slice = if use_names {
                 &arena[e.name_off as usize..e.name_off as usize + e.name_len as usize]
             } else {
