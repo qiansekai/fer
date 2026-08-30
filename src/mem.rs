@@ -11,9 +11,9 @@
 //!   `by_mtime`, `by_ctime` — all queries reduce to two binary searches
 //!   (partition points) over one of these
 //!
-//! All 12 query-language terms evaluate in memory. SQLite stays as the
-//! persistence layer (build target, monitor sink); serve reloads this index
-//! after a rescan. Disable with `fer serve --no-mem-index`.
+//! All 12 query-language terms evaluate in memory. SQLite survives only as a
+//! dev/test oracle behind the `sqlite` feature — production queries (CLI,
+//! serve, monitor) never touch it.
 //!
 //! Known divergence: path CI ordering folds ASCII case only; non-ASCII
 //! letters with Unicode case (É/Ö/ü) compare bytewise — SQLite's fallback
@@ -26,14 +26,15 @@ use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
+#[cfg(feature = "sqlite")]
 use rusqlite::Connection;
 
 use crate::EntryMeta;
+use crate::Hit;
 use crate::basename;
 use crate::fold_lower;
 use crate::lower_rev;
 use crate::query::{Query, Term};
-use crate::store::Hit;
 
 /// Dump file magic + format version. v2 pads every section to 8-byte
 /// alignment so the file can be memory-mapped and viewed in place (zero-copy
@@ -117,13 +118,17 @@ impl MemBuilder {
 }
 
 pub struct MemIndex {
-    keep: Keep,
+    _keep: Keep,
     sec: Sections,
 }
 
 /// What keeps the section memory alive. `Owned` holds the Vecs produced by
 /// finalize (their heap buffers are stable across moves, so the raw pointers
 /// in `Sections` stay valid); `Mapped` holds the mmap of a dump file.
+/// (Payloads are ownership anchors only — the live data is reached through the
+/// `Sections` views — hence the dead_code allow; one MemIndex holds exactly
+/// one variant, so the large-variant lint is moot here.)
+#[allow(dead_code, clippy::large_enum_variant)]
 enum Keep {
     Owned(OwnedData),
     Mapped(memmap2::Mmap),
@@ -219,6 +224,7 @@ impl std::ops::Deref for MemIndex {
 }
 
 impl MemIndex {
+    #[cfg(feature = "sqlite")]
     pub fn load(conn: &Connection) -> Result<Self> {
         let mut stmt = conn.prepare(
             "SELECT id, path, name_l, size, mtime, ctime, flags, is_dir, frn FROM files ORDER BY id",
@@ -406,7 +412,7 @@ impl MemIndex {
             readonly_ids: view_of(view_at(offs[14], counts[4] * 4)),
             reparse_ids: view_of(view_at(offs[15], counts[5] * 4)),
         };
-        Ok(MemIndex { keep: Keep::Mapped(mmap), sec })
+        Ok(MemIndex { _keep: Keep::Mapped(mmap), sec })
     }
 
     pub fn len(&self) -> usize {
@@ -488,40 +494,6 @@ impl MemIndex {
                 * 4
     }
 
-    /// True when the SQL path is expected to beat the in-memory engine:
-    /// ≥3-char substrings ride the FTS5 trigram index (12-25 ms) while the
-    /// memory engine would scan the whole name arena (~65 ms).
-    pub fn prefers_sql(q: &Query) -> bool {
-        let check = |t: &Term| -> bool {
-            match t {
-                Term::Name(s) | Term::PathSubstr(s) => {
-                    s.chars().count() >= 3
-                        && !s.contains('%')
-                        && !s.contains('_')
-                        && !s.contains('\\')
-                }
-                _ => false,
-            }
-        };
-        q.include.iter().any(check) || q.exclude.iter().any(check)
-    }
-
-    /// Inverse gate for CLI one-shots: true when SQL would fall back to a slow
-    /// scan AND the dump-backed SIMD path beats it even after the ~300-500ms
-    /// load cost. Measured: path substrings (SQL instr over path_l ~1.1s) and
-    /// wildcards (SQL LIKE scans) qualify; short *name* substrings do not
-    /// (SQL instr over the slim name index ~0.28s < dump load + scan).
-    pub fn prefers_dump(q: &Query) -> bool {
-        let check = |t: &Term| -> bool {
-            match t {
-                Term::PathSubstr(_) => true,
-                Term::NameWild(_) | Term::PathWild(_) => true,
-                _ => false,
-            }
-        };
-        q.include.iter().any(check) || q.exclude.iter().any(check)
-    }
-
     /// Evaluate the whole query in memory; returns matching file ids ascending.
     pub fn search(&self, q: &Query) -> Vec<u32> {
         let mut acc: Option<Vec<u32>> = None;
@@ -576,7 +548,7 @@ impl MemIndex {
 
     fn eval(&self, t: &Term) -> Vec<u32> {
         match t {
-            Term::Name(s) => self.scan(&self.names, s.as_bytes(), true),
+            Term::Name(s) => self.scan_names(s.as_bytes()),
             Term::PathSubstr(s) => self.scan_paths_ci(s.as_bytes()),
             Term::Suffix(s) => {
                 let rev: String = s.chars().rev().collect();
@@ -636,19 +608,16 @@ impl MemIndex {
         }
     }
 
-    /// SIMD substring scan over an arena (ids come out ascending — we walk in
-    /// entry order).
-    fn scan(&self, arena: &[u8], needle: &[u8], use_names: bool) -> Vec<u32> {
+    /// Substring scan over the (lowercased) name arena; ids come out ascending
+    /// because we walk in entry order.
+    fn scan_names(&self, needle: &[u8]) -> Vec<u32> {
         let mut out = Vec::new();
         if needle.is_empty() {
             return self.all_ids();
         }
         for e in &self.entries {
-            let slice = if use_names {
-                &arena[e.name_off as usize..e.name_off as usize + e.name_len as usize]
-            } else {
-                &arena[e.path_off as usize..e.path_off as usize + e.path_len as usize]
-            };
+            let slice =
+                &self.names[e.name_off as usize..e.name_off as usize + e.name_len as usize];
             if memchr::memmem::find(slice, needle).is_some() {
                 out.push(e.id);
             }
@@ -686,13 +655,13 @@ impl MemIndex {
                     break;
                 }
             }
-            if !found {
-                if let Some(a) = alt {
-                    for pos in memchr::memchr_iter(a, scan) {
-                        if ci_eq_at(path, pos, needle) {
-                            found = true;
-                            break;
-                        }
+            if !found
+                && let Some(a) = alt
+            {
+                for pos in memchr::memchr_iter(a, scan) {
+                    if ci_eq_at(path, pos, needle) {
+                        found = true;
+                        break;
                     }
                 }
             }
@@ -914,7 +883,7 @@ impl MemIndex {
             readonly_ids: View::from_slice(&o.readonly_ids),
             reparse_ids: View::from_slice(&o.reparse_ids),
         };
-        MemIndex { keep: Keep::Owned(o), sec }
+        MemIndex { _keep: Keep::Owned(o), sec }
     }
 }
 
@@ -931,36 +900,6 @@ pub fn dump_path(db: &Path) -> PathBuf {
     let mut p = std::ffi::OsString::from(db.as_os_str());
     p.push(".feridx");
     PathBuf::from(p)
-}
-
-/// True when a dump exists and is at least as new as the db, including its
-/// -wal sidecar (monitor writes land there between checkpoints). A stale dump
-/// must not answer queries — callers fall back to SQL.
-///
-/// An EMPTY -wal is ignored: closing a connection can touch the sidecar's
-/// mtime without writing data (the build checkpoints to TRUNCATE), which would
-/// otherwise falsify staleness right after `fer index`.
-pub fn dump_is_fresh(db: &Path) -> bool {
-    let dump = dump_path(db);
-    let Ok(dump_m) = std::fs::metadata(&dump).and_then(|m| m.modified()) else {
-        return false;
-    };
-    let mut wal = std::ffi::OsString::from(db.as_os_str());
-    wal.push("-wal");
-    let wal_path = PathBuf::from(wal);
-    let wal_meta = std::fs::metadata(&wal_path).ok();
-    // Non-empty WAL = un-checkpointed changes that must outdate the dump.
-    if wal_meta.as_ref().map(|m| m.len() > 0).unwrap_or(false) {
-        if let Some(wal_t) = wal_meta.and_then(|m| m.modified().ok()) {
-            if dump_m < wal_t {
-                return false;
-            }
-        }
-    }
-    match std::fs::metadata(db).and_then(|m| m.modified()).ok() {
-        Some(db_t) => dump_m >= db_t,
-        None => true,
-    }
 }
 
 fn name_of<'a>(entries: &'a [Entry], names: &'a [u8], i: u32) -> &'a [u8] {
@@ -1145,32 +1084,44 @@ fn glob_match(tokens: &[GTok], hay: &[u8]) -> bool {
 mod tests {
     use super::*;
     use crate::EntryMeta;
-    use crate::store::Store;
 
-    fn build() -> (tempfile::TempDir, Store, MemIndex) {
-        let dir = tempfile::tempdir().unwrap();
-        let mut store = Store::open(&dir.path().join("t.db")).unwrap();
-        let mut rb = store.begin_rebuild().unwrap();
+    fn rows() -> Vec<(&'static str, EntryMeta)> {
         let now = 1_700_000_000i64;
-        let rows: &[(&str, EntryMeta)] = &[
+        vec![
             (r"D:\docs\年度报告.md", EntryMeta { size: 100, mtime: now, ctime: now, flags: 0, ..Default::default() }),
             (r"D:\docs\readme.txt", EntryMeta { size: 500, mtime: now - 10_000_000, ctime: now, flags: 0, ..Default::default() }),
             (r"D:\proj\src\main.rs", EntryMeta { size: 2 << 20, mtime: now, ctime: now, flags: 0, ..Default::default() }),
             (r"D:\proj\src\lib.rs", EntryMeta { size: 3 << 20, mtime: now - 100, ctime: now, flags: EntryMeta::FLAG_HIDDEN, ..Default::default() }),
             (r"D:\media\rs.jpg", EntryMeta { size: 9 << 20, mtime: now, ctime: now, flags: 0, ..Default::default() }),
             (r"D:\media\sub", EntryMeta { is_dir: true, size: 0, mtime: now, ctime: now, flags: 0, ..Default::default() }),
-        ];
-        for (path, meta) in rows {
-            rb.insert(path, *meta).unwrap();
-        }
-        rb.commit().unwrap();
-        let mem = MemIndex::load(&store.conn()).unwrap();
-        (dir, store, mem)
+        ]
     }
 
+    fn build_mem() -> MemIndex {
+        let mut b = MemBuilder::default();
+        for (path, meta) in rows() {
+            b.push(path, meta);
+        }
+        b.finish()
+    }
+
+    #[cfg(feature = "sqlite")]
+    fn build_sql() -> (tempfile::TempDir, crate::store::Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(&dir.path().join("t.db")).unwrap();
+        let mut rb = store.begin_rebuild().unwrap();
+        for (path, meta) in rows() {
+            rb.insert(path, meta).unwrap();
+        }
+        rb.commit().unwrap();
+        (dir, store)
+    }
+
+    #[cfg(feature = "sqlite")]
     #[test]
     fn consistency_with_sql() {
-        let (_d, store, mem) = build();
+        let (_d, store) = build_sql();
+        let mem = MemIndex::load(store.conn()).unwrap();
         let queries = [
             "报告",
             "rs",
@@ -1226,7 +1177,7 @@ mod tests {
 
     #[test]
     fn mem_hits_fields() {
-        let (_d, _store, mem) = build();
+        let mem = build_mem();
         let q = Query::parse("lib.rs").unwrap();
         let ids = mem.search(&q);
         let hits = mem.hits(&ids, 10);
@@ -1238,7 +1189,7 @@ mod tests {
 
     #[test]
     fn empty_query_matches_all() {
-        let (_d, _store, mem) = build();
+        let mem = build_mem();
         let q = Query::parse("").unwrap();
         assert_eq!(mem.search(&q).len(), 6);
     }

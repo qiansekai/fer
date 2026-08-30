@@ -1,4 +1,6 @@
 //! End-to-end tests on a synthetic temp tree (no admin required).
+//! Compiles only with the `sqlite` feature — the SQL store is a test oracle.
+#![cfg(feature = "sqlite")]
 
 use file_engine_rust::store::Store;
 
@@ -13,7 +15,7 @@ fn walk_index_then_search() {
     // Keep the index DB OUTSIDE the scanned tree (it would otherwise be indexed).
     let db_dir = tempfile::tempdir().unwrap();
     let db = db_dir.path().join("idx.db");
-    let mut store = Store::open(&db).unwrap();
+    let store = Store::open(&db).unwrap();
     let mut rb = store.begin_rebuild().unwrap();
     let mut files = 0;
     let mut dirs = 0;

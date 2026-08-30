@@ -155,7 +155,7 @@ fn name_term(pattern: &str) -> Term {
         } else {
             Term::PathSubstr(pattern.to_lowercase())
         }
-    } else if let Some(suffix) = crate::store::try_suffix_literal(pattern) {
+    } else if let Some(suffix) = try_suffix_literal(pattern) {
         Term::Suffix(suffix.to_lowercase())
     } else if has_wc {
         Term::NameWild(pattern.to_lowercase())
@@ -179,7 +179,8 @@ fn parse_size(value: &str) -> Result<(Option<u64>, Option<u64>)> {
     Ok((Some(n), Some(n.saturating_add(1))))
 }
 
-pub fn parse_bytes(s: &str) -> Result<u64> {    let s = s.trim();
+pub fn parse_bytes(s: &str) -> Result<u64> {
+    let s = s.trim();
     let (num, mult) = if let Some(n) = s.strip_suffix("gb") {
         (n, 1u64 << 30)
     } else if let Some(n) = s.strip_suffix("mb") {
@@ -192,7 +193,26 @@ pub fn parse_bytes(s: &str) -> Result<u64> {    let s = s.trim();
         (s, 1)
     };
     let n: u64 = num.parse().map_err(|_| anyhow::anyhow!("bad size '{s}' (use e.g. 1kb 500mb 2gb, with >, < or a-b)"))?;
-    Ok(n.checked_mul(mult).unwrap_or(u64::MAX))
+    Ok(n.saturating_mul(mult))
+}
+
+/// If the glob is a pure suffix pattern (`*` + literal, no other wildcards),
+/// return the literal suffix; otherwise `None`.
+pub(crate) fn try_suffix_literal(glob: &str) -> Option<String> {
+    let mut chars = glob.chars();
+    if chars.next() != Some('*') {
+        return None;
+    }
+    let rest: String = chars.collect();
+    if rest.is_empty() || rest.contains('*') || rest.contains('?') {
+        return None;
+    }
+    Some(rest)
+}
+
+/// Does the pattern use wildcards?
+pub fn has_wildcards(p: &str) -> bool {
+    p.contains('*') || p.contains('?')
 }
 
 /// Parse a date expression into a half-open unix-seconds range.

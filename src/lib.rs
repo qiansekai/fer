@@ -3,20 +3,21 @@
 //! * `mft`     — raw $MFT scanner: hard-link aliases, size, timestamps, flags
 //! * `usn`     — NTFS USN/MFT enumeration (fallback + change journal)
 //! * `walk`    — plain directory-walk fallback (no admin required)
-//! * `store`   — SQLite + FTS5 trigram persistent index, millisecond queries
 //! * `query`   — filter query language (`ext: size: dm: parent:` …)
-//! * `matcher` — case-insensitive substring / wildcard matching semantics
+//! * `mem`     — FERIDX01 dump engine: mmap zero-copy, all queries in memory
 //! * `monitor` — USN journal polling to keep the index live
 //! * `server`  — HTTP API (axum) with a minimal web UI
+//! * `store`   — SQLite + FTS5 (feature `sqlite`, dev/test oracle only —
+//!   production queries never touch it)
 
 pub mod dupes;
 pub mod indexer;
-pub mod matcher;
 pub mod mem;
 pub mod mft;
 pub mod monitor;
 pub mod query;
 pub mod server;
+#[cfg(feature = "sqlite")]
 pub mod store;
 pub mod usn;
 pub mod walk;
@@ -57,6 +58,17 @@ impl EntryMeta {
     pub fn reparse(&self) -> bool {
         self.flags & Self::FLAG_REPARSE != 0
     }
+}
+
+/// One search hit (path + metadata), shared by every engine.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Hit {
+    pub path: String,
+    pub is_dir: bool,
+    pub size: u64,
+    pub mtime: i64,
+    pub ctime: i64,
+    pub flags: u8,
 }
 
 /// Result of a full index build.

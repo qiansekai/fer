@@ -72,30 +72,30 @@ pub fn run(
                     applied += 1;
                 }
             }
-            if r.reason & (USN_REASON_FILE_CREATE | USN_REASON_RENAME_NEW_NAME) != 0 {
-                if let Some(parent) = resolve_path(&vol, drive, r.parent_frn, &mut cache) {
-                    let path = if parent.is_empty() {
-                        format!("{drive}:\\{}", r.name)
-                    } else {
-                        format!("{parent}\\{}", r.name)
-                    };
-                    // Rename-into-place / case change: retire any entry that
-                    // already occupies this path.
-                    if let Some(idx) = mem.find_path_idx(&path) {
-                        let old_frn = mem.meta_at(idx).frn.unwrap_or(0);
-                        frn.remove(&old_frn);
-                        removed.insert(idx as u32);
-                    }
-                    let meta = EntryMeta { is_dir: r.is_dir, frn: Some(r.frn), ..Default::default() };
-                    if let Some(k) = appended
-                        .iter()
-                        .position(|(p, _)| p.eq_ignore_ascii_case(&path))
-                    {
-                        appended.swap_remove(k); // same path re-created this window
-                    }
-                    appended.push((path, meta));
-                    applied += 1;
+            if r.reason & (USN_REASON_FILE_CREATE | USN_REASON_RENAME_NEW_NAME) != 0
+                && let Some(parent) = resolve_path(&vol, drive, r.parent_frn, &mut cache)
+            {
+                let path = if parent.is_empty() {
+                    format!("{drive}:\\{}", r.name)
+                } else {
+                    format!("{parent}\\{}", r.name)
+                };
+                // Rename-into-place / case change: retire any entry that
+                // already occupies this path.
+                if let Some(idx) = mem.find_path_idx(&path) {
+                    let old_frn = mem.meta_at(idx).frn.unwrap_or(0);
+                    frn.remove(&old_frn);
+                    removed.insert(idx as u32);
                 }
+                let meta = EntryMeta { is_dir: r.is_dir, frn: Some(r.frn), ..Default::default() };
+                if let Some(k) = appended
+                    .iter()
+                    .position(|(p, _)| p.eq_ignore_ascii_case(&path))
+                {
+                    appended.swap_remove(k); // same path re-created this window
+                }
+                appended.push((path, meta));
+                applied += 1;
             }
         }
         if next != start {

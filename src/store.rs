@@ -13,10 +13,11 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
 use crate::EntryMeta;
+use crate::Hit;
 use crate::basename;
 use crate::fold_lower;
 use crate::lower_rev;
-use crate::matcher::has_wildcards;
+use crate::query::has_wildcards;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS files (
@@ -80,16 +81,6 @@ CREATE INDEX idx_flags_readonly ON files(flags) WHERE (flags & 4) != 0;
 CREATE INDEX idx_flags_reparse ON files(flags) WHERE (flags & 8) != 0;
 CREATE VIRTUAL TABLE files_fts USING fts5(name_l, content='files', content_rowid='id', tokenize='trigram', detail=none);
 "#;
-
-#[derive(Debug, Clone, Serialize)]
-pub struct Hit {
-    pub path: String,
-    pub is_dir: bool,
-    pub size: u64,
-    pub mtime: i64,
-    pub ctime: i64,
-    pub flags: u8,
-}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchResult {
@@ -162,13 +153,6 @@ impl Store {
 
     pub fn db_path(&self) -> &Path {
         &self.db_path
-    }
-
-    /// One-off maintenance: compact the database file (rewrites it, reclaiming
-    /// free pages left by schema migrations and rebuilds).
-    pub fn vacuum(&self) -> Result<()> {
-        self.conn.execute_batch("VACUUM;")?;
-        Ok(())
     }
 
     /// Raw connection (for the in-memory index loader).
@@ -270,7 +254,7 @@ impl Store {
             } else {
                 Term::PathSubstr(fold_lower(pattern))
             }
-        } else if let Some(suffix) = try_suffix_literal(pattern) {
+        } else if let Some(suffix) = crate::query::try_suffix_literal(pattern) {
             Term::Suffix(fold_lower(&suffix))
         } else if has_wildcards(pattern) {
             Term::NameWild(fold_lower(pattern))
@@ -595,20 +579,6 @@ fn glob_to_like(glob: &str) -> String {
         }
     }
     out
-}
-
-/// If the glob is a pure suffix pattern (`*` + literal, no other wildcards),
-/// return the literal suffix; otherwise `None`.
-pub(crate) fn try_suffix_literal(glob: &str) -> Option<String> {
-    let mut chars = glob.chars();
-    if chars.next() != Some('*') {
-        return None;
-    }
-    let rest: String = chars.collect();
-    if rest.is_empty() || rest.contains('*') || rest.contains('?') {
-        return None;
-    }
-    Some(rest)
 }
 
 /// Escape a string for inlining as a SQL string literal.

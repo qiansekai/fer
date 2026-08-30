@@ -122,7 +122,7 @@ async fn rescan(State(st): State<AppState>) -> Json<Value> {
     let slot = st.mem.clone();
     let outcome = tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
         let vols = usn::list_volumes();
-        let (report, mem, _max_usns) = indexer::build(&vols, Method::Auto)?;
+        let (report, mem) = indexer::build(&vols, Method::Auto)?;
         let dump = dump_path(&db);
         mem.save(&dump)?;
         *slot.write().unwrap() = Arc::new(mem);

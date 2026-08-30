@@ -61,7 +61,7 @@ fn live_build_and_instant_search() {
     assert_eq!(vols.len(), 1);
 
     let t = Instant::now();
-    let (report, mem, _max_usns) = indexer::build(&vols, Method::Mft).unwrap();
+    let (report, mem) = indexer::build(&vols, Method::Mft).unwrap();
     let build_ms = t.elapsed().as_millis();
 
     // dump roundtrip: save → zero-copy load → query
@@ -85,12 +85,12 @@ fn live_build_and_instant_search() {
     assert!(r.len() >= 6, "expected several ntdll.dll hits, got {}", r.len());
     assert!(
         r2.iter()
-            .any(|h| h.path.to_ascii_lowercase() == "c:\\windows\\system32\\drivers\\etc\\hosts"),
+            .any(|h| h.path.eq_ignore_ascii_case("c:\\windows\\system32\\drivers\\etc\\hosts")),
         "hosts not found by search"
     );
     assert!(
         r.iter()
-            .any(|h| h.path.to_ascii_lowercase() == "c:\\windows\\system32\\ntdll.dll"),
+            .any(|h| h.path.eq_ignore_ascii_case("c:\\windows\\system32\\ntdll.dll")),
         "hard-link alias System32\\ntdll.dll not resolved by raw MFT scan"
     );
     // metadata sanity: ntdll.dll hits carry real sizes

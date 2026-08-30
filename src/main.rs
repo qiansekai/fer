@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -91,7 +91,7 @@ fn print_json(value: serde_json::Value) -> Result<()> {
 }
 
 /// Load the dump; if missing, point the user at the one-time index build.
-fn load_index(db: &PathBuf) -> Result<MemIndex> {
+fn load_index(db: &Path) -> Result<MemIndex> {
     let dump = dump_path(db);
     if !dump.exists() {
         anyhow::bail!(
@@ -128,7 +128,7 @@ fn main() -> Result<()> {
             for v in &vols {
                 eprintln!("target: {}: ({}) [{}]", v.drive, v.label.trim(), v.fs);
             }
-            let (report, mem, _max_usns) = indexer::build(&vols, method)?;
+            let (report, mem) = indexer::build(&vols, method)?;
             let t_dump = Instant::now();
             let dump = dump_path(&db);
             mem.save(&dump)?;

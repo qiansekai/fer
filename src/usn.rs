@@ -529,7 +529,7 @@ mod tests {
     fn make_record(name: &str, frn: u64, parent: u64, attrs: u32, v3: bool) -> Vec<u8> {
         let name_bytes: Vec<u8> = name.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
         let name_off = if v3 { 76 } else { 60 };
-        let rec_len = ((name_off + name_bytes.len() + 7) / 8) * 8;
+        let rec_len = (name_off + name_bytes.len()).div_ceil(8) * 8;
         let mut buf = vec![0u8; rec_len];
         put_u32(&mut buf, 0, rec_len as u32);
         put_u16(&mut buf, 4, if v3 { 3 } else { 2 });

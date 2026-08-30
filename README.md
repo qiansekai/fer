@@ -1,8 +1,8 @@
 # File-Engine-Rust
 
 > Everything 级「秒定位全局文件」搜索引擎，纯 Rust。
-> 索引走 **原始 $MFT 扫描**（与 Everything 同款内核路径），搜索走 SQLite + FTS5 trigram（毫秒级），
-> 支持硬链接别名、文件大小/时间/属性过滤，CLI + HTTP API 双通道，agent 友好。
+> 索引走 **原始 $MFT 扫描**（与 Everything 同款内核路径），搜索走 **FERIDX01 dump 内存引擎**
+> （mmap 零拷贝，毫秒级），支持硬链接别名、文件大小/时间/属性过滤，CLI + HTTP API 双通道，agent 友好。
 
 ## 特性
 
@@ -10,8 +10,8 @@
   一次拿到：**全部硬链接别名**（`System32\ntdll.dll` → WinSxS 本体也能搜到）、
   真实大小、修改/创建时间、hidden/system/readonly/reparse 标志；
   分片 `$MFT` 自动回退 USN 枚举，无管理员回退目录遍历
-- 🧠 **低内存**：紧凑数组 + 流式 DFS 落库，全盘 400 万条峰值内存 ~170 MB
-- 🚀 **毫秒级搜索**：子串（FTS5 trigram ≥3 字符）、`*.rs` 后缀（反向列区间查询）、
+- 🧠 **低内存**：紧凑数组 + 流式 DFS 构建，全盘 400 万条峰值内存 ~170 MB
+- 🚀 **毫秒级搜索**：全查询走内存引擎——子串（memchr SIMD 扫描）、`*.rs` 后缀（反向列二分）、
   通配符、大小写不敏感、CJK
 - 🔍 **过滤查询语言**：`ext: size: dm: dc: type: hidden: parent: path: name:` + 取反（`!`）
 - 🔄 **实时监控**：`fer monitor` 轮询 USN 日志增量更新（删除按 FRN 直删）
@@ -30,6 +30,7 @@
 # 本机（Tairitsu）无 MSVC 链接器，走 rustup GNU 工具链（rust-toolchain.toml 已配置）：
 rustup run stable-x86_64-pc-windows-gnu cargo build --release
 # 产物：target-gnu/release/fer.exe（独立 exe，无运行时依赖）
+# 精简编译：cargo build --profile min-size（opt-level="z"，体积优先；默认构建不编译 SQLite）
 ```
 
 ## CLI 使用
@@ -45,7 +46,6 @@ fer search "foo" --limit 50 --count-only     # 只看命中数
 fer serve --addr 127.0.0.1:9876      # HTTP API + 网页 UI
 fer monitor --volume D               # USN 实时增量（需管理员）
 fer stats                            # 索引统计
-fer vacuum                           # 压缩索引库文件（迁移后一次性维护）
 fer dupes --min-size 1kb --limit 50  # 找重复文件（同大小分组 + 内容哈希 + 字节校验）
 fer dupes --name adb.exe             # 只看文件名含 adb.exe 的重复组
 fer --db <path> <cmd>                # 自定义索引库（默认 %LOCALAPPDATA%\file-engine-rust\index.db）
@@ -108,7 +108,7 @@ curl -X POST http://127.0.0.1:9876/api/rescan
   `fer search "ext:rs dm:thisweek" --json`（注意 shell 里 `!` 需转义或使用单引号）。
 - **HTTP**：长驻 `fer serve` 后直接 `GET /api/search?q=...`，URL 编码查询串。
 - **稳定契约**：`--json` 输出与 `/api/*` 的字段名视为稳定 API；`took_ms`/`total` 仅供观测。
-- 已知边界：2 字短查询（尤其中文）走全扫描约 1s 量级；硬链接别名均已收录。
+- 已知边界：2 字短查询（尤其中文）走全名扫描，~60-150 ms；硬链接别名均已收录。
 
 ## 架构
 
@@ -119,10 +119,13 @@ src/
 │               大小/时间/DOS 标志；纯函数解析器全部有单测
 ├── usn.rs      FSCTL_ENUM_USN_DATA / READ_USN_JOURNAL（回退索引 + 变更监控）
 ├── walk.rs     walkdir 回退（Windows 上 metadata 零额外 syscall）
-├── store.rs    SQLite(WAL+mmap) + FTS5 trigram；反向列区间查询；查询语言→SQL 翻译
+├── mem.rs      FERIDX01 dump 内存引擎：56B 紧凑 Entry + arena + 6 排序置换，
+│               mmap 零拷贝加载，全部查询语言内存求值
+├── store.rs    SQLite + FTS5 oracle（feature `sqlite`，仅测试交叉验证，不进生产路径）
 ├── query.rs    查询语言解析（纯函数 + 单测）
 ├── indexer.rs  mft → usn → walk 逐级回退编排
-├── monitor.rs  USN 日志轮询 → delete_by_frn / upsert
+├── monitor.rs  USN 日志轮询 → 内存增量（FRN 直删）+ 防抖写回 dump
+├── dupes.rs    重复文件查找（同大小分组 + FNV 哈希 + 字节校验）
 ├── server.rs   axum HTTP API + 内嵌网页
 └── main.rs     fer CLI（clap，--json 全局开关）
 ```
@@ -130,7 +133,8 @@ src/
 ## 测试
 
 ```bash
-cargo test                                        # 单元 + 端到端（33+ 用例）
+cargo test                                        # 单元 + 端到端（默认不含 SQLite）
+cargo test --features sqlite                      # 追加 SQL 交叉验证 oracle（store.rs / mem 一致性）
 cargo test --test live_volume -- --ignored --nocapture   # 真实卷（需管理员）
 # 自定义盘符：$env:FER_TEST_DRIVE='D'
 ```
@@ -162,11 +166,6 @@ cargo test --test live_volume -- --ignored --nocapture   # 真实卷（需管理
 - **CLI**：同样零拷贝，**全查询 17-336ms**（含进程启动），无 SQLite、无门控
 - **monitor**：USN 增量进内存，默认每 60s 防抖写回 dump（`--flush-secs` 可调）
 
-索引构建：全盘 ~416 万条（MFT 路径含硬链接别名），**热缓存 ~11s / 冷盘 ~40-50s**，
-构建收尾原子写 **FERIDX01 dump**（~1GB，mmap 零拷贝加载，加载 ~1ms）。
-serve 模式：内存引擎加载 **15s / 970MB**，工作集 ~2GB（含 mmap 页缓存，OS 可回收）；
-CLI 一次性查询不吃这份内存（~0-90ms，SQL）。
-
 ## 已知限制 / TODO
 
 - 索引 = dump 快照 + monitor 增量；monitor 不在线时文件变动不反映（下次
@@ -186,7 +185,7 @@ CLI 一次性查询不吃这份内存（~0-90ms，SQL）。
 | 索引 | C++ JNI 读 USN | 完整 MFT 解析 | **完整 MFT 解析（mft.rs）** |
 | 硬链接别名 | ❌ | ✅ | ✅ |
 | 大小/时间/属性 | 部分 | ✅ | ✅ |
-| 存储 | SQLite | 内存索引 | SQLite + FTS5 trigram |
+| 存储 | SQLite | 内存索引 | **FERIDX01 dump 内存引擎（mmap 零拷贝）** |
 | 搜索 | HTTP API | GUI + IPC | CLI + HTTP + 网页 |
 | 监控 | fileMonitor | USN + RDCW | USN 轮询 |
 | 依赖 | JDK21+VS+GraalVM | 闭源 | 单一 exe |

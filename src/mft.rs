@@ -84,7 +84,7 @@ pub struct MftScanner {
 
 /// Windows FILETIME (100ns since 1601) → unix seconds.
 fn filetime_to_unix(ft: u64) -> i64 {
-    (ft / 10_000_000).saturating_sub(116_444_736_00) as i64
+    (ft / 10_000_000).saturating_sub(11_644_473_600) as i64
 }
 
 impl MftScanner {
@@ -138,9 +138,7 @@ impl MftScanner {
                 0x80 if !attr.non_resident => {}
                 0x80 => {
                     data_size = attr.real_size;
-                    runs = parse_runlist(
-                        &rec0[attr.mapping_pairs_off..attr.end].to_vec(),
-                    )?;
+                    runs = parse_runlist(&rec0[attr.mapping_pairs_off..attr.end])?;
                 }
                 _ => {}
             }
@@ -329,8 +327,6 @@ fn utf16_name(bytes: &[u8]) -> String {
 // pure parsing helpers (unit-tested)
 
 struct FileHeader {
-    usa_off: usize,
-    usa_count: usize,
     attr_off: usize,
     bytes_in_use: usize,
     base_frn: u64,
@@ -342,8 +338,6 @@ fn parse_file_header(rec: &[u8]) -> Result<FileHeader> {
         bail!("not a FILE record");
     }
     Ok(FileHeader {
-        usa_off: u16::from_le_bytes([rec[4], rec[5]]) as usize,
-        usa_count: u16::from_le_bytes([rec[6], rec[7]]) as usize,
         attr_off: u16::from_le_bytes([rec[20], rec[21]]) as usize,
         bytes_in_use: u32::from_le_bytes(rec[24..28].try_into().unwrap()) as usize,
         base_frn: u64::from_le_bytes(rec[32..40].try_into().unwrap()),
@@ -395,35 +389,35 @@ struct AttrRef {
 
 fn iterate_attributes<'a>(rec: &'a [u8], mut off: usize, limit: usize) -> impl Iterator<Item = AttrRef> + 'a {
     std::iter::from_fn(move || {
-        while off + 16 <= limit.min(rec.len()) {
-            let attr_type = u32::from_le_bytes(rec[off..off + 4].try_into().unwrap());
-            let len = u32::from_le_bytes(rec[off + 4..off + 8].try_into().unwrap()) as usize;
-            if attr_type == 0xFFFF_FFFF || len < 16 || off + len > rec.len() {
-                return None;
-            }
-            let non_resident = rec[off + 8] != 0;
-            let (value_len, value_off, real_size, mapping_pairs_off) = if non_resident {
-                let mp = u16::from_le_bytes([rec[off + 32], rec[off + 33]]) as usize;
-                let rs = u64::from_le_bytes(rec[off + 48..off + 56].try_into().unwrap());
-                (0u32, 0usize, rs, off + mp)
-            } else {
-                let vl = u32::from_le_bytes(rec[off + 16..off + 20].try_into().unwrap());
-                let vo = u16::from_le_bytes([rec[off + 20], rec[off + 21]]) as usize;
-                (vl, off + vo, 0u64, 0usize)
-            };
-            let end = off + len;
-            off += len;
-            return Some(AttrRef {
-                attr_type,
-                end,
-                non_resident,
-                value_len,
-                value_off,
-                real_size,
-                mapping_pairs_off,
-            });
+        if off + 16 > limit.min(rec.len()) {
+            return None;
         }
-        None
+        let attr_type = u32::from_le_bytes(rec[off..off + 4].try_into().unwrap());
+        let len = u32::from_le_bytes(rec[off + 4..off + 8].try_into().unwrap()) as usize;
+        if attr_type == 0xFFFF_FFFF || len < 16 || off + len > rec.len() {
+            return None;
+        }
+        let non_resident = rec[off + 8] != 0;
+        let (value_len, value_off, real_size, mapping_pairs_off) = if non_resident {
+            let mp = u16::from_le_bytes([rec[off + 32], rec[off + 33]]) as usize;
+            let rs = u64::from_le_bytes(rec[off + 48..off + 56].try_into().unwrap());
+            (0u32, 0usize, rs, off + mp)
+        } else {
+            let vl = u32::from_le_bytes(rec[off + 16..off + 20].try_into().unwrap());
+            let vo = u16::from_le_bytes([rec[off + 20], rec[off + 21]]) as usize;
+            (vl, off + vo, 0u64, 0usize)
+        };
+        let end = off + len;
+        off += len;
+        Some(AttrRef {
+            attr_type,
+            end,
+            non_resident,
+            value_len,
+            value_off,
+            real_size,
+            mapping_pairs_off,
+        })
     })
 }
 
@@ -545,7 +539,7 @@ mod tests {
         let mut off = 56usize;
         for &(parent, name, size, dos_flags) in file_names {
             let name16: Vec<u8> = name.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
-            let attr_len = (24 + 66 + name16.len() + 7) / 8 * 8;
+            let attr_len = (24 + 66 + name16.len()).div_ceil(8) * 8;
             put_u32(&mut rec, off, 0x30);
             put_u32(&mut rec, off + 4, attr_len as u32);
             rec[off + 8] = 0; // resident

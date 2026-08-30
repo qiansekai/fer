@@ -9,15 +9,21 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.104"
-axum = "0.8.9"
+# Server only needs http1 + json + query (+ the tokio integration for axum::serve).
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio"] }
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 clap = { version = "4.6.6", features = ["derive"] }
 memchr = "2.8.3"
 memmap2 = "0.9"
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+# SQLite survives only as a dev/test cross-validation oracle (feature `sqlite`).
+# It is NOT on the production path — gating it means `cargo build`/`check`
+# never compiles the bundled C at all (fat LTO also keeps it out of fer.exe).
+rusqlite = { version = "0.40.2", features = ["bundled"], optional = true }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-tokio = { version = "1.53.1", features = ["full"] }
+# Only rt-multi-thread (Runtime::new/block_on) + net (TcpListener) are used;
+# "full" pulled in signal/process/time/io-util/fs for nothing.
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "net"] }
 walkdir = "2.5.0"
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
@@ -26,10 +32,24 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_Ioctl",
 ] }
 
+[features]
+default = []
+# Test-only SQL oracle: store.rs, MemIndex::load, and the integration test.
+# `cargo test --features sqlite` runs the full suite incl. mem-vs-SQL checks.
+sqlite = ["dep:rusqlite"]
+
 [dev-dependencies]
 tempfile = "3"
 
+# Speed profile: this machine only (target-cpu=native via .cargo/config.toml).
 [profile.release]
+opt-level = 3
 lto = "fat"
 codegen-units = 1
 panic = "abort"
+debug = false
+
+# Size-optimized alternative: `cargo build --profile min-size`.
+[profile.min-size]
+inherits = "release"
+opt-level = "z"

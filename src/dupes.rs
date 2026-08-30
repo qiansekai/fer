@@ -104,9 +104,12 @@ pub fn find(
     Ok(report)
 }
 
-/// FNV-1a 64-bit streaming hash.
-fn fnv1a(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+/// FNV-1a 64-bit offset basis.
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// FNV-1a 64-bit hash step over one chunk, folded into the running state
+/// (streaming-friendly: call per read buffer).
+fn fnv1a_update(mut h: u64, bytes: &[u8]) -> u64 {
     for &b in bytes {
         h ^= b as u64;
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
@@ -118,16 +121,13 @@ fn hash_file(path: &str) -> Result<u64> {
     let mut file = std::fs::File::open(path)?;
     use std::io::Read;
     let mut buf = vec![0u8; 1 << 20];
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut h = FNV_OFFSET;
     loop {
         let n = file.read(&mut buf)?;
         if n == 0 {
             break;
         }
-        for &b in &buf[..n] {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x0000_0100_0000_01b3);
-        }
+        h = fnv1a_update(h, &buf[..n]);
     }
     Ok(h)
 }
@@ -203,8 +203,12 @@ mod tests {
     }
 
     #[test]
-    fn fnv_basics() {
-        assert_ne!(fnv1a(b"a"), fnv1a(b"b"));
-        assert_eq!(fnv1a(b"same"), fnv1a(b"same"));
+    fn fnv_update_basics() {
+        let a = fnv1a_update(FNV_OFFSET, b"a");
+        let b = fnv1a_update(FNV_OFFSET, b"b");
+        assert_ne!(a, b);
+        // streaming chunks fold to the same value as one buffer
+        let ab = fnv1a_update(FNV_OFFSET, b"ab");
+        assert_eq!(fnv1a_update(a, b"b"), ab);
     }
 }

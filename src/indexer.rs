@@ -48,9 +48,8 @@ pub fn resolve_volumes(volumes: &str) -> Vec<VolumeInfo> {
 }
 
 /// Full rebuild: streams every volume straight into the in-memory engine and
-/// returns it (the caller saves the dump). Also returns the per-volume max
-/// USN so the monitor can start from the current journal position.
-pub fn build(volumes: &[VolumeInfo], method: Method) -> Result<(BuildReport, MemIndex, Vec<(char, i64)>)> {
+/// returns it (the caller saves the dump).
+pub fn build(volumes: &[VolumeInfo], method: Method) -> Result<(BuildReport, MemIndex)> {
     let start = Instant::now();
     let mut report = BuildReport {
         volumes: volumes
@@ -61,16 +60,12 @@ pub fn build(volumes: &[VolumeInfo], method: Method) -> Result<(BuildReport, Mem
     };
     let mut mb = MemBuilder::default();
     let mut methods: Vec<&str> = Vec::new();
-    let mut max_usns: Vec<(char, i64)> = Vec::new();
     for vol in volumes {
         let stats = index_volume(vol, method, &mut mb)?;
         report.files += stats.files;
         report.dirs += stats.dirs;
         report.skipped += stats.skipped;
         report.max_usn = report.max_usn.max(stats.max_usn);
-        if stats.max_usn > 0 {
-            max_usns.push((vol.drive, stats.max_usn));
-        }
         if !methods.contains(&stats.method) {
             methods.push(stats.method);
         }
@@ -86,7 +81,7 @@ pub fn build(volumes: &[VolumeInfo], method: Method) -> Result<(BuildReport, Mem
         "mixed".to_string()
     };
     let mem = mb.finish();
-    Ok((report, mem, max_usns))
+    Ok((report, mem))
 }
 
 struct VolStats {
@@ -174,7 +169,7 @@ fn index_mft(vol: &VolumeInfo, mb: &mut MemBuilder) -> Result<VolStats> {
             stats.files += 1;
         }
         processed += 1;
-        if processed % 200_000 == 0 {
+        if processed.is_multiple_of(200_000) {
             eprintln!("[mft] {}: {processed} entries inserted ...", vol.drive);
         }
         mb.push(path, meta);
@@ -212,7 +207,7 @@ fn index_usn(vol: &VolumeInfo, mb: &mut MemBuilder) -> Result<VolStats> {
             stats.files += 1;
         }
         processed += 1;
-        if processed % 200_000 == 0 {
+        if processed.is_multiple_of(200_000) {
             eprintln!("[usn] {}: {processed} entries inserted ...", vol.drive);
         }
         mb.push(path, meta);
@@ -232,7 +227,7 @@ fn index_walk(vol: &VolumeInfo, mb: &mut MemBuilder) -> Result<VolStats> {
             stats.files += 1;
         }
         processed += 1;
-        if processed % 200_000 == 0 {
+        if processed.is_multiple_of(200_000) {
             eprintln!("[walk] {}: {processed} entries inserted ...", vol.drive);
         }
         mb.push(path, meta);
