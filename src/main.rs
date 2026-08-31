@@ -64,6 +64,9 @@ enum Cmd {
     },
     /// Index statistics
     Stats,
+    /// Format-only migration: rebuild the trigram index into the existing
+    /// dump and rewrite it as v5 (no admin, no MFT re-read)
+    Upgrade,
     /// Find duplicate files (same size + identical content)
     Dupes {
         /// Only consider files at least this big (e.g. 1kb, 10mb)
@@ -217,6 +220,34 @@ fn main() -> Result<()> {
                 Duration::from_secs(interval_secs),
                 Duration::from_secs(flush_secs),
             )?;
+        }
+        Cmd::Upgrade => {
+            let dump = dump_path(&db);
+            let mut mem = load_index(&db)?;
+            let t = Instant::now();
+            if mem.build_missing_trigrams() {
+                mem.save(&dump)?;
+                let took = t.elapsed().as_millis();
+                if cli.json {
+                    print_json(json!({
+                        "ok": true,
+                        "trigrams": mem.trigram_count(),
+                        "entries": mem.len(),
+                        "dump": dump.display().to_string(),
+                        "took_ms": took,
+                    }))?;
+                } else {
+                    println!(
+                        "upgraded to v5: {} entries, {} trigrams, dump rewritten in {took} ms",
+                        mem.len(),
+                        mem.trigram_count()
+                    );
+                }
+            } else if cli.json {
+                print_json(json!({ "ok": true, "already_v5": true }))?;
+            } else {
+                println!("dump is already v5 (trigram index present) — nothing to do");
+            }
         }
         Cmd::Stats => {
             let mem = load_index(&db)?;
