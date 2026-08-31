@@ -274,6 +274,7 @@ dependencies = [
  "memchr",
  "memmap2",
  "regex",
+ "regex-syntax",
  "rusqlite",
  "serde",
  "serde_json",

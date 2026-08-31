@@ -19,6 +19,9 @@ memmap2 = "0.9"
 # crate's big Unicode tables out of the binary; \p{...} patterns then error
 # at parse with a clear message.
 regex = { version = "1.12", default-features = false, features = ["std", "perf"] }
+# Already a transitive dep of `regex` (same version from the lockfile cache):
+# used only for literal extraction in the regex prefilter (regex_literal_seeds).
+regex-syntax = "0.8"
 # SQLite survives only as a dev/test cross-validation oracle (feature `sqlite`).
 # It is NOT on the production path — gating it means `cargo build`/`check`
 # never compiles the bundled C at all (fat LTO also keeps it out of fer.exe).

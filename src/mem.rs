@@ -39,17 +39,25 @@ use crate::query::{Query, Term};
 /// Dump file magic + format version. v2 pads every section to 8-byte
 /// alignment so the file can be memory-mapped and viewed in place (zero-copy
 /// loading); v1 had unaligned sections and is rejected. v3 adds the `by_frn`
-/// permutation section (FRN → entry binary search for the monitor).
+/// permutation section (FRN → entry binary search for the monitor). v4 adds
+/// the `name_offs` / `path_offs` accelerator arrays (arena-offset → entry
+/// mapping, enabling whole-arena SIMD scans); v3 dumps stay loadable by
+/// rebuilding those arrays in memory in one linear pass.
 const MAGIC: &[u8; 8] = b"FERIDX01";
-const FORMAT_VERSION: u32 = 3;
+const FORMAT_VERSION: u32 = 4;
 
 /// Fixed dump section order: entries, paths, names, revs, the six sorted
-/// permutations, the six id lists, then `by_frn`. The header stores byte
+/// permutations, the six id lists, `by_frn`, then `name_offs` and `path_offs`
+/// (u32 arena offsets in entry/id order, monotone). The header stores byte
 /// offsets for each section plus the total file length (SEC+1 table entries),
 /// followed by the six id-list element counts — logical lengths come from
 /// these, so inter-section alignment padding never leaks into the data.
-const SEC: usize = 17;
-const HDR_LEN: usize = 32 + (SEC + 1) * 8 + 6 * 4; // 200
+const SEC: usize = 19;
+const HDR_LEN: usize = 32 + (SEC + 1) * 8 + 6 * 4; // 216
+/// v3 layout constants (no accelerator sections) for backward-compatible
+/// loading: existing dumps keep working without an immediate rebuild.
+const SEC_V3: usize = 17;
+const HDR_LEN_V3: usize = 32 + (SEC_V3 + 1) * 8 + 6 * 4; // 200
 
 /// Packed, dump-stable 56-byte record. Field order groups the u64s so there
 /// is no interior padding; the dump is written/read as raw little-endian
@@ -154,14 +162,32 @@ pub struct MemIndex {
 
 /// What keeps the section memory alive. `Owned` holds the Vecs produced by
 /// finalize (their heap buffers are stable across moves, so the raw pointers
-/// in `Sections` stay valid); `Mapped` holds the mmap of a dump file.
-/// (Payloads are ownership anchors only — the live data is reached through the
-/// `Sections` views — hence the dead_code allow; one MemIndex holds exactly
-/// one variant, so the large-variant lint is moot here.)
+/// in `Sections` stay valid); `Mapped` holds the mmap of a dump file plus, for
+/// v3 dumps, the accelerator arrays rebuilt in memory (their heap buffers are
+/// likewise stable). (Payloads are ownership anchors only — the live data is
+/// reached through the `Sections` views — hence the dead_code allow.)
 #[allow(dead_code, clippy::large_enum_variant)]
 enum Keep {
     Owned(OwnedData),
-    Mapped(memmap2::Mmap),
+    Mapped(MappedData),
+}
+
+/// v3 compatibility payload: the two accelerator arrays derived from the
+/// id-ordered entries section (arena offsets are monotone there).
+#[derive(Default)]
+struct AuxAccel {
+    name_offs: Vec<u32>,
+    path_offs: Vec<u32>,
+}
+
+/// Ownership anchor for dump-backed indexes: the mmap keeps every mapped
+/// section alive, and `aux` (v3 dumps only) keeps the rebuilt accelerator
+/// arrays alive. Neither field is read directly — the live data is reached
+/// through the `Sections` views.
+#[allow(dead_code)]
+struct MappedData {
+    mmap: memmap2::Mmap,
+    aux: Option<AuxAccel>,
 }
 
 #[derive(Default)]
@@ -183,6 +209,8 @@ struct OwnedData {
     system_ids: Vec<u32>,
     readonly_ids: Vec<u32>,
     reparse_ids: Vec<u32>,
+    name_offs: Vec<u32>,
+    path_offs: Vec<u32>,
 }
 
 /// Immutable pointer+len slice view. Backed either by the owned Vecs or by the
@@ -246,6 +274,8 @@ pub struct Sections {
     readonly_ids: View<u32>,
     reparse_ids: View<u32>,
     by_frn: View<u32>,
+    name_offs: View<u32>,
+    path_offs: View<u32>,
 }
 
 impl std::ops::Deref for MemIndex {
@@ -331,6 +361,8 @@ impl MemIndex {
             pod_bytes(&self.readonly_ids),
             pod_bytes(&self.reparse_ids),
             pod_bytes(&self.by_frn),
+            pod_bytes(&self.name_offs),
+            pod_bytes(&self.path_offs),
         ];
         for (i, bytes) in secs.into_iter().enumerate() {
             offs[i] = off;
@@ -384,33 +416,35 @@ impl MemIndex {
         let len = file.metadata()?.len();
         let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
         let buf: &[u8] = &mmap;
-        if buf.len() < HDR_LEN || buf[0..8] != *MAGIC {
+        if buf.len() < HDR_LEN_V3 || buf[0..8] != *MAGIC {
             bail!("not a FERIDX dump: {}", path.display());
         }
         let version = u32::from_le_bytes(buf[8..12].try_into().unwrap());
-        if version != FORMAT_VERSION {
+        if version != FORMAT_VERSION && version != 3 {
             bail!(
-                "dump format v{version} unsupported (want v{FORMAT_VERSION}) — re-run `fer index`"
+                "dump format v{version} unsupported (want v{FORMAT_VERSION} or v3) — re-run `fer index`"
             );
         }
+        let sec = if version == 3 { SEC_V3 } else { SEC };
+        let hdr_len = if version == 3 { HDR_LEN_V3 } else { HDR_LEN };
         let n = u32::from_le_bytes(buf[12..16].try_into().unwrap()) as usize;
         let mut offs = [0u64; SEC + 1];
-        for (i, o) in offs.iter_mut().enumerate() {
+        for (i, o) in offs.iter_mut().enumerate().take(sec + 1) {
             *o = u64::from_le_bytes(buf[32 + i * 8..40 + i * 8].try_into().unwrap());
         }
         let mut counts = [0usize; 6];
         for (i, c) in counts.iter_mut().enumerate() {
             *c = u32::from_le_bytes(
-                buf[32 + (SEC + 1) * 8 + i * 4..32 + (SEC + 1) * 8 + (i + 1) * 4]
+                buf[32 + (sec + 1) * 8 + i * 4..32 + (sec + 1) * 8 + (i + 1) * 4]
                     .try_into()
                     .unwrap(),
             ) as usize;
         }
         anyhow::ensure!(
-            offs[0] == HDR_LEN as u64
-                && offs[SEC] == len
-                && offs.windows(2).all(|w| w[0] <= w[1])
-                && offs.iter().all(|o| o % 8 == 0)
+            offs[0] == hdr_len as u64
+                && offs[sec] == len
+                && offs[..sec].windows(2).all(|w| w[0] <= w[1])
+                && offs.iter().take(sec).all(|o| o % 8 == 0)
                 && (offs[1] - offs[0]) as usize == n * std::mem::size_of::<Entry>()
                 && (offs[17] - offs[16]) as usize == n * 4
                 && counts[0] + counts[1] == n,
@@ -428,6 +462,33 @@ impl MemIndex {
         }
         let entry_bytes = n * std::mem::size_of::<Entry>();
         let perm_bytes = n * 4;
+        // v3 dumps predate the accelerator arrays: rebuild them in memory from
+        // the id-ordered entries section (arena offsets are monotone there).
+        let aux = if version == 3 {
+            let entries_view: View<Entry> = view_of(view_at(offs[0], entry_bytes));
+            let mut acc = AuxAccel {
+                name_offs: Vec::with_capacity(n),
+                path_offs: Vec::with_capacity(n),
+            };
+            for e in entries_view.slice() {
+                acc.name_offs.push(e.name_off);
+                acc.path_offs.push(e.path_off);
+            }
+            eprintln!(
+                "fer: loaded v3 dump (accelerator arrays rebuilt in memory) — run `fer index` to upgrade to v4"
+            );
+            Some(acc)
+        } else {
+            None
+        };
+        let name_offs = match &aux {
+            Some(a) => View::from_slice(&a.name_offs),
+            None => view_of(view_at(offs[17], perm_bytes)),
+        };
+        let path_offs = match &aux {
+            Some(a) => View::from_slice(&a.path_offs),
+            None => view_of(view_at(offs[18], perm_bytes)),
+        };
         let sec = Sections {
             entries: view_of(view_at(offs[0], entry_bytes)),
             paths: view_of(view(1)),
@@ -446,8 +507,10 @@ impl MemIndex {
             readonly_ids: view_of(view_at(offs[14], counts[4] * 4)),
             reparse_ids: view_of(view_at(offs[15], counts[5] * 4)),
             by_frn: view_of(view_at(offs[16], perm_bytes)),
+            name_offs,
+            path_offs,
         };
-        Ok(MemIndex { _keep: Keep::Mapped(mmap), sec })
+        Ok(MemIndex { _keep: Keep::Mapped(MappedData { mmap, aux }), sec })
     }
 
     pub fn len(&self) -> usize {
@@ -548,7 +611,9 @@ impl MemIndex {
                 + self.by_size.len()
                 + self.by_mtime.len()
                 + self.by_ctime.len()
-                + self.by_frn.len())
+                + self.by_frn.len()
+                + self.name_offs.len()
+                + self.path_offs.len())
                 * 4
             + (self.dir_ids.len()
                 + self.file_ids.len()
@@ -690,11 +755,29 @@ impl MemIndex {
     }
 
     /// Regex scan over the (lowercased) name arena. The pattern was validated
-    /// and lowercased at parse time, so this compile cannot fail; a full scan
-    /// is inherent (regexes have no precomputed index).
+    /// and lowercased at parse time, so this compile cannot fail. When the
+    /// pattern yields exact literals, they prefilter the whole-arena SIMD
+    /// scan (every match must contain at least one extracted literal);
+    /// candidates are then verified with the full regex on the entry's own
+    /// bytes. Patterns with no usable literal keep the per-entry scan.
     fn scan_regex(&self, pattern: &str) -> Vec<u32> {
         let re = regex::bytes::Regex::new(pattern).expect("regex pattern validated at parse");
         let mut out = Vec::new();
+        if let Some(seeds) = regex_literal_seeds(pattern) {
+            let mut cands: Vec<u32> = Vec::new();
+            for seed in &seeds {
+                cands = union(&cands, &self.scan_name_hits(seed));
+            }
+            for idx in cands {
+                let e = &self.entries[idx as usize];
+                let name =
+                    &self.names[e.name_off as usize..e.name_off as usize + e.name_len as usize];
+                if re.is_match(name) {
+                    out.push(e.id);
+                }
+            }
+            return out;
+        }
         for e in &self.entries {
             let name =
                 &self.names[e.name_off as usize..e.name_off as usize + e.name_len as usize];
@@ -722,31 +805,87 @@ impl MemIndex {
         out
     }
 
-    /// Substring scan over the (lowercased) name arena; ids come out ascending
-    /// because we walk in entry order.
+    /// Substring scan over the (lowercased) name arena, returning ids ascending.
+    /// See [`Self::scan_name_hits`] for the scanning strategy.
     fn scan_names(&self, needle: &[u8]) -> Vec<u32> {
-        let mut out = Vec::new();
         if needle.is_empty() {
             return self.all_ids();
         }
-        for e in &self.entries {
-            let slice =
-                &self.names[e.name_off as usize..e.name_off as usize + e.name_len as usize];
-            if memchr::memmem::find(slice, needle).is_some() {
-                out.push(e.id);
+        self.scan_name_hits(needle)
+            .iter()
+            .map(|&i| self.entries[i as usize].id)
+            .collect()
+    }
+
+    /// Whole-arena substring scan returning matching entry INDICES (ascending:
+    /// the arena is laid out in entry order and the scan cursor only ever
+    /// advances). This is the hot path for substring and regex-prefilter
+    /// queries — ONE SIMD pass over the contiguous names arena instead of one
+    /// tiny scan per entry (4M short-haystack scans waste the SIMD setup).
+    ///
+    /// Correctness notes:
+    /// * a hit straddling an entry boundary is an arena concatenation
+    ///   artifact and is rejected, advancing just one byte so a real
+    ///   overlapping match is never shadowed (non-overlapping iterators
+    ///   would silently drop it);
+    /// * after a real hit the scan jumps to the entry's end (contains
+    ///   semantics — at most one hit per entry);
+    /// * the entry cursor advances monotonically because `from` only grows.
+    fn scan_name_hits(&self, needle: &[u8]) -> Vec<u32> {
+        let mut out = Vec::new();
+        let arena = self.names.slice();
+        let n = self.entries.len();
+        if arena.is_empty() || n == 0 {
+            return out;
+        }
+        let offs = self.name_offs.slice();
+        let mut from = 0usize;
+        let mut e_idx = 0usize;
+        loop {
+            if from >= arena.len() {
+                break;
+            }
+            let rel = if needle.len() == 1 {
+                memchr::memchr(needle[0], &arena[from..])
+            } else {
+                memchr::memmem::find(&arena[from..], needle)
+            };
+            let Some(rel) = rel else { break };
+            let abs = from + rel;
+            while e_idx + 1 < n && offs[e_idx + 1] as usize <= abs {
+                e_idx += 1;
+            }
+            let e = &self.entries[e_idx];
+            let end = e.name_off as usize + e.name_len as usize;
+            if abs + needle.len() <= end {
+                // fully inside this entry: real match; record and skip the
+                // rest of the entry (boolean contains semantics)
+                out.push(e_idx as u32);
+                from = end;
+            } else {
+                // straddles a concatenation boundary: artifact
+                from = abs + 1;
             }
         }
         out
     }
 
     /// ASCII-case-insensitive substring scan over the (original-case) path
-    /// arena: memchr locates candidates by the folded first byte (both case
-    /// variants for ASCII letters), then the tail is verified folded.
+    /// arena: one whole-arena SIMD pass via `memchr2` over both case variants
+    /// of the folded first byte (plain `memchr` for non-letters), folded-tail
+    /// verification per candidate, and the same boundary mapping plus
+    /// entry-end jumps as `scan_name_hits`.
     fn scan_paths_ci(&self, needle: &[u8]) -> Vec<u32> {
         let mut out = Vec::new();
         if needle.is_empty() {
             return self.all_ids();
         }
+        let arena = self.paths.slice();
+        let n = self.entries.len();
+        if arena.is_empty() || n == 0 {
+            return out;
+        }
+        let offs = self.path_offs.slice();
         let f = fold(needle[0]);
         let alt = if f.is_ascii_lowercase() {
             Some(f - 32)
@@ -755,32 +894,28 @@ impl MemIndex {
         } else {
             None
         };
-        for e in &self.entries {
-            let path = &self.paths[e.path_off as usize..e.path_off as usize + e.path_len as usize];
-            if path.len() < needle.len() {
-                continue;
+        let mut from = 0usize;
+        let mut e_idx = 0usize;
+        loop {
+            if from >= arena.len() {
+                break;
             }
-            let limit = path.len() - needle.len();
-            let scan = &path[..=limit];
-            let mut found = false;
-            for pos in memchr::memchr_iter(f, scan) {
-                if ci_eq_at(path, pos, needle) {
-                    found = true;
-                    break;
-                }
+            let rel = match alt {
+                Some(a) => memchr::memchr2(f, a, &arena[from..]),
+                None => memchr::memchr(f, &arena[from..]),
+            };
+            let Some(rel) = rel else { break };
+            let abs = from + rel;
+            while e_idx + 1 < n && offs[e_idx + 1] as usize <= abs {
+                e_idx += 1;
             }
-            if !found
-                && let Some(a) = alt
-            {
-                for pos in memchr::memchr_iter(a, scan) {
-                    if ci_eq_at(path, pos, needle) {
-                        found = true;
-                        break;
-                    }
-                }
-            }
-            if found {
+            let e = &self.entries[e_idx];
+            let end = e.path_off as usize + e.path_len as usize;
+            if abs + needle.len() <= end && ci_eq_at(arena, abs, needle) {
                 out.push(e.id);
+                from = end;
+            } else {
+                from = abs + 1;
             }
         }
         out
@@ -957,6 +1092,10 @@ fn finalize(entries: Vec<Entry>, paths: Vec<u8>, names: Vec<u8>, revs: Vec<u8>) 
             }
         });
     });
+    // Accelerator arrays: arena offsets in id order (monotone by
+    // construction), used to map whole-arena scan hits back to entries.
+    let name_offs: Vec<u32> = e.iter().map(|t| t.name_off).collect();
+    let path_offs: Vec<u32> = e.iter().map(|t| t.path_off).collect();
     MemIndex::from_owned(OwnedData {
         entries,
         paths,
@@ -975,6 +1114,8 @@ fn finalize(entries: Vec<Entry>, paths: Vec<u8>, names: Vec<u8>, revs: Vec<u8>) 
         system_ids,
         readonly_ids,
         reparse_ids,
+        name_offs,
+        path_offs,
     })
 }
 
@@ -1001,6 +1142,8 @@ impl MemIndex {
             readonly_ids: View::from_slice(&o.readonly_ids),
             reparse_ids: View::from_slice(&o.reparse_ids),
             by_frn: View::from_slice(&o.by_frn),
+            name_offs: View::from_slice(&o.name_offs),
+            path_offs: View::from_slice(&o.path_offs),
         };
         MemIndex { _keep: Keep::Owned(o), sec }
     }
@@ -1220,6 +1363,31 @@ fn glob_match(tokens: &[GTok], hay: &[u8]) -> bool {
     prev[n]
 }
 
+/// Extract exact literals from a (pre-lowercased) regex pattern for SIMD
+/// prefiltering. regex-syntax guarantees every match contains at least one
+/// extracted literal, so "entry contains any of these" is a sound superset
+/// filter; candidates are verified with the full regex afterwards. Returns
+/// None when the pattern has no usable literal (pure classes/quantifiers).
+/// Capped at a few seeds so alternation-heavy patterns stay cheap.
+fn regex_literal_seeds(pattern: &str) -> Option<Vec<Vec<u8>>> {
+    use regex_syntax::hir::literal::Extractor;
+    let hir = regex_syntax::Parser::new().parse(pattern).ok()?;
+    let seq = Extractor::new().extract(&hir);
+    let lits = seq.literals()?;
+    const MAX_SEEDS: usize = 8;
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    for lit in lits {
+        if !lit.is_exact() || lit.as_bytes().is_empty() {
+            continue;
+        }
+        out.push(lit.as_bytes().to_vec());
+        if out.len() >= MAX_SEEDS {
+            break;
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -1378,5 +1546,146 @@ mod tests {
         let hits = mem.hits(&mem.search(&q), 10);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path, r"D:\proj\src\main.rs");
+    }
+
+    #[test]
+    fn arena_scan_boundary_artifacts() {
+        // Adjacent names in the arena concatenate into "xab"+"bbc"+"ab" =
+        // "xabbbcab". Boundary-straddling hits must be rejected, and a real
+        // match that OVERLAPS an earlier artifact must still be found
+        // (a non-overlapping iterator would silently drop it).
+        let mut b = MemBuilder::default();
+        let meta = EntryMeta { size: 0, mtime: 0, ctime: 0, flags: 0, ..Default::default() };
+        b.push(r"D:\a\xab", meta.clone()); // id 0
+        b.push(r"D:\a\bbc", meta.clone()); // id 1
+        b.push(r"D:\a\ab", meta.clone()); // id 2
+        let mem = b.finish();
+
+        // "bb": first hit at abs=2 straddles entry0/entry1 (artifact), the
+        // real hit at abs=3 sits fully inside entry1 → must return [1].
+        let q = Query::parse("bb").unwrap();
+        assert_eq!(mem.search(&q), vec![1]);
+
+        // "ab": real hits in entry0 (pos 1) and entry2 (pos 0) → [0, 2].
+        let q = Query::parse("ab").unwrap();
+        assert_eq!(mem.search(&q), vec![0, 2]);
+
+        // single-byte needle: only entry1 contains 'c'.
+        let q = Query::parse("c").unwrap();
+        assert_eq!(mem.search(&q), vec![1]);
+
+        // long needle spanning multiple entries: nothing.
+        let q = Query::parse("bbca").unwrap();
+        assert!(mem.search(&q).is_empty());
+    }
+
+    #[test]
+    fn path_ci_arena_scan() {
+        let mut b = MemBuilder::default();
+        let meta = EntryMeta { size: 0, mtime: 0, ctime: 0, flags: 0, ..Default::default() };
+        b.push(r"D:\KitA\File", meta.clone()); // id 0: path contains "kita\file" (CI)
+        b.push(r"D:\Other\kita", meta.clone()); // id 1: path contains "other\kita"
+        b.push(r"D:\Other\KITB", meta.clone()); // id 2: "other\kitb", not "kita"
+        let mem = b.finish();
+
+        let q = Query::parse(r"kita\file").unwrap();
+        assert_eq!(mem.search(&q), vec![0]);
+        let q = Query::parse(r"other\kita").unwrap();
+        assert_eq!(mem.search(&q), vec![1]);
+        // bare token WITHOUT a separator is a basename term by contract; the
+        // full-path substring form carries a separator:
+        let q = Query::parse(r"d:\other").unwrap();
+        assert_eq!(mem.search(&q), vec![1, 2]);
+    }
+
+    #[test]
+    fn regex_arena_prefilter() {
+        let mut b = MemBuilder::default();
+        let meta = EntryMeta { size: 0, mtime: 0, ctime: 0, flags: 0, ..Default::default() };
+        b.push(r"D:\p\main.rs", meta.clone()); // id 0
+        b.push(r"D:\p\lib.rs", meta.clone()); // id 1
+        b.push(r"D:\p\README.md", meta.clone()); // id 2
+        b.push(r"D:\p\m.rs", meta.clone()); // id 3
+        let mem = b.finish();
+
+        // literal prefilter: ".rs" candidates {0,1,3} → anchored ^m narrows to 0,3
+        let q = Query::parse("regex:^m").unwrap();
+        assert_eq!(mem.search(&q), vec![0, 3]);
+        // literal "main" (exact) → only 0
+        let q = Query::parse("regex:main").unwrap();
+        assert_eq!(mem.search(&q), vec![0]);
+        // suffix literal: all .rs files
+        let q = Query::parse("regex:\\.rs$").unwrap();
+        assert_eq!(mem.search(&q), vec![0, 1, 3]);
+        // no usable literal → fallback per-entry scan still correct
+        let q = Query::parse("regex:[a-z]+").unwrap();
+        assert_eq!(mem.search(&q), vec![0, 1, 2, 3]);
+        // alternation: prefilter must not drop matches that lack one branch
+        let q = Query::parse("regex:main|readme").unwrap();
+        assert_eq!(mem.search(&q), vec![0, 2]);
+    }
+
+    #[test]
+    fn v3_dump_compat_load() {
+        let mem = build_mem();
+        let dir = tempfile::tempdir().unwrap();
+        let v4path = dir.path().join("t.feridx");
+        mem.save(&v4path).unwrap();
+        // Rebuild a GENUINE v3-layout file from the v4 one: identical section
+        // payloads (same order), but a 200-byte v3 header. (Simply patching
+        // the version field would not work — v3/v4 headers have different
+        // sizes and offset-table layouts.)
+        let v4 = std::fs::read(&v4path).unwrap();
+        let mut offs4 = [0u64; SEC + 1];
+        for (i, o) in offs4.iter_mut().enumerate() {
+            *o = u64::from_le_bytes(v4[32 + i * 8..40 + i * 8].try_into().unwrap());
+        }
+        let counts4: Vec<u32> = (0..6)
+            .map(|i| {
+                u32::from_le_bytes(
+                    v4[32 + (SEC + 1) * 8 + i * 4..32 + (SEC + 1) * 8 + (i + 1) * 4]
+                        .try_into()
+                        .unwrap(),
+                )
+            })
+            .collect();
+        let payload = v4[offs4[0] as usize..offs4[SEC_V3] as usize].to_vec();
+        let mut v3hdr = Vec::with_capacity(HDR_LEN_V3);
+        v3hdr.extend_from_slice(MAGIC);
+        v3hdr.extend_from_slice(&3u32.to_le_bytes());
+        v3hdr.extend_from_slice(&(mem.len() as u32).to_le_bytes());
+        v3hdr.extend_from_slice(&0i64.to_le_bytes()); // created
+        v3hdr.extend_from_slice(&0i64.to_le_bytes()); // reserved
+        let mut offs3 = [0u64; SEC_V3 + 1];
+        offs3[0] = HDR_LEN_V3 as u64;
+        for i in 1..=SEC_V3 {
+            offs3[i] = HDR_LEN_V3 as u64 + (offs4[i] - offs4[0]);
+        }
+        for o in offs3 {
+            v3hdr.extend_from_slice(&o.to_le_bytes());
+        }
+        for c in counts4 {
+            v3hdr.extend_from_slice(&c.to_le_bytes());
+        }
+        let mut v3file = v3hdr;
+        v3file.extend_from_slice(&payload);
+        let v3path = dir.path().join("t3.feridx");
+        std::fs::write(&v3path, &v3file).unwrap();
+
+        let loaded = MemIndex::load_dump(&v3path).unwrap();
+        assert_eq!(loaded.len(), mem.len());
+        for q in ["rs", "report", "*.rs", "ext:rs", "a?c", "regex:rs", "!hidden:true"] {
+            assert_eq!(
+                loaded.search(&Query::parse(q).unwrap()),
+                mem.search(&Query::parse(q).unwrap()),
+                "query {q}: v3-compat load vs owned mismatch"
+            );
+        }
+        // v4 roundtrip keeps the accelerator sections mapped (no aux rebuild).
+        let v4b = MemIndex::load_dump(&v4path).unwrap();
+        assert_eq!(
+            v4b.search(&Query::parse("rs").unwrap()),
+            mem.search(&Query::parse("rs").unwrap())
+        );
     }
 }

@@ -17,7 +17,8 @@
 - 🔄 **实时监控**：`fer monitor` 轮询 USN 日志增量更新（删除按 FRN 直删）
 - 🌐 **HTTP API + 网页 UI** + **CLI --json**（稳定 JSON 输出，面向 agent）
 - 🧠 **Everything 架构**：`fer index` 一次性把全盘扫进内存引擎并写成
-  **FERIDX01 dump**（~1GB）；查询全靠内存的排序数组 + SIMD 扫描，dump 用
+  **FERIDX01 dump**（~1GB）；查询全靠内存的排序数组 + **整 arena 单遍 SIMD 扫描**
+  （子串/正则走 memchr 大缓冲扫 + `name_offs`/`path_offs` 游标映射），dump 用
   **mmap 零拷贝加载**（serve 启动 ~135ms，CLI 全查询 17-336ms）
 - 🔄 **USN 实时监控**（需管理员）：monitor 常驻内存增量追平 + 防抖写回 dump，
   崩溃后从 USN 日志回放，无需重建
@@ -121,7 +122,9 @@ src/
 ├── usn.rs      FSCTL_ENUM_USN_DATA / READ_USN_JOURNAL（回退索引 + 变更监控）
 ├── walk.rs     walkdir 回退（Windows 上 metadata 零额外 syscall）
 ├── mem.rs      FERIDX01 dump 内存引擎：56B 紧凑 Entry + arena + 7 排序置换
-│               （含 by_frn，monitor 二分删改），mmap 零拷贝加载，多 term 并行求值
+│               （含 by_frn，monitor 二分删改）+ name_offs/path_offs 加速段，
+│               mmap 零拷贝加载，多 term 并行求值；子串/正则走整 arena 单遍
+│               SIMD 扫描（跨 entry 边界伪命中过滤 + 命中后跳到 entry 尾）
 ├── store.rs    SQLite + FTS5 oracle（feature `sqlite`，仅测试交叉验证，不进生产路径）
 ├── query.rs    查询语言解析（纯函数 + 单测）
 ├── indexer.rs  mft → usn → walk 逐级回退编排
@@ -174,6 +177,24 @@ CLI 全查询 3 轮取 min/median（每项均含进程启动 + dump mmap 加载�
   `ext:rs` 2ms、`type:dir` 1ms、`dm:thisweek type:file` 34ms；逻辑内存 1021MB /
   RSS 350MB（mmap 按需缺页，OS 可回收）
 - **CLI**：全查询 **0-294ms**（含进程启动 + dump 加载），无 SQLite、无门控
+
+### serve 稳态查询（2026-09 整 arena SIMD 扫描优化后，dump v4 兼容加载 v3）
+
+第二轮热页测量（`took_ms`，引擎侧耗时，不含 HTTP/CLI 进程税）：
+
+| 查询 | 结果数 | 旧（CLI 含启动） | 新 serve 稳态 |
+|------|-------:|------------------:|--------------:|
+| `rs`（2 字子串） | 184,011 | 158-168ms | **22ms** |
+| `报告`（2 字 CJK） | 40 | 152-158ms | **7ms** |
+| `report`（长子串） | 7,325 | 167-171ms | **8ms** |
+| `Kita-Tools\Coding`（路径子串） | 88,965 | 281-294ms | **135ms** |
+| `regex:\.rs$`（字面量预筛） | 40,211 | ~170ms 档 | **14ms** |
+| `*.rs` / `ext:rs` | 40,211 | 2ms | 0-1ms（持平） |
+
+说明：dump v4 新增 `name_offs`/`path_offs` 两个 u32 加速段（各 n×4B ≈ 16MB），
+使子串/正则扫描从「每 entry 一次小扫」变为「整块 arena 单遍 SIMD 扫 + 游标映射」。
+v3 dump 仍可加载（启动时内存重建加速段并提示 `fer index` 升级）。
+首次查询含 mmap 缺页税（`rs` 首轮 115ms → 次轮 22ms）。
 - **monitor**：USN 增量进内存（by_frn 二分 + 删除影子集），默认每 60s 防抖写回 dump
   （`--flush-secs` 可调）；flush 走 arena 直达复用（零 String 分配）
 - **编译**：`cargo check` 6.9s（不编 SQLite）；release 1.81MB / `--profile min-size`
@@ -183,6 +204,8 @@ CLI 全查询 3 轮取 min/median（每项均含进程启动 + dump mmap 加载�
 
 - 索引 = dump 快照 + monitor 增量；monitor 不在线时文件变动不反映（下次
   `fer index` 或 monitor 启动回放 USN 日志补齐）
+- v3 dump 兼容加载会在启动时重建加速段（一次性 ~百 ms 级）；`fer index`
+  重建为 v4 后即零额外成本
 - 内存引擎的路径排序只折叠 ASCII 大小写（非 ASCII 大小写字母如 É/Ö 按字节比较）
   ——Windows 路径中极少见
 - 8.3 短名（namespace=2）不入索引（避免噪音）；分片 `$MFT` 回退 USN 路径会丢失
