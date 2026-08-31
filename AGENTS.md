@@ -16,8 +16,11 @@ CLI `--json` 与 HTTP API 双通道。
   ~1GB）；构建热缓存 ~11s / 冷盘 ~40-50s
 - dump **mmap 零拷贝加载**（裸指针 View + `Keep` 所有权锚点，加载 ~1ms，页按需缺页）：
   serve 启动 ~135ms，CLI 全查询 17-336ms（含进程启动）
-- dump 二进制契约：56B repr(C) Entry + 8 字节对齐段 + 头部 18 偏移 + 6 列表计数
-  + **by_frn 置换段**（v3，monitor 的 FRN→条目二分查找）；改布局必须 bump FORMAT_VERSION
+- dump 二进制契约：56B repr(C) Entry + 8 字节对齐段 + 头部 19 段偏移表 + 6 列表计数
+  + **by_frn 置换段** + **name_offs/path_offs 加速段**（v4；子串/正则整 arena 扫描的
+  offset→entry 游标映射）；改布局必须 bump FORMAT_VERSION。**v3 兼容加载**：老 dump
+  启动时从 entries 内存重建两个加速段（AuxAccel，Keep::Mapped 持有），stderr 提示
+  `fer index` 升级；v3/v4 头部长不同（200B/216B），测试里伪造 v3 要重建头部而非改版本字节
 - monitor：load dump → USN 增量进内存（by_frn 二分 + 删除影子集/删除集/追加列表）→
   默认每 60s 防抖重建成新 dump（flush 走 push_arena 直达复用，零 String 分配）；
   USN 位置存 `*.feridx.usn` 边车，崩溃靠日志回放补齐
@@ -27,9 +30,11 @@ CLI `--json` 与 HTTP API 双通道。
 
 - 源码 `src/`：mft.rs（原始 $MFT 扫描，核心）、usn.rs（回退索引 + 变更监控）、
   walk.rs（回退）、store.rs（SQLite oracle，feature `sqlite` 门控）、query.rs（查询语言）、
-  indexer.rs（mft→usn→walk 编排）、monitor.rs、server.rs、mem.rs（dump 内存引擎）、
-  dupes.rs、main.rs（CLI）
+  indexer.rs（mft→usn→walk 编排）、monitor.rs、server.rs、mem.rs（dump 内存引擎：
+  **v4 + name_offs/path_offs 加速段 + 整 arena 单遍 SIMD 扫描**）、dupes.rs、main.rs（CLI）
 - 产物 `target-gnu\release\fer.exe`；默认索引库 `%LOCALAPPDATA%\file-engine-rust\index.db`
+- **在役稳定备份** `stable\fer.exe`（gitignored 二进制 + `stable\README.md` 记录来源
+  commit/hash/dump 版本）；大改前先更新备份再动代码
 - 真实卷测试 `tests/live_volume.rs`（`#[ignore]`，需管理员）
 
 ## 构建（本机特有）
@@ -79,6 +84,19 @@ cargo test --test live_volume -- --ignored --nocapture       # 真实卷（管�
   `\p{...}` 报 "Unicode property not found"；模式 parse 时小写化 + 预校验
 - release 开了 `fat LTO + codegen-units=1 + panic=abort + target-cpu=native`（本机专用）；
   另有 `--profile min-size`（`opt-level="z"`）体积最精简构建；clippy 保持 0 警告
+- **整 arena 扫描必须用重叠语义手动循环**（命中后 `from=abs+1` 续扫）：non-overlap 的
+  `find_iter` 会让跨 entry 边界的伪命中遮蔽与其重叠的真实命中（"xab"+"bbc" 拼成
+  "xabbbcab" 时 needle "bb" 先伪后真，迭代器会跳过真的）。伪命中 +1、真命中跳到
+  entry end（contains 布尔语义，每 entry 至多一次）
+- **arena 命中→entry 映射用单调游标**（`while offs[e_idx+1] <= abs { e_idx += 1 }`），
+  因为 `from` 只增、abs 严格递增——不要用 partition_point（每命中 22 次二分比摊还 O(1) 慢一个量级）
+- 单字节 needle 无跨边界问题（abs+1 ≤ end 恒成立），memchr 单遍即可
+- **regex 不能直接 arena 级 find**：贪婪匹配跨边界时（`a.*` 吃掉邻接 entry 字节）
+  会遮蔽同起点的短真匹配——正确做法是 regex-syntax 抽字面量 → 整 arena 预筛候选
+  （每 match 必含至少一个 extracted literal，超集过滤安全）→ 候选逐 entry 用完整
+  span 校验。无字面量的模式（`[a-z]+`）回退 per-entry 扫
+- **v3 兼容加载**：v3/v4 头部尺寸不同（200B/216B、偏移表 18/20 项），测试里伪造
+  v3 必须重算偏移重建头部，只改版本字节会被 layout 校验拒掉
 - 本仓库有 git（commit 节点：基线/测试全绿/真实卷全绿/性能优化/内存引擎/dupes/极致性能），
   改动前先看 `git log`
 

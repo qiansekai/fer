@@ -4,3 +4,5 @@
 *.db-wal
 *.db-shm
 *.log
+# 稳定版二进制备份不入库（说明见 stable/README.md）
+/stable/fer.exe
