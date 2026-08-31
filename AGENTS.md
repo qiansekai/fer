@@ -97,6 +97,15 @@ cargo test --test live_volume -- --ignored --nocapture       # 真实卷（管�
   span 校验。无字面量的模式（`[a-z]+`）回退 per-entry 扫
 - **v3 兼容加载**：v3/v4 头部尺寸不同（200B/216B、偏移表 18/20 项），测试里伪造
   v3 必须重算偏移重建头部，只改版本字节会被 layout 校验拒掉
+- **glob 位并行（GlobProg）**：每查询编译一次（段 ≤64 token 走 2KB 栈上 Shift-And 掩码表，
+  >64 走 naive），逐候选零分配。**结尾锚定契约**：无尾随 `*` 时末段必须结束于 hay 尾
+  （`*.rs` 不匹配 "main.rss"）；段间贪心 earliest-match 是安全的（更早 end 给后续段
+  超集起点）。**1 字节前缀的 glob 是 contains 语义**（by_name 前缀快路径只对 ≥2 字节
+  前缀生效——老 DP 遗留契约，与 SQL LIKE oracle 一致，别"顺手修正"它）。`?` 是字节级
+  语义（`报?` = 4 字节模式，对 6 字节的"报告"不锚定匹配，要 `报???`）。旧 DP 保留在
+  测试作 oracle（`glob_match_dp`）+ 800 例伪随机交叉验证，改匹配器必须跑它
+- **glob 预筛**：最长字面量 run 作 SIMD seed（glob 无 alternation，任何 run 必现，超集
+  安全）；纯星模式特判 `all_ids()` 免全扫；无字面量模式（`???`）退全扫 + 位并行验证
 - 本仓库有 git（commit 节点：基线/测试全绿/真实卷全绿/性能优化/内存引擎/dupes/极致性能），
   改动前先看 `git log`
 

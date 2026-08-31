@@ -189,10 +189,16 @@ CLI 全查询 3 轮取 min/median（每项均含进程启动 + dump mmap 加载�
 | `report`（长子串） | 7,325 | 167-171ms | **8ms** |
 | `Kita-Tools\Coding`（路径子串） | 88,965 | 281-294ms | **135ms** |
 | `regex:\.rs$`（字面量预筛） | 40,211 | ~170ms 档 | **14ms** |
+| `a?c`（glob 位并行） | 1,829 | **1,018ms** | **118ms** |
+| `*report*`（字面量 run 预筛） | 7,325 | 秒级（per-entry DP） | **9ms** |
+| `*fer*idx*` | 1 | 秒级 | **11ms** |
+| `???`（无字面量纯位并行全扫） | 4,068,025 | 数秒 | **115ms** |
 | `*.rs` / `ext:rs` | 40,211 | 2ms | 0-1ms（持平） |
 
 说明：dump v4 新增 `name_offs`/`path_offs` 两个 u32 加速段（各 n×4B ≈ 16MB），
 使子串/正则扫描从「每 entry 一次小扫」变为「整块 arena 单遍 SIMD 扫 + 游标映射」。
+glob 匹配编译为 **Shift-And 位并行**（2KB 栈上掩码表，零分配，段间 earliest-match
+贪心 + 结尾锚定契约与原 DP 一致），最长字面量 run 作 SIMD 预筛。
 v3 dump 仍可加载（启动时内存重建加速段并提示 `fer index` 升级）。
 首次查询含 mmap 缺页税（`rs` 首轮 115ms → 次轮 22ms）。
 - **monitor**：USN 增量进内存（by_frn 二分 + 删除影子集），默认每 60s 防抖写回 dump
