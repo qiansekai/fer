@@ -62,6 +62,7 @@ fer --db <path> <cmd>                # 自定义索引库（默认 %LOCALAPPDATA
 | `*.rs` `main*` `a?c*` | 通配符（`*` 任意串、`?` 单字符；`*.rs` 为精确后缀） |
 | `D:\proj\src`（含分隔符的裸词） | 全路径子串 |
 | `name:foo` | 显式文件名匹配（同裸词） |
+| `regex:^foo.*bar$` | 正则匹配文件名（大小写不敏感，全名扫描档耗时） |
 | `ext:rs,png` | 扩展名（逗号列表，不带点） |
 | `size:>1mb` `size:<10kb` `size:1kb-5mb` `size:1024` | 大小（kb=1024, mb=1024², gb=1024³；`>` `<` 区间；裸值为精确字节） |
 | `dm:today` `dm:yesterday` `dm:thisweek` `dm:thismonth` | 修改时间（近 7 天/30 天） |

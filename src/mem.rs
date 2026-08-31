@@ -685,7 +685,24 @@ impl MemIndex {
                 }
             }
             Term::PathPrefix(p) => IdSet::Owned(self.range_by_path_prefix(p.as_bytes())),
+            Term::Regex(pat) => IdSet::Owned(self.scan_regex(pat)),
         }
+    }
+
+    /// Regex scan over the (lowercased) name arena. The pattern was validated
+    /// and lowercased at parse time, so this compile cannot fail; a full scan
+    /// is inherent (regexes have no precomputed index).
+    fn scan_regex(&self, pattern: &str) -> Vec<u32> {
+        let re = regex::bytes::Regex::new(pattern).expect("regex pattern validated at parse");
+        let mut out = Vec::new();
+        for e in &self.entries {
+            let name =
+                &self.names[e.name_off as usize..e.name_off as usize + e.name_len as usize];
+            if re.is_match(name) {
+                out.push(e.id);
+            }
+        }
+        out
     }
 
     /// All ids minus `list` (both sorted) via one two-pointer sweep — avoids
@@ -1342,5 +1359,24 @@ mod tests {
         assert_eq!(loaded.path_at(idx as usize), r"D:\proj\src\main.rs");
         let q = Query::parse("ext:rs").unwrap();
         assert_eq!(loaded.search(&q), mem.search(&q));
+    }
+
+    #[test]
+    fn regex_scan() {
+        let mem = build_mem();
+        // anchored exact match: main.rs only
+        let q = Query::parse("regex:^main\\.rs$").unwrap();
+        let hits = mem.hits(&mem.search(&q), 10);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, r"D:\proj\src\main.rs");
+        // unanchored + class + quantifier: both .rs files
+        let q = Query::parse("regex:^.*\\.rs$").unwrap();
+        let ids = mem.search(&q);
+        assert_eq!(ids.len(), 2);
+        // negation composes with regex
+        let q = Query::parse("ext:rs !regex:lib").unwrap();
+        let hits = mem.hits(&mem.search(&q), 10);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, r"D:\proj\src\main.rs");
     }
 }

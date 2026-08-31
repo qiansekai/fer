@@ -271,6 +271,7 @@ impl Store {
 
     /// Search with the structured query language (see [`crate::query`]).
     pub fn search_query(&self, q: &crate::query::Query, limit: Option<usize>) -> Result<SearchResult> {
+        Self::reject_regex(q)?;
         let lim = limit.map(|l| l.min(100_000) as i64);
         let row = |r: &rusqlite::Row<'_>| -> rusqlite::Result<Hit> {
             Ok(Hit {
@@ -322,6 +323,7 @@ impl Store {
     /// COUNT-only variant of [`Store::search_query`] — skips the hits query
     /// entirely (halves latency for scan-bound queries like 2-char CJK).
     pub fn count_query(&self, q: &crate::query::Query) -> Result<u64> {
+        Self::reject_regex(q)?;
         let mut count_conds: Vec<String> = Vec::with_capacity(q.include.len() + q.exclude.len());
         for t in &q.include {
             count_conds.push(Self::term_sql(t, true));
@@ -336,6 +338,20 @@ impl Store {
         };
         let sql_count = format!("SELECT COUNT(*) FROM files WHERE {count_where}");
         Ok(self.conn.query_row(&sql_count, [], |r| r.get::<_, i64>(0))? as u64)
+    }
+
+    /// Translate one query term into a SQL condition (all literals inlined and
+    /// escaped; the query language is trusted input by design). `for_count`
+    /// emits the rowid-subquery-free form so COUNT runs over covering indexes.
+    fn reject_regex(q: &crate::query::Query) -> Result<()> {
+        if q.include
+            .iter()
+            .chain(&q.exclude)
+            .any(|t| matches!(t, crate::query::Term::Regex(_)))
+        {
+            anyhow::bail!("regex terms are not supported by the SQL oracle");
+        }
+        Ok(())
     }
 
     /// Translate one query term into a SQL condition (all literals inlined and
@@ -377,6 +393,10 @@ impl Store {
                 }
             }
             Term::PathPrefix(p) => prefix_sql("path_l", p, for_count),
+            // SQLite has no built-in regex operator; the oracle refuses regex
+            // terms up front (search_query/count_query bail) instead of
+            // silently returning wrong results.
+            Term::Regex(_) => "1=1".to_string(),
         }
     }
 

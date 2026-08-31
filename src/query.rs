@@ -14,6 +14,7 @@
 //! parent:D:\proj      everything under that directory (prefix match)
 //! path:D:\proj\src    full-path prefix match
 //! name:pattern        explicit basename match (substring or wildcard)
+//! regex:^foo.*bar$    regex against the basename (case-insensitive)
 //! !term               negate a term
 //! ```
 //!
@@ -42,6 +43,9 @@ pub enum Term {
     NameWild(String),
     /// Wildcard glob against the full path.
     PathWild(String),
+    /// `regex:^foo.*bar$` — regex against the basename (case-insensitive,
+    /// pattern pre-lowercased; validated at parse).
+    Regex(String),
     /// `ext:rs,txt`
     Ext(Vec<String>),
     /// `size:` comparison (bytes).
@@ -86,7 +90,7 @@ fn parse_term(body: &str) -> Result<Term> {
         let f = field.to_ascii_lowercase();
         const FIELDS: &[&str] = &[
             "ext", "size", "dm", "dc", "type", "hidden", "system", "readonly", "reparse",
-            "parent", "path", "name",
+            "parent", "path", "name", "regex",
         ];
         if !FIELDS.contains(&f.as_str()) {
             // `D:\proj`-style tokens: the colon is a drive letter, not a field.
@@ -94,7 +98,7 @@ fn parse_term(body: &str) -> Result<Term> {
                 return Ok(name_term(body));
             }
             bail!(
-                "unknown field '{field}:' (supported: ext size dm dc type hidden system readonly reparse parent path name)"
+                "unknown field '{field}:' (supported: ext size dm dc type hidden system readonly reparse parent path name regex)"
             );
         }
         if value.is_empty() {
@@ -136,7 +140,15 @@ fn parse_term(body: &str) -> Result<Term> {
             }
             "parent" | "path" => Ok(Term::PathPrefix(value.to_lowercase())),
             "name" => Ok(name_term(value)),
-            other => bail!("unknown field '{other}:' (supported: ext size dm dc type hidden system readonly reparse parent path name)"),
+            "regex" => {
+                // Lowercase the pattern: names are stored lowercased, and the
+                // whole query language is case-insensitive by contract.
+                let pat = value.to_lowercase();
+                regex::bytes::Regex::new(&pat)
+                    .map_err(|e| anyhow::anyhow!("regex: invalid pattern '{value}': {e}"))?;
+                Ok(Term::Regex(pat))
+            }
+            other => bail!("unknown field '{other}:' (supported: ext size dm dc type hidden system readonly reparse parent path name regex)"),
         }
     } else {
         Ok(name_term(body))
@@ -296,6 +308,19 @@ mod tests {
     #[test]
     fn unknown_field_rejected() {
         assert!(Query::parse("bogus:x").is_err());
+    }
+
+    #[test]
+    fn regex_term() {
+        let q = Query::parse("regex:^main.*\\.rs$ !regex:backup").unwrap();
+        assert!(matches!(q.include[0], Term::Regex(ref p) if p == "^main.*\\.rs$"));
+        assert!(matches!(q.exclude[0], Term::Regex(ref p) if p == "backup"));
+        // pattern is lowercased (engine-wide CI contract)
+        let q = Query::parse("regex:[A-Z]{3}").unwrap();
+        assert!(matches!(q.include[0], Term::Regex(ref p) if p == "[a-z]{3}"));
+        // invalid regex rejected at parse
+        assert!(Query::parse("regex:[").is_err());
+        assert!(Query::parse("regex:(unclosed").is_err());
     }
 
     #[test]

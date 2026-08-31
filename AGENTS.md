@@ -42,6 +42,8 @@ $env:CARGO_TARGET_DIR = 'D:\Kita-Tools\Coding\File-Engine-Rust\target-gnu'
 ```
 
 `rust-toolchain.toml` 已指 GNU；`.cargo/config.toml` 固定 target-gnu。
+crates.io 偶尔 SSL reset：加新依赖先看 `DevEnv\cargo\registry\cache` 是否有缓存，
+有则加 `--offline` 可过。
 
 ## 测试
 
@@ -73,6 +75,8 @@ cargo test --test live_volume -- --ignored --nocapture       # 真实卷（管�
   查不到），同窗口删除走 `appended.swap_remove`；同窗口同路径多次创建同理去重
 - 多 term 查询的 eval 在 scoped 线程上并行求值；`ScopedJoinHandle` 的 join 必须
   写在 `thread::scope` 闭包内（handle 的 env 生命周期出不了 scope）
+- regex 走 `regex::bytes` 且**关 unicode feature**（名字已小写，二进制省 400KB）；
+  `\p{...}` 报 "Unicode property not found"；模式 parse 时小写化 + 预校验
 - release 开了 `fat LTO + codegen-units=1 + panic=abort + target-cpu=native`（本机专用）；
   另有 `--profile min-size`（`opt-level="z"`）体积最精简构建；clippy 保持 0 警告
 - 本仓库有 git（commit 节点：基线/测试全绿/真实卷全绿/性能优化/内存引擎/dupes/极致性能），
