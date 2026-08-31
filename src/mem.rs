@@ -871,15 +871,25 @@ impl MemIndex {
     }
 
     /// ASCII-case-insensitive substring scan over the (original-case) path
-    /// arena: one whole-arena SIMD pass via `memchr2` over both case variants
-    /// of the folded first byte (plain `memchr` for non-letters), folded-tail
-    /// verification per candidate, and the same boundary mapping plus
-    /// entry-end jumps as `scan_name_hits`.
+    /// arena, returning ids ascending. See [`Self::scan_paths_hits`].
     fn scan_paths_ci(&self, needle: &[u8]) -> Vec<u32> {
-        let mut out = Vec::new();
         if needle.is_empty() {
             return self.all_ids();
         }
+        self.scan_paths_hits(needle)
+            .iter()
+            .map(|&i| self.entries[i as usize].id)
+            .collect()
+    }
+
+    /// Whole-arena CI seed scan over the path arena returning entry INDICES:
+    /// one SIMD pass via `memchr2` over both case variants of the folded
+    /// first byte (plain `memchr` for non-letters), folded-tail verification
+    /// per candidate, and the same boundary mapping plus entry-end jumps as
+    /// `scan_name_hits`. Shared by the path-substring term and the glob
+    /// prefilter.
+    fn scan_paths_hits(&self, needle: &[u8]) -> Vec<u32> {
+        let mut out = Vec::new();
         let arena = self.paths.slice();
         let n = self.entries.len();
         if arena.is_empty() || n == 0 {
@@ -912,13 +922,24 @@ impl MemIndex {
             let e = &self.entries[e_idx];
             let end = e.path_off as usize + e.path_len as usize;
             if abs + needle.len() <= end && ci_eq_at(arena, abs, needle) {
-                out.push(e.id);
+                out.push(e_idx as u32);
                 from = end;
             } else {
                 from = abs + 1;
             }
         }
         out
+    }
+
+    /// Whole-arena seed scan (entry indices) over the name or path arena,
+    /// depending on `use_names`; names are pre-lowercased (plain memmem),
+    /// paths keep original case (folded-first-byte memchr2 + tail check).
+    fn scan_arena_hits(&self, seed: &[u8], use_names: bool) -> Vec<u32> {
+        if use_names {
+            self.scan_name_hits(seed)
+        } else {
+            self.scan_paths_hits(seed)
+        }
     }
 
     fn range_by_rev(&self, rev: &[u8]) -> Vec<u32> {
@@ -978,10 +999,20 @@ impl MemIndex {
         out
     }
 
-    /// Glob scan with a leading-literal prefix narrowing (uses the
-    /// byte-sorted name permutation; names are already lowercased).
+    /// Glob scan. Three layers, in order:
+    /// 1. pure-star pattern → everything;
+    /// 2. leading literal prefix ≥ 2 bytes → byte-sorted name permutation
+    ///    narrows the candidate range (unchanged fast path);
+    /// 3. otherwise a whole-arena SIMD prefilter on the longest literal run
+    ///    of the pattern (every glob literal must appear in any match, so any
+    ///    run is a sound superset filter), then the compiled bit-parallel
+    ///    matcher verifies each candidate (zero allocation).
     fn scan_glob(&self, arena: &[u8], pattern: &str, use_names: bool) -> Vec<u32> {
         let tokens = glob_tokens(pattern);
+        if tokens.iter().all(|t| *t == GTok::Star) {
+            return self.all_ids();
+        }
+        let prog = GlobProg::compile(&tokens);
         let prefix: String = pattern
             .chars()
             .take_while(|c| *c != '*' && *c != '?')
@@ -1001,20 +1032,27 @@ impl MemIndex {
             for &i in &self.by_name[lo..hi] {
                 let e = &self.entries[i as usize];
                 let name = &arena[e.name_off as usize..e.name_off as usize + e.name_len as usize];
-                if glob_match(&tokens, name) {
+                if prog.matches(name) {
                     out.push(e.id);
                 }
             }
             out.sort_unstable();
             return out;
         }
-        for e in &self.entries {
+        let seed = longest_literal_run(&tokens);
+        let cands: Vec<u32> = if seed.is_empty() {
+            (0..self.entries.len() as u32).collect()
+        } else {
+            self.scan_arena_hits(&seed, use_names)
+        };
+        for idx in cands {
+            let e = &self.entries[idx as usize];
             let slice = if use_names {
                 &arena[e.name_off as usize..e.name_off as usize + e.name_len as usize]
             } else {
                 &arena[e.path_off as usize..e.path_off as usize + e.path_len as usize]
             };
-            if glob_match(&tokens, slice) {
+            if prog.matches(slice) {
                 out.push(e.id);
             }
         }
@@ -1326,41 +1364,169 @@ fn glob_tokens(p: &str) -> Vec<GTok> {
     out
 }
 
-/// Iterative glob match over bytes with ASCII case folding (no allocation).
-fn glob_match(tokens: &[GTok], hay: &[u8]) -> bool {
-    let n = hay.len();
-    let mut prev = vec![false; n + 1];
-    let mut cur = vec![false; n + 1];
-    prev[0] = true;
-    for &t in tokens {
-        match t {
-            GTok::Star => {
-                cur.fill(false);
-                let mut run = prev[0];
-                cur[0] = run;
-                for j in 1..=n {
-                    if prev[j] {
-                        run = true;
+/// Compiled glob matcher: literal segments between `Star`s, each compiled to
+/// a Shift-And mask table (or a naive matcher for pathological >64-token
+/// segments). Compiled ONCE per query; matching is per-candidate and
+/// zero-allocation. Byte-level `?` semantics and ASCII case folding are
+/// preserved exactly (same contract as the old DP matcher).
+struct GlobProg {
+    segs: Vec<GlobSeg>,
+    /// No trailing `*` → the last segment must end exactly at hay.len()
+    /// (full-string match, same as the old DP: `*.rs` must not match
+    /// "main.rss", while the implicit leading star keeps the prefix free).
+    anchored_end: bool,
+}
+
+#[allow(clippy::large_enum_variant)]
+enum GlobSeg {
+    /// Shift-And: `n` tokens, 2 KB on-stack mask table (both case variants of
+    /// each literal folded in, so one table serves lowercase names AND
+    /// original-case paths). Large-variant lint muted: the Bit variant is the
+    /// overwhelmingly common case and lives on the caller's stack, not the heap.
+    Bit { n: u8, masks: [u64; 256] },
+    Naive(Vec<GTok>),
+}
+
+impl GlobProg {
+    fn compile(tokens: &[GTok]) -> GlobProg {
+        let anchored_end = tokens.last() != Some(&GTok::Star);
+        let segs = tokens
+            .split(|t| *t == GTok::Star)
+            .flat_map(|seg| {
+                if seg.is_empty() {
+                    None
+                } else if seg.len() <= 64 {
+                    let mut masks = [0u64; 256];
+                    for (j, t) in seg.iter().enumerate() {
+                        match t {
+                            GTok::Lit(c) => {
+                                let c = *c; // already lowercased by glob_tokens
+                                masks[c as usize] |= 1 << j;
+                                if c.is_ascii_lowercase() {
+                                    masks[(c - 32) as usize] |= 1 << j;
+                                }
+                            }
+                            GTok::Any => {
+                                for m in masks.iter_mut() {
+                                    *m |= 1 << j;
+                                }
+                            }
+                            GTok::Star => unreachable!("segments contain no stars"),
+                        }
                     }
-                    cur[j] = run;
+                    Some(GlobSeg::Bit { n: seg.len() as u8, masks })
+                } else {
+                    Some(GlobSeg::Naive(seg.to_vec()))
                 }
+            })
+            .collect();
+        GlobProg { segs, anchored_end }
+    }
+
+    /// Greedy earliest-match per segment is safe: an earlier segment end
+    /// leaves a superset of valid starts for every later segment (a `*`
+    /// matches any run, including empty). The anchored-end contract applies
+    /// to the final segment only.
+    fn matches(&self, hay: &[u8]) -> bool {
+        let mut pos = 0usize;
+        let last = self.segs.len();
+        for (i, seg) in self.segs.iter().enumerate() {
+            let anchored = i == last - 1 && self.anchored_end;
+            let (found, end) = match seg {
+                GlobSeg::Bit { n, masks } => bit_seg_match(*n as usize, masks, hay, pos, anchored),
+                GlobSeg::Naive(tokens) => naive_seg_match(tokens, hay, pos, anchored),
+            };
+            if !found {
+                return false;
             }
-            _ => {
-                cur.fill(false);
-                for j in 1..=n {
-                    if prev[j - 1] {
-                        cur[j] = match t {
-                            GTok::Any => true,
-                            GTok::Lit(c) => fold(hay[j - 1]) == c,
-                            GTok::Star => unreachable!(),
-                        };
-                    }
-                }
+            pos = end;
+        }
+        true
+    }
+}
+
+/// Shift-And segment match. Earliest position in hay[start..] where the
+/// segment's literal bytes and `?` wildcards line up; with `anchored`, the
+/// match must end exactly at hay.len() (the scan runs to the end and the
+/// final automaton state answers "some suffix ends here").
+fn bit_seg_match(n: usize, masks: &[u64; 256], hay: &[u8], start: usize, anchored: bool) -> (bool, usize) {
+    if start + n > hay.len() {
+        return (false, start);
+    }
+    let target = 1u64 << (n - 1);
+    let mut state: u64 = 0;
+    if anchored {
+        for &b in &hay[start..] {
+            state = ((state << 1) | 1) & masks[fold(b) as usize];
+        }
+        (state & target != 0, hay.len())
+    } else {
+        for (k, &b) in hay[start..].iter().enumerate() {
+            state = ((state << 1) | 1) & masks[fold(b) as usize];
+            if state & target != 0 {
+                return (true, start + k + 1);
             }
         }
-        std::mem::swap(&mut prev, &mut cur);
+        (false, start)
     }
-    prev[n]
+}
+
+/// Fallback for >64-token segments (pathological: names are ≤ 255 bytes).
+fn naive_seg_match(tokens: &[GTok], hay: &[u8], start: usize, anchored: bool) -> (bool, usize) {
+    let n = tokens.len();
+    if start + n > hay.len() {
+        return (false, start);
+    }
+    if anchored {
+        let pos = hay.len() - n;
+        let ok = tokens.iter().enumerate().all(|(j, t)| match t {
+            GTok::Lit(c) => fold(hay[pos + j]) == *c,
+            GTok::Any => true,
+            GTok::Star => unreachable!(),
+        });
+        return (ok, hay.len());
+    }
+    for pos in start..=hay.len() - n {
+        let ok = tokens.iter().enumerate().all(|(j, t)| match t {
+            GTok::Lit(c) => fold(hay[pos + j]) == *c,
+            GTok::Any => true,
+            GTok::Star => unreachable!(),
+        });
+        if ok {
+            return (true, pos + n);
+        }
+    }
+    (false, start)
+}
+
+/// Longest contiguous run of literal bytes in the token list — the SIMD
+/// prefilter seed for the full-scan glob path. Glob has no alternation, so
+/// every literal run must appear in any match: a sound superset filter.
+fn longest_literal_run(tokens: &[GTok]) -> Vec<u8> {
+    let mut best: Vec<u8> = Vec::new();
+    let mut cur: Vec<u8> = Vec::new();
+    for t in tokens {
+        match t {
+            GTok::Lit(c) => cur.push(*c),
+            _ => {
+                if cur.len() > best.len() {
+                    best = cur.clone();
+                }
+                cur.clear();
+            }
+        }
+    }
+    if cur.len() > best.len() {
+        best = cur;
+    }
+    best
+}
+
+/// Bit-parallel glob match over bytes with ASCII case folding (no allocation).
+/// Test-only convenience wrapper (the engine uses `GlobProg` directly).
+#[cfg(test)]
+fn glob_match(tokens: &[GTok], hay: &[u8]) -> bool {
+    GlobProg::compile(tokens).matches(hay)
 }
 
 /// Extract exact literals from a (pre-lowercased) regex pattern for SIMD
@@ -1483,6 +1649,132 @@ mod tests {
         // case-insensitive, wildcard pattern
         let t = glob_tokens("READme*");
         assert!(glob_match(&t, b"readme.txt"));
+    }
+
+    /// Reference DP glob matcher (the pre-bit-parallel implementation),
+    /// retained as the correctness oracle for the compiled matcher.
+    fn glob_match_dp(tokens: &[GTok], hay: &[u8]) -> bool {
+        let n = hay.len();
+        let mut prev = vec![false; n + 1];
+        let mut cur = vec![false; n + 1];
+        prev[0] = true;
+        for &t in tokens {
+            match t {
+                GTok::Star => {
+                    cur.fill(false);
+                    let mut run = prev[0];
+                    cur[0] = run;
+                    for j in 1..=n {
+                        if prev[j] {
+                            run = true;
+                        }
+                        cur[j] = run;
+                    }
+                }
+                _ => {
+                    cur.fill(false);
+                    for j in 1..=n {
+                        if prev[j - 1] {
+                            cur[j] = match t {
+                                GTok::Any => true,
+                                GTok::Lit(c) => fold(hay[j - 1]) == c,
+                                GTok::Star => unreachable!(),
+                            };
+                        }
+                    }
+                }
+            }
+            std::mem::swap(&mut prev, &mut cur);
+        }
+        prev[n]
+    }
+
+    #[test]
+    fn glob_bitparallel_cases() {
+        let gm = |p: &str, h: &str| glob_match(&glob_tokens(p), h.as_bytes());
+        assert!(gm("*.rs", "main.rs"));
+        assert!(!gm("*.rs", "main.rss"));
+        assert!(gm("a?c", "abc"));
+        assert!(gm("a?c", "axc"));
+        assert!(gm("a?c", "xabc")); // implicit leading star: substring semantics
+        assert!(!gm("a?c", "ac"));
+        assert!(gm("*foo*bar*", "xfooybarz"));
+        assert!(!gm("*foo*bar*", "barfoo")); // order matters across stars
+        assert!(gm("???", "abc"));
+        assert!(!gm("???", "ab"));
+        // byte-level `?` semantics over UTF-8, end-anchored without trailing star
+        assert!(gm("报???", "报告"));
+        assert!(gm("报???", "报道"));
+        assert!(!gm("报?", "报告")); // 4-byte pattern vs 6-byte hay: cannot end-anchor
+        assert!(!gm("报?", "报")); // hay shorter than the 4-token segment
+        // case folding against original-case hay
+        assert!(gm("MAIN*", "main.rs"));
+        assert!(!gm("MAIN*", "sub.rs"));
+        // >64-token segment: naive fallback path
+        let long = "a".repeat(70) + "z";
+        let hay = "x".repeat(10) + &"a".repeat(70) + "z";
+        assert!(gm(&format!("*{long}*"), &hay));
+        assert!(!gm(&format!("*{long}*"), &"a".repeat(69)));
+        assert!(!gm(&format!("*{long}*"), &"a".repeat(71)));
+    }
+
+    #[test]
+    fn glob_bitparallel_matches_dp_random() {
+        // Deterministic pseudo-random patterns over {a,b,?,*} vs hays over
+        // {a,b}; the compiled matcher must agree with the DP oracle in every
+        // case (greedy earliest-match per segment is safe).
+        let mut seed = 0x9E37_79B9u64;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        const ALPHA: &[u8] = b"ab?*";
+        for _ in 0..800 {
+            let plen = (rnd() % 8 + 1) as usize;
+            let hlen = (rnd() % 14) as usize;
+            let p: String = (0..plen).map(|_| ALPHA[(rnd() % 4) as usize] as char).collect();
+            let h: String = (0..hlen).map(|_| (b'a' + (rnd() % 2) as u8) as char).collect();
+            let tokens = glob_tokens(&p);
+            assert_eq!(
+                glob_match(&tokens, h.as_bytes()),
+                glob_match_dp(&tokens, h.as_bytes()),
+                "pattern={p} hay={h}"
+            );
+        }
+    }
+
+    #[test]
+    fn glob_scan_prefilter() {
+        let mut b = MemBuilder::default();
+        let meta = EntryMeta { size: 0, mtime: 0, ctime: 0, flags: 0, ..Default::default() };
+        b.push(r"D:\p\foo_bar.rs", meta.clone()); // id 0: "*foo*bar*" ✓
+        b.push(r"D:\p\bar_foo.txt", meta.clone()); // id 1: order wrong
+        b.push(r"D:\p\xabc", meta.clone()); // id 2: "a?c" ✓ (ends abc)
+        b.push(r"D:\p\axc", meta.clone()); // id 3: "a?c" ✓ (ends axc)
+        b.push(r"D:\p\abc.txt", meta.clone()); // id 4: "a?c" ✗ (ends txt)
+        let mem = b.finish();
+
+        let q = Query::parse("*foo*bar*").unwrap();
+        assert_eq!(mem.search(&q), vec![0]);
+        // no ≥2 literal run → memchr prefilter + bit-parallel verification;
+        // no trailing star → end-anchored (full-string) semantics
+        let q = Query::parse("a?c").unwrap();
+        assert_eq!(mem.search(&q), vec![2, 3]);
+        // 1-byte prefix: legacy contains-semantics (the by_name fast path only
+        // engages for ≥2-byte prefixes) — every name containing 'a' matches
+        let q = Query::parse("a*").unwrap();
+        assert_eq!(mem.search(&q), vec![0, 1, 2, 3, 4]);
+        // ≥2-byte prefix keeps the by_name fast path
+        let q = Query::parse("ax*").unwrap();
+        assert_eq!(mem.search(&q), vec![3]);
+        let q = Query::parse("x*").unwrap();
+        // contains-x semantics: "txt" also has an x
+        assert_eq!(mem.search(&q), vec![1, 2, 3, 4]);
+        // pure star = everything
+        let q = Query::parse("*").unwrap();
+        assert_eq!(mem.search(&q), vec![0, 1, 2, 3, 4]);
     }
 
     #[test]
