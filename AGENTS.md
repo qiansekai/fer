@@ -16,11 +16,15 @@ CLI `--json` 与 HTTP API 双通道。
   ~1GB）；构建热缓存 ~11s / 冷盘 ~40-50s
 - dump **mmap 零拷贝加载**（裸指针 View + `Keep` 所有权锚点，加载 ~1ms，页按需缺页）：
   serve 启动 ~135ms，CLI 全查询 17-336ms（含进程启动）
-- dump 二进制契约：56B repr(C) Entry + 8 字节对齐段 + 头部 19 段偏移表 + 6 列表计数
-  + **by_frn 置换段** + **name_offs/path_offs 加速段**（v4；子串/正则整 arena 扫描的
-  offset→entry 游标映射）；改布局必须 bump FORMAT_VERSION。**v3 兼容加载**：老 dump
-  启动时从 entries 内存重建两个加速段（AuxAccel，Keep::Mapped 持有），stderr 提示
-  `fer index` 升级；v3/v4 头部长不同（200B/216B），测试里伪造 v3 要重建头部而非改版本字节
+- dump 二进制契约：56B repr(C) Entry + 8 字节对齐段 + 头部 22 段偏移表 + 6 列表计数
+  + **by_frn 置换段** + **name_offs/path_offs 加速段** + **trigram 倒排段**
+  （trigrams 排序去重 u32 / trig_offs 累计**终点**偏移 / trig_posts 按 entry 序；
+  v5）。改布局必须 bump FORMAT_VERSION。**v3/v4 兼容加载**：v3 内存重建加速段
+  （AuxAccel，Keep::Mapped 持有），v4 直接映射加速段；两者 trigram 段为空 → 查询
+  自动回退 arena 扫描。**`fer upgrade`** 免管理员格式迁移：load → build_missing_trigrams
+  （trig 三元组挂到 AuxAccel.trig）→ save 重写 v5（实测 4.14M 条 ~6.6s）
+- **dump 段尺寸校验必须容忍对齐 padding**：u32 段在 n×4 不是 8 的倍数时有 ≤7B padding
+  （真实 dump n 为偶数从未触发过，n=3 的测试炸了）——用 `bytes >= logical && bytes-logical < 8`
 - monitor：load dump → USN 增量进内存（by_frn 二分 + 删除影子集/删除集/追加列表）→
   默认每 60s 防抖重建成新 dump（flush 走 push_arena 直达复用，零 String 分配）；
   USN 位置存 `*.feridx.usn` 边车，崩溃靠日志回放补齐
@@ -106,6 +110,11 @@ cargo test --test live_volume -- --ignored --nocapture       # 真实卷（管�
   测试作 oracle（`glob_match_dp`）+ 800 例伪随机交叉验证，改匹配器必须跑它
 - **glob 预筛**：最长字面量 run 作 SIMD seed（glob 无 alternation，任何 run 必现，超集
   安全）；纯星模式特判 `all_ids()` 免全扫；无字面量模式（`???`）退全扫 + 位并行验证
+- **trigram 倒排段**：`trig_offs` 存的是每个 trigram posting 的**累计终点**（offs[0]=0，
+  换 trigram 时 push 上一个的 end，循环后 push 最后一个的 end）——写成"起点"语义会
+  让首个 trigram 的区间变成空（debug 血案）。trigram 只是超集过滤，**必须逐候选
+  memmem 校验**（含 trigram 的假阳性）；常见 trigram（如 "con"）posting 巨大，
+  校验成本线性于候选数（实测 186K 候选 14ms，可接受）
 - 本仓库有 git（commit 节点：基线/测试全绿/真实卷全绿/性能优化/内存引擎/dupes/极致性能），
   改动前先看 `git log`
 
@@ -116,6 +125,7 @@ cargo test --test live_volume -- --ignored --nocapture       # 真实卷（管�
 .\target-gnu\release\fer.exe search "foo" --count-only
 .\target-gnu\release\fer.exe index --volumes D
 .\target-gnu\release\fer.exe serve
+.\target-gnu\release\fer.exe upgrade   # 老 dump 免管理员迁移到 v5（重建 trigram 段）
 ```
 
 查询语言、HTTP API 契约、性能数据：见 README.md（以 README 为准，本文件只是速查）。

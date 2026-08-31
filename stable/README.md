@@ -7,12 +7,12 @@
 
 | 项 | 值 |
 |---|---|
-| 文件 | `stable\fer.exe`（2,916,705 字节） |
-| SHA256 | `F2CB104D8765D365337FF41B3C7B05E81DC5FCFC17CB0E4401858AEFD9202D1B` |
-| 备份时间 | 2026-09-01 |
-| 来源 commit | `4ef24c2`（2026-08-31，feat: regex 查询收尾） |
-| dump 格式 | **FERIDX01 v3**（与当时 `%LOCALAPPDATA%\file-engine-rust\index.db.feridx` 匹配） |
-| 已知性能 | 全查询 0-294ms（含进程启动），2 字子串 ~152-168ms，serve 启动 86ms |
+| 文件 | `stable\fer.exe` |
+| SHA256 | `BE3622429C46B593E1824F9055047F17190B6B4D87FCD1242B1F70AACD4153B7` |
+| 备份时间 | 2026-09-01（trigram v5 轮完成后） |
+| 来源 commit | `6c27bd1` 之后（v5 trigram + `fer upgrade`，正式 commit 见 git log） |
+| dump 格式 | **FERIDX01 v5**（trigram 倒排段；兼容加载 v3/v4） |
+| 已知性能 | serve 稳态：子串 0-23ms、CJK 2 字 0-1ms、路径子串 90-135ms、正则 4ms、glob 9-134ms |
 
 ## 回退方法
 
@@ -20,9 +20,8 @@
 Copy-Item D:\Kita-Tools\Coding\File-Engine-Rust\stable\fer.exe D:\Kita-Tools\Coding\File-Engine-Rust\target-gnu\release\fer.exe -Force
 ```
 
-注意：**v3 dump 与新版本（v4）互不兼容**。若回退到本备份但索引已用新版重建为 v4，
-需重跑 `fer index`（管理员）或让旧版报格式错误后重建。反过来，新版 fer 可**兼容加载 v3 dump**
-（自动构建加速段，提示重建）。
+注意：**本备份能读 v3/v4/v5 三种 dump**（v3 自动内存重建加速段并提示 `fer upgrade`）。
+若回退到更老的版本（v4 之前的 commit），v5 dump 无法加载，需重跑 `fer index`。
 
 ## 版本更替约定
 

@@ -41,23 +41,32 @@ use crate::query::{Query, Term};
 /// loading); v1 had unaligned sections and is rejected. v3 adds the `by_frn`
 /// permutation section (FRN → entry binary search for the monitor). v4 adds
 /// the `name_offs` / `path_offs` accelerator arrays (arena-offset → entry
-/// mapping, enabling whole-arena SIMD scans); v3 dumps stay loadable by
-/// rebuilding those arrays in memory in one linear pass.
+/// mapping, enabling whole-arena SIMD scans). v5 adds the trigram index
+/// (`trigrams` / `trig_offs` / `trig_posts`) for O(posting) substring
+/// candidate generation. Older dumps stay loadable: v3 rebuilds the two
+/// accelerator arrays in memory, v3/v4 simply fall back to arena scans.
 const MAGIC: &[u8; 8] = b"FERIDX01";
-const FORMAT_VERSION: u32 = 4;
+const FORMAT_VERSION: u32 = 5;
 
 /// Fixed dump section order: entries, paths, names, revs, the six sorted
-/// permutations, the six id lists, `by_frn`, then `name_offs` and `path_offs`
-/// (u32 arena offsets in entry/id order, monotone). The header stores byte
-/// offsets for each section plus the total file length (SEC+1 table entries),
-/// followed by the six id-list element counts — logical lengths come from
-/// these, so inter-section alignment padding never leaks into the data.
-const SEC: usize = 19;
-const HDR_LEN: usize = 32 + (SEC + 1) * 8 + 6 * 4; // 216
-/// v3 layout constants (no accelerator sections) for backward-compatible
-/// loading: existing dumps keep working without an immediate rebuild.
+/// permutations, the six id lists, `by_frn`, `name_offs`, `path_offs`, then
+/// the trigram index (`trigrams` sorted-unique u32, `trig_offs` cumulative
+/// u32 posting offsets, `trig_posts` ascending entry indices). The header
+/// stores byte offsets for each section plus the total file length (SEC+1
+/// table entries), followed by the six id-list element counts — logical
+/// lengths come from these, so inter-section alignment padding never leaks
+/// into the data.
+const SEC: usize = 22;
+const HDR_LEN: usize = 32 + (SEC + 1) * 8 + 6 * 4; // 240
+/// v3 layout constants (no accelerator/trigram sections) for
+/// backward-compatible loading: existing dumps keep working without an
+/// immediate rebuild.
 const SEC_V3: usize = 17;
 const HDR_LEN_V3: usize = 32 + (SEC_V3 + 1) * 8 + 6 * 4; // 200
+/// v4 layout (accelerator arrays, no trigram index): loads with mapped
+/// accelerators and arena-scan fallback for substrings.
+const SEC_V4: usize = 19;
+const HDR_LEN_V4: usize = 32 + (SEC_V4 + 1) * 8 + 6 * 4; // 216
 
 /// Packed, dump-stable 56-byte record. Field order groups the u64s so there
 /// is no interior padding; the dump is written/read as raw little-endian
@@ -173,11 +182,13 @@ enum Keep {
 }
 
 /// v3 compatibility payload: the two accelerator arrays derived from the
-/// id-ordered entries section (arena offsets are monotone there).
+/// id-ordered entries section (arena offsets are monotone there), plus —
+/// after `fer upgrade` — the trigram index rebuilt in memory.
 #[derive(Default)]
 struct AuxAccel {
     name_offs: Vec<u32>,
     path_offs: Vec<u32>,
+    trig: Option<(Vec<u32>, Vec<u32>, Vec<u32>)>,
 }
 
 /// Ownership anchor for dump-backed indexes: the mmap keeps every mapped
@@ -211,6 +222,9 @@ struct OwnedData {
     reparse_ids: Vec<u32>,
     name_offs: Vec<u32>,
     path_offs: Vec<u32>,
+    trigrams: Vec<u32>,
+    trig_offs: Vec<u32>,
+    trig_posts: Vec<u32>,
 }
 
 /// Immutable pointer+len slice view. Backed either by the owned Vecs or by the
@@ -276,6 +290,9 @@ pub struct Sections {
     by_frn: View<u32>,
     name_offs: View<u32>,
     path_offs: View<u32>,
+    trigrams: View<u32>,
+    trig_offs: View<u32>,
+    trig_posts: View<u32>,
 }
 
 impl std::ops::Deref for MemIndex {
@@ -363,6 +380,9 @@ impl MemIndex {
             pod_bytes(&self.by_frn),
             pod_bytes(&self.name_offs),
             pod_bytes(&self.path_offs),
+            pod_bytes(&self.trigrams),
+            pod_bytes(&self.trig_offs),
+            pod_bytes(&self.trig_posts),
         ];
         for (i, bytes) in secs.into_iter().enumerate() {
             offs[i] = off;
@@ -420,13 +440,16 @@ impl MemIndex {
             bail!("not a FERIDX dump: {}", path.display());
         }
         let version = u32::from_le_bytes(buf[8..12].try_into().unwrap());
-        if version != FORMAT_VERSION && version != 3 {
+        if version != FORMAT_VERSION && version != 4 && version != 3 {
             bail!(
-                "dump format v{version} unsupported (want v{FORMAT_VERSION} or v3) — re-run `fer index`"
+                "dump format v{version} unsupported (want v{FORMAT_VERSION}, v4 or v3) — re-run `fer index`"
             );
         }
-        let sec = if version == 3 { SEC_V3 } else { SEC };
-        let hdr_len = if version == 3 { HDR_LEN_V3 } else { HDR_LEN };
+        let (sec, hdr_len) = match version {
+            3 => (SEC_V3, HDR_LEN_V3),
+            4 => (SEC_V4, HDR_LEN_V4),
+            _ => (SEC, HDR_LEN),
+        };
         let n = u32::from_le_bytes(buf[12..16].try_into().unwrap()) as usize;
         let mut offs = [0u64; SEC + 1];
         for (i, o) in offs.iter_mut().enumerate().take(sec + 1) {
@@ -440,13 +463,20 @@ impl MemIndex {
                     .unwrap(),
             ) as usize;
         }
+        // Section sizes: entries are 56B (always 8-divisible, exact check);
+        // u32 sections may carry up to 7 bytes of alignment padding when
+        // n*4 isn't a multiple of 8, so use the padded bound.
+        let padded = |bytes: u64, logical: usize| {
+            bytes as usize >= logical && (bytes as usize - logical) < 8
+        };
         anyhow::ensure!(
             offs[0] == hdr_len as u64
                 && offs[sec] == len
                 && offs[..sec].windows(2).all(|w| w[0] <= w[1])
                 && offs.iter().take(sec).all(|o| o % 8 == 0)
                 && (offs[1] - offs[0]) as usize == n * std::mem::size_of::<Entry>()
-                && (offs[17] - offs[16]) as usize == n * 4
+                && padded(offs[17] - offs[16], n * 4)
+                && (version == 3 || padded(offs[18] - offs[17], n * 4))
                 && counts[0] + counts[1] == n,
             "dump layout corrupt: {}",
             path.display()
@@ -469,13 +499,14 @@ impl MemIndex {
             let mut acc = AuxAccel {
                 name_offs: Vec::with_capacity(n),
                 path_offs: Vec::with_capacity(n),
+                trig: None,
             };
             for e in entries_view.slice() {
                 acc.name_offs.push(e.name_off);
                 acc.path_offs.push(e.path_off);
             }
             eprintln!(
-                "fer: loaded v3 dump (accelerator arrays rebuilt in memory) — run `fer index` to upgrade to v4"
+                "fer: loaded v3 dump (accelerator arrays rebuilt in memory) — run `fer upgrade` for the v5 trigram index, or `fer index` for a full refresh"
             );
             Some(acc)
         } else {
@@ -488,6 +519,21 @@ impl MemIndex {
         let path_offs = match &aux {
             Some(a) => View::from_slice(&a.path_offs),
             None => view_of(view_at(offs[18], perm_bytes)),
+        };
+        // Trigram sections exist only in v5; older dumps fall back to the
+        // whole-arena scan path (empty views).
+        let (trigrams, trig_offs, trig_posts) = if version == 5 {
+            (
+                view_of(view_at(offs[19], (offs[20] - offs[19]) as usize)),
+                view_of(view_at(offs[20], (offs[21] - offs[20]) as usize)),
+                view_of(view_at(offs[21], (offs[22] - offs[21]) as usize)),
+            )
+        } else {
+            (
+                View::<u32>::from_slice(&[]),
+                View::<u32>::from_slice(&[]),
+                View::<u32>::from_slice(&[]),
+            )
         };
         let sec = Sections {
             entries: view_of(view_at(offs[0], entry_bytes)),
@@ -509,12 +555,59 @@ impl MemIndex {
             by_frn: view_of(view_at(offs[16], perm_bytes)),
             name_offs,
             path_offs,
+            trigrams,
+            trig_offs,
+            trig_posts,
         };
         Ok(MemIndex { _keep: Keep::Mapped(MappedData { mmap, aux }), sec })
     }
 
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Number of distinct trigrams in the index (0 when absent — v3/v4 dumps).
+    pub fn trigram_count(&self) -> usize {
+        self.trigrams.len()
+    }
+
+    /// Rebuild the trigram index in memory when it is missing (v3/v4 dumps)
+    /// and repoint the section views at the new arrays. The arrays live in
+    /// the `Keep` anchor (OwnedData fields or the MappedData aux slot).
+    /// Returns false when the index was already present. `fer upgrade` uses
+    /// this for a format-only migration — no admin, no MFT re-read; a later
+    /// `save()` then rewrites the dump as v5.
+    pub fn build_missing_trigrams(&mut self) -> bool {
+        if !self.trigrams.is_empty() {
+            return false;
+        }
+        let (t, o, p) = build_trigrams(self.names.slice(), self.entries.slice());
+        let (tv, ov, pv) = match &mut self._keep {
+            Keep::Owned(owned) => {
+                owned.trigrams = t;
+                owned.trig_offs = o;
+                owned.trig_posts = p;
+                (
+                    View::from_slice(&owned.trigrams),
+                    View::from_slice(&owned.trig_offs),
+                    View::from_slice(&owned.trig_posts),
+                )
+            }
+            Keep::Mapped(mapped) => {
+                let aux = mapped.aux.get_or_insert_with(AuxAccel::default);
+                aux.trig = Some((t, o, p));
+                let trig = aux.trig.as_ref().expect("just set");
+                (
+                    View::from_slice(&trig.0),
+                    View::from_slice(&trig.1),
+                    View::from_slice(&trig.2),
+                )
+            }
+        };
+        self.sec.trigrams = tv;
+        self.sec.trig_offs = ov;
+        self.sec.trig_posts = pv;
+        true
     }
 
     /// Number of directory entries (from the precomputed id lists, no scan).
@@ -622,6 +715,7 @@ impl MemIndex {
                 + self.readonly_ids.len()
                 + self.reparse_ids.len())
                 * 4
+            + (self.trigrams.len() + self.trig_offs.len() + self.trig_posts.len()) * 4
     }
 
     /// Evaluate the whole query in memory; returns matching file ids ascending.
@@ -832,6 +926,26 @@ impl MemIndex {
     ///   semantics — at most one hit per entry);
     /// * the entry cursor advances monotonically because `from` only grows.
     fn scan_name_hits(&self, needle: &[u8]) -> Vec<u32> {
+        // Trigram fast path: ≥3-byte needles intersect posting lists down to a
+        // tiny candidate set (O(posting) instead of O(arena)); each candidate
+        // is still verified with a real memmem on its own name, so the trigram
+        // index is only a sound superset filter. Absent index (v3/v4 dumps) →
+        // whole-arena scan.
+        if needle.len() >= 3
+            && let Some(cands) = self.trigram_candidates(needle)
+        {
+            let mut out = Vec::with_capacity(cands.len());
+            let names = self.names.slice();
+            for idx in cands {
+                let e = &self.entries[idx as usize];
+                let name =
+                    &names[e.name_off as usize..e.name_off as usize + e.name_len as usize];
+                if memchr::memmem::find(name, needle).is_some() {
+                    out.push(idx);
+                }
+            }
+            return out;
+        }
         let mut out = Vec::new();
         let arena = self.names.slice();
         let n = self.entries.len();
@@ -868,6 +982,45 @@ impl MemIndex {
             }
         }
         out
+    }
+
+    /// Trigram prefilter: intersect the posting lists of the needle's distinct
+    /// trigrams, starting from the shortest list; returns candidate entry
+    /// indices ascending, or None when the trigram index is absent (v3/v4
+    /// dumps load with empty sections and fall back to the arena scan).
+    /// Soundness: a name containing the needle contains every distinct trigram
+    /// of the needle, so the intersection is a superset of the matches.
+    fn trigram_candidates(&self, needle: &[u8]) -> Option<Vec<u32>> {
+        if self.trigrams.is_empty() {
+            return None;
+        }
+        let mut ts: Vec<u32> = Vec::new();
+        for w in needle.windows(3) {
+            let t = ((w[0] as u32) << 16) | ((w[1] as u32) << 8) | w[2] as u32;
+            if ts.last() != Some(&t) {
+                ts.push(t);
+            }
+        }
+        let posts_of = |t: u32| -> &[u32] {
+            let pos = self.trigrams.partition_point(|&x| x < t);
+            if pos < self.trigrams.len() && self.trigrams[pos] == t {
+                let s = self.trig_offs[pos] as usize;
+                let e = self.trig_offs[pos + 1] as usize;
+                &self.trig_posts.slice()[s..e]
+            } else {
+                &[]
+            }
+        };
+        // shortest posting first (cheapest intersection)
+        ts.sort_unstable_by_key(|&t| posts_of(t).len());
+        let mut cands: Vec<u32> = posts_of(ts[0]).to_vec();
+        for t in &ts[1..] {
+            cands = intersect(&cands, posts_of(*t));
+            if cands.is_empty() {
+                break;
+            }
+        }
+        Some(cands)
     }
 
     /// ASCII-case-insensitive substring scan over the (original-case) path
@@ -1084,6 +1237,9 @@ fn finalize(entries: Vec<Entry>, paths: Vec<u8>, names: Vec<u8>, revs: Vec<u8>) 
     let mut readonly_ids: Vec<u32> = Vec::new();
     let mut reparse_ids: Vec<u32> = Vec::new();
     let e: &[Entry] = &entries;
+    // The trigram build is independent of the sorts/attribute pass — run it in
+    // the same scope so finalize stays one parallel phase.
+    let mut trig: Option<(Vec<u32>, Vec<u32>, Vec<u32>)> = None;
     std::thread::scope(|s| {
         s.spawn(|| {
             by_path.sort_unstable_by(|&a, &b| {
@@ -1129,7 +1285,11 @@ fn finalize(entries: Vec<Entry>, paths: Vec<u8>, names: Vec<u8>, revs: Vec<u8>) 
                 }
             }
         });
+        s.spawn(|| {
+            trig = Some(build_trigrams(&names, e));
+        });
     });
+    let (trigrams, trig_offs, trig_posts) = trig.expect("trigram build thread");
     // Accelerator arrays: arena offsets in id order (monotone by
     // construction), used to map whole-arena scan hits back to entries.
     let name_offs: Vec<u32> = e.iter().map(|t| t.name_off).collect();
@@ -1154,7 +1314,54 @@ fn finalize(entries: Vec<Entry>, paths: Vec<u8>, names: Vec<u8>, revs: Vec<u8>) 
         reparse_ids,
         name_offs,
         path_offs,
+        trigrams,
+        trig_offs,
+        trig_posts,
     })
+}
+
+/// Build the trigram index: every distinct 3-byte window of every (lowercased)
+/// name maps to the sorted list of entries containing it. `(trigram, idx)`
+/// pairs are packed into u64s, sorted once, then deduplicated and split into
+/// the three dump sections. Peak cost is one u64 per name-window (~500 MB at
+/// 4M entries of ~18-byte names) — acceptable for a build-time phase.
+fn build_trigrams(names: &[u8], entries: &[Entry]) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+    let mut pairs: Vec<u64> = Vec::with_capacity(entries.len().saturating_mul(12));
+    for (i, e) in entries.iter().enumerate() {
+        let name = &names[e.name_off as usize..e.name_off as usize + e.name_len as usize];
+        let mut prev: u32 = u32::MAX;
+        for w in name.windows(3) {
+            let t = ((w[0] as u32) << 16) | ((w[1] as u32) << 8) | w[2] as u32;
+            // consecutive-duplicate skip; exact duplicates collapse in dedup()
+            if t != prev {
+                pairs.push(((t as u64) << 32) | i as u64);
+                prev = t;
+            }
+        }
+    }
+    pairs.sort_unstable();
+    pairs.dedup();
+    let mut trigs: Vec<u32> = Vec::with_capacity(pairs.len());
+    let mut offs: Vec<u32> = Vec::with_capacity(pairs.len());
+    let mut posts: Vec<u32> = Vec::with_capacity(pairs.len());
+    offs.push(0);
+    let mut cur: Option<u32> = None;
+    for p in pairs {
+        let t = (p >> 32) as u32;
+        let i = (p & 0xFFFF_FFFF) as u32;
+        if Some(t) != cur {
+            // end of the PREVIOUS trigram's posting run
+            if cur.is_some() {
+                offs.push(posts.len() as u32);
+            }
+            trigs.push(t);
+            cur = Some(t);
+        }
+        posts.push(i);
+    }
+    // end of the last trigram's posting run
+    offs.push(posts.len() as u32);
+    (trigs, offs, posts)
 }
 
 impl MemIndex {
@@ -1182,6 +1389,9 @@ impl MemIndex {
             by_frn: View::from_slice(&o.by_frn),
             name_offs: View::from_slice(&o.name_offs),
             path_offs: View::from_slice(&o.path_offs),
+            trigrams: View::from_slice(&o.trigrams),
+            trig_offs: View::from_slice(&o.trig_offs),
+            trig_posts: View::from_slice(&o.trig_posts),
         };
         MemIndex { _keep: Keep::Owned(o), sec }
     }
@@ -1915,6 +2125,114 @@ mod tests {
         // alternation: prefilter must not drop matches that lack one branch
         let q = Query::parse("regex:main|readme").unwrap();
         assert_eq!(mem.search(&q), vec![0, 2]);
+    }
+
+    #[test]
+    fn trigram_fast_path_correctness() {
+        let mut b = MemBuilder::default();
+        let meta = EntryMeta { size: 0, mtime: 0, ctime: 0, flags: 0, ..Default::default() };
+        b.push(r"D:\t\aaaa", meta.clone()); // id 0: "aaa" with duplicate trigram
+        b.push(r"D:\t\abababa", meta.clone()); // id 1: "aba" twice, non-adjacent
+        b.push(r"D:\t\abcabc", meta.clone()); // id 2
+        b.push(r"D:\t\x", meta.clone()); // id 3: name < 3 bytes, no trigrams
+        b.push(r"D:\t\bca", meta.clone()); // id 4: shares "bca" with id 2
+        let mem = b.finish();
+
+        // ≥3-byte needles take the trigram fast path (owned index has it)
+        assert_eq!(mem.search(&Query::parse("aaa").unwrap()), vec![0]);
+        assert_eq!(mem.search(&Query::parse("aba").unwrap()), vec![1]);
+        assert_eq!(mem.search(&Query::parse("bca").unwrap()), vec![2, 4]);
+        // intersection of three trigrams narrows to id 2
+        assert_eq!(mem.search(&Query::parse("abcabc").unwrap()), vec![2]);
+        // trigram absent from the whole index → empty
+        assert!(mem.search(&Query::parse("zzz").unwrap()).is_empty());
+        // trigram hit but verification fails (needle longer than name)
+        assert!(mem.search(&Query::parse("aaaaa").unwrap()).is_empty());
+        // <3-byte needles keep the whole-arena scan
+        assert_eq!(mem.search(&Query::parse("ab").unwrap()), vec![1, 2]);
+        assert_eq!(mem.search(&Query::parse("x").unwrap()), vec![3]);
+    }
+
+    #[test]
+    fn v4_dump_compat_load() {
+        let mem = build_mem();
+        let dir = tempfile::tempdir().unwrap();
+        let v5path = dir.path().join("t.feridx");
+        mem.save(&v5path).unwrap();
+        // Rebuild a genuine v4-layout file from the v5 one: first 19 sections,
+        // 216-byte v4 header (v4 has accelerators but no trigram index).
+        let v5 = std::fs::read(&v5path).unwrap();
+        let mut offs5 = [0u64; SEC + 1];
+        for (i, o) in offs5.iter_mut().enumerate() {
+            *o = u64::from_le_bytes(v5[32 + i * 8..40 + i * 8].try_into().unwrap());
+        }
+        let counts5: Vec<u32> = (0..6)
+            .map(|i| {
+                u32::from_le_bytes(
+                    v5[32 + (SEC + 1) * 8 + i * 4..32 + (SEC + 1) * 8 + (i + 1) * 4]
+                        .try_into()
+                        .unwrap(),
+                )
+            })
+            .collect();
+        let payload = v5[offs5[0] as usize..offs5[SEC_V4] as usize].to_vec();
+        let mut hdr = Vec::with_capacity(HDR_LEN_V4);
+        hdr.extend_from_slice(MAGIC);
+        hdr.extend_from_slice(&4u32.to_le_bytes());
+        hdr.extend_from_slice(&(mem.len() as u32).to_le_bytes());
+        hdr.extend_from_slice(&0i64.to_le_bytes());
+        hdr.extend_from_slice(&0i64.to_le_bytes());
+        let mut offs4 = [0u64; SEC_V4 + 1];
+        offs4[0] = HDR_LEN_V4 as u64;
+        for i in 1..=SEC_V4 {
+            offs4[i] = HDR_LEN_V4 as u64 + (offs5[i] - offs5[0]);
+        }
+        for o in offs4 {
+            hdr.extend_from_slice(&o.to_le_bytes());
+        }
+        for c in counts5 {
+            hdr.extend_from_slice(&c.to_le_bytes());
+        }
+        let mut v4file = hdr;
+        v4file.extend_from_slice(&payload);
+        let v4path = dir.path().join("t4.feridx");
+        std::fs::write(&v4path, &v4file).unwrap();
+
+        let loaded = MemIndex::load_dump(&v4path).unwrap();
+        assert_eq!(loaded.len(), mem.len());
+        assert!(loaded.trigrams.is_empty(), "v4 loads without a trigram index");
+        // ≥3-byte needles fall back to the arena scan with identical results
+        for q in ["report", "rs", "*.rs", "ext:rs", "regex:rs", "!hidden:true"] {
+            assert_eq!(
+                loaded.search(&Query::parse(q).unwrap()),
+                mem.search(&Query::parse(q).unwrap()),
+                "query {q}: v4-compat load vs owned mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn v5_dump_roundtrip_trigram() {
+        // The trigram index must survive a dump roundtrip (mapped views) and
+        // serve the fast path identically to the owned index.
+        let mut b = MemBuilder::default();
+        let meta = EntryMeta { size: 0, mtime: 0, ctime: 0, flags: 0, ..Default::default() };
+        b.push(r"D:\t\report.md", meta.clone());
+        b.push(r"D:\t\年度报告.md", meta.clone());
+        b.push(r"D:\t\main.rs", meta.clone());
+        let mem = b.finish();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.feridx");
+        mem.save(&path).unwrap();
+        let loaded = MemIndex::load_dump(&path).unwrap();
+        assert!(!loaded.trigrams.is_empty());
+        for q in ["rep", "report", "报告", "年度", "main", "rs", "zzz"] {
+            assert_eq!(
+                loaded.search(&Query::parse(q).unwrap()),
+                mem.search(&Query::parse(q).unwrap()),
+                "query {q}: v5 roundtrip mismatch"
+            );
+        }
     }
 
     #[test]
