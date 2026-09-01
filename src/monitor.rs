@@ -38,6 +38,12 @@ pub fn run(
     interval: Duration,
     flush_every: Duration,
 ) -> Result<()> {
+    // Hard gate: the USN journal needs an elevated token; failing 10 minutes
+    // into a watch (or worse, flushing a broken index) is worse than refusing
+    // up front.
+    if !crate::is_elevated() {
+        bail!("fer monitor needs an elevated process (USN journal access)");
+    }
     let mut vol = UsnVolume::open(drive)?;
     let usn_sidecar = usn_sidecar_path(&dump);
     let mut start = read_usn(&usn_sidecar, drive).unwrap_or_else(|| sync_to_now(&vol));

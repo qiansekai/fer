@@ -34,6 +34,7 @@ tokio = { version = "1.53.1", features = ["rt-multi-thread", "net"] }
 walkdir = "2.5.0"
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
+    "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_System_Ioctl",

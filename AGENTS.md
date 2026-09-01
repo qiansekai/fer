@@ -37,7 +37,7 @@ CLI `--json` 与 HTTP API 双通道。
 
 - 源码 `src/`：mft.rs（原始 $MFT 扫描，核心）、usn.rs（回退索引 + 变更监控）、
   walk.rs（回退）、store.rs（SQLite oracle，feature `sqlite` 门控）、query.rs（查询语言）、
-  indexer.rs（mft→usn→walk 编排）、monitor.rs、server.rs、mem.rs（dump 内存引擎：
+  indexer.rs（build 编排：auto=纯 MFT，非提权硬拒绝；usn/walk 仅显式降级）、monitor.rs、server.rs、mem.rs（dump 内存引擎：
   **v4 + name_offs/path_offs 加速段 + 整 arena 单遍 SIMD 扫描**）、du.rs（磁盘占用
   聚合：subtree_ids 边界感知枚举 + FRN 去重 + 祖先 roll-up）、dupes.rs、main.rs（CLI）
 - 产物 `target-gnu\release\fer.exe`；默认索引库 `%LOCALAPPDATA%\file-engine-rust\index.db`
@@ -137,6 +137,12 @@ cargo test --test live_volume -- --ignored --nocapture       # 真实卷（管�
   血案：把分隔符算进前缀导致与目录键全部失配、children 全空）；聚合 = 连续均分块 scoped
   线程 + 稠密 per-dir 原子数组（无 merge；**按一级目录分桶会失效**——单目录占 87% 文件时
   一个线程单扛全部查找）
+- **构建门禁（2026-09）**：`indexer::build` 对 auto/mft/usn 做 `is_elevated()` 硬检查
+  （`Win32_Security` OpenProcessToken + TokenElevation），非提权直接 bail——**auto 曾经
+  MFT→USN→walk 静默降级**，非提权跑 `fer index` 会悄悄用 walk 覆盖好 dump（丢硬链接/
+  大小/时间）；现在降级必须显式 `--method walk`。monitor 同款门禁。`/api/rescan` 走
+  build() 自动继承。测试：`elevation_gate`（环境无关）；真实非提权验证 = 普通终端跑
+  `fer index` 应瞬间拒绝
 - **allocated 口径（v6）**：`$DATA` 非驻留头 allocated@+40 / real@+48（mft.rs）；**驻留文件
   allocated=0 是真实语义**（住在 MFT 记录里不占簇，与"未知"区分靠 dump 版本）；du 双口径
   始终在 JSON 里（`total_bytes`/`total_allocated`、children 的 `size`/`allocated`），

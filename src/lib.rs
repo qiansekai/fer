@@ -29,6 +29,41 @@ pub const ROOT_FRN: u64 = 5;
 /// Mask that strips the sequence number from a 64-bit file reference number.
 pub const FRN_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 
+/// Whether the current process token is elevated (administrator). Drives the
+/// hard gates on `fer index` / `fer monitor`: raw $MFT / USN journal access
+/// requires it, and silently degrading to the metadata-less walk path would
+/// overwrite a good dump with a worse one.
+pub fn is_elevated() -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TOKEN_ELEVATION, TokenElevation, TOKEN_QUERY,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: GetCurrentProcess returns a valid pseudo-handle; TOKEN_QUERY is
+    // a minimal access mask; the out handle is initialized above.
+    let ok = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) };
+    if ok == 0 {
+        return false;
+    }
+    let mut elevated = TOKEN_ELEVATION { TokenIsElevated: 0 };
+    let mut ret = 0u32;
+    // SAFETY: `token` is a valid query handle; the buffer is a correctly
+    // sized TOKEN_ELEVATION; TokenElevation is the matching info class.
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TokenElevation,
+            &mut elevated as *mut TOKEN_ELEVATION as *mut core::ffi::c_void,
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut ret,
+        )
+    };
+    // SAFETY: `token` came from OpenProcessToken and is used exactly once.
+    unsafe { CloseHandle(token) };
+    ok != 0 && elevated.TokenIsElevated != 0
+}
+
 /// Per-entry metadata flowing through the index pipeline.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EntryMeta {
