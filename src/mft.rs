@@ -56,6 +56,8 @@ pub struct MftEntry {
     pub name: String,
     pub is_dir: bool,
     pub size: u64,
+    /// Allocated clusters in bytes (0 for resident streams).
+    pub allocated: u64,
     pub mtime: i64, // unix seconds
     pub ctime: i64, // unix seconds
     pub hidden: bool,
@@ -375,6 +377,7 @@ fn parse_record(rec: &mut [u8], sector_size: u32) -> Option<Vec<MftEntry>> {
     let mut std_mtime = 0i64;
     let mut std_ctime = 0i64;
     let mut data_size: Option<u64> = None;
+    let mut data_allocated: Option<u64> = None;
     let mut names: Vec<(u64, String, bool, bool, bool, bool)> = Vec::new();
     let mut max_size = 0u64;
     for attr in iterate_attributes(rec, hdr.attr_off, hdr.bytes_in_use) {
@@ -385,11 +388,14 @@ fn parse_record(rec: &mut [u8], sector_size: u32) -> Option<Vec<MftEntry>> {
                 std_mtime = filetime_to_unix(u64::from_le_bytes(v[8..16].try_into().unwrap()));
             }
             0x80 => {
-                data_size = if attr.non_resident {
-                    Some(attr.real_size)
+                if attr.non_resident {
+                    data_size = Some(attr.real_size);
+                    // 0 clusters for resident streams (stored in the record)
+                    data_allocated = Some(attr.allocated);
                 } else {
-                    Some(attr.value_len as u64)
-                };
+                    data_size = Some(attr.value_len as u64);
+                    data_allocated = Some(0);
+                }
             }
             0x30 if !attr.non_resident && attr.value_len >= 66 => {
                 let v = &rec[attr.value_off..attr.value_off + attr.value_len as usize];
@@ -419,6 +425,7 @@ fn parse_record(rec: &mut [u8], sector_size: u32) -> Option<Vec<MftEntry>> {
         }
     }
     let size = data_size.unwrap_or(max_size);
+    let allocated = data_allocated.unwrap_or(0);
     let mut out = Vec::with_capacity(names.len());
     for (parent_frn, name, hidden, system, readonly, reparse) in names {
         out.push(MftEntry {
@@ -427,6 +434,7 @@ fn parse_record(rec: &mut [u8], sector_size: u32) -> Option<Vec<MftEntry>> {
             name,
             is_dir,
             size,
+            allocated,
             mtime: std_mtime.max(0),
             ctime: std_ctime.max(0),
             hidden,
@@ -525,6 +533,9 @@ struct AttrRef {
     value_len: u32,
     value_off: usize,
     real_size: u64,
+    /// Allocated clusters in bytes ($DATA only; 0 for resident attributes,
+    /// which live inside the FILE record and occupy no clusters).
+    allocated: u64,
     mapping_pairs_off: usize,
 }
 
@@ -539,14 +550,16 @@ fn iterate_attributes<'a>(rec: &'a [u8], mut off: usize, limit: usize) -> impl I
             return None;
         }
         let non_resident = rec[off + 8] != 0;
-        let (value_len, value_off, real_size, mapping_pairs_off) = if non_resident {
+        let (value_len, value_off, real_size, allocated, mapping_pairs_off) = if non_resident {
             let mp = u16::from_le_bytes([rec[off + 32], rec[off + 33]]) as usize;
+            // non-resident header: allocated_size @ +40, real_size @ +48
+            let as_ = u64::from_le_bytes(rec[off + 40..off + 48].try_into().unwrap());
             let rs = u64::from_le_bytes(rec[off + 48..off + 56].try_into().unwrap());
-            (0u32, 0usize, rs, off + mp)
+            (0u32, 0usize, rs, as_, off + mp)
         } else {
             let vl = u32::from_le_bytes(rec[off + 16..off + 20].try_into().unwrap());
             let vo = u16::from_le_bytes([rec[off + 20], rec[off + 21]]) as usize;
-            (vl, off + vo, 0u64, 0usize)
+            (vl, off + vo, 0u64, 0u64, 0usize)
         };
         let end = off + len;
         off += len;
@@ -557,6 +570,7 @@ fn iterate_attributes<'a>(rec: &'a [u8], mut off: usize, limit: usize) -> impl I
             value_len,
             value_off,
             real_size,
+            allocated,
             mapping_pairs_off,
         })
     })
@@ -697,11 +711,12 @@ mod tests {
             off += attr_len;
         }
         if let Some(ds) = data_size {
-            // non-resident $DATA attribute (no runlist), real size = ds
+            // non-resident $DATA attribute (no runlist): allocated = real = ds
             put_u32(&mut rec, off, 0x80);
             put_u32(&mut rec, off + 4, 64);
             rec[off + 8] = 1;
-            put_u64(&mut rec, off + 48, ds);
+            put_u64(&mut rec, off + 40, ds); // allocated size
+            put_u64(&mut rec, off + 48, ds); // real size
             off += 64;
         }
         put_u32(&mut rec, off, 0xFFFF_FFFF);
@@ -764,13 +779,31 @@ mod tests {
         let rec = make_file_record(201, 1, false, &[(5, "big.bin", 0, 0)], Some(7777));
         let fixed = apply_fixups(&rec, 512).unwrap();
         let hdr = parse_file_header(&fixed).unwrap();
-        let data: Vec<(bool, u64, u32)> = iterate_attributes(&fixed, hdr.attr_off, hdr.bytes_in_use)
+        let data: Vec<(bool, u64, u64, u32)> = iterate_attributes(&fixed, hdr.attr_off, hdr.bytes_in_use)
             .filter(|a| a.attr_type == 0x80)
-            .map(|a| (a.non_resident, a.real_size, a.value_len))
+            .map(|a| (a.non_resident, a.real_size, a.allocated, a.value_len))
             .collect();
         assert_eq!(data.len(), 1);
         assert!(data[0].0); // non-resident
         assert_eq!(data[0].1, 7777); // real_size read from offset 48
+        assert_eq!(data[0].2, 7777); // allocated read from offset 40
+    }
+
+    #[test]
+    fn record_allocated_flows_into_entry() {
+        // End-to-end: parse_record surfaces the $DATA allocated size on the
+        // emitted entry; resident records (no $DATA) get 0.
+        let mut rec = make_file_record(202, 1, false, &[(5, "big.bin", 0, 0)], Some(9000));
+        let entries = parse_record(&mut rec, 512).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].size, 9000);
+        assert_eq!(entries[0].allocated, 9000);
+
+        let mut resident = make_file_record(203, 1, false, &[(5, "tiny.txt", 7, 0)], None);
+        let entries = parse_record(&mut resident, 512).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].size, 7); // falls back to $FILE_NAME's field
+        assert_eq!(entries[0].allocated, 0);
     }
 
     #[test]

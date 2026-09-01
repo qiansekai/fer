@@ -16,13 +16,16 @@ CLI `--json` 与 HTTP API 双通道。
   ~1GB）；构建热缓存 ~11s / 冷盘 ~40-50s
 - dump **mmap 零拷贝加载**（裸指针 View + `Keep` 所有权锚点，加载 ~1ms，页按需缺页）：
   serve 启动 ~135ms，CLI 全查询 17-336ms（含进程启动）
-- dump 二进制契约：56B repr(C) Entry + 8 字节对齐段 + 头部 22 段偏移表 + 6 列表计数
-  + **by_frn 置换段** + **name_offs/path_offs 加速段** + **trigram 倒排段**
-  （trigrams 排序去重 u32 / trig_offs 累计**终点**偏移 / trig_posts 按 entry 序；
-  v5）。改布局必须 bump FORMAT_VERSION。**v3/v4 兼容加载**：v3 内存重建加速段
-  （AuxAccel，Keep::Mapped 持有），v4 直接映射加速段；两者 trigram 段为空 → 查询
-  自动回退 arena 扫描。**`fer upgrade`** 免管理员格式迁移：load → build_missing_trigrams
-  （trig 三元组挂到 AuxAccel.trig）→ save 重写 v5（实测 4.14M 条 ~6.6s）
+- dump 二进制契约：56B repr(C) Entry + 8 字节对齐段 + 头部 23 段偏移表 + 6 列表计数
+  + **by_frn 置换段** + **name_offs/path_offs 加速段** + **trigram 倒排段** +
+  **alloc 段**（v6 追加：per-entry 分配簇字节 u64，置末尾——Entry 布局不动，
+  v3/v4/v5 零拷贝兼容不破坏）（trigrams 排序去重 u32 / trig_offs 累计**终点**偏移 /
+  trig_posts 按 entry 序）。改布局必须 bump FORMAT_VERSION。**v3/v4/v5 兼容加载**：
+  v3 内存重建加速段（AuxAccel，Keep::Mapped 持有），v4/v5 直接映射各段；v3/v4
+  trigram 段为空 → 查询自动回退 arena 扫描；**v5- 无 alloc 段 → meta_at 回退
+  allocated=size**（近似，真实簇数只有 `fer index` 重扫 $MFT 才有）。**`fer upgrade`**
+  免管理员格式迁移：load → build_missing_trigrams（trig 三元组挂到 AuxAccel.trig）→
+  save 重写最新版（实测 4.14M 条 ~6.6s；老 dump 升级时 alloc 段写 size 近似值）
 - **dump 段尺寸校验必须容忍对齐 padding**：u32 段在 n×4 不是 8 的倍数时有 ≤7B padding
   （真实 dump n 为偶数从未触发过，n=3 的测试炸了）——用 `bytes >= logical && bytes-logical < 8`
 - monitor：load dump → USN 增量进内存（by_frn 二分 + 删除影子集/删除集/追加列表）→
@@ -133,7 +136,11 @@ cargo test --test live_volume -- --ignored --nocapture       # 真实卷（管�
   **目录前缀不含分隔符本身**（查表用 `&raw[..i-1]` 配处理当前字节前的 `before` 哈希——
   血案：把分隔符算进前缀导致与目录键全部失配、children 全空）；聚合 = 连续均分块 scoped
   线程 + 稠密 per-dir 原子数组（无 merge；**按一级目录分桶会失效**——单目录占 87% 文件时
-  一个线程单扛全部查找）；逻辑大小不含分配簇
+  一个线程单扛全部查找）
+- **allocated 口径（v6）**：`$DATA` 非驻留头 allocated@+40 / real@+48（mft.rs）；**驻留文件
+  allocated=0 是真实语义**（住在 MFT 记录里不占簇，与"未知"区分靠 dump 版本）；du 双口径
+  始终在 JSON 里（`total_bytes`/`total_allocated`、children 的 `size`/`allocated`），
+  `--allocated` 只切排序/文本显示口径
 - 本仓库有 git（commit 节点：基线/测试全绿/真实卷全绿/性能优化/内存引擎/dupes/极致性能），
   改动前先看 `git log`
 
@@ -144,9 +151,10 @@ cargo test --test live_volume -- --ignored --nocapture       # 真实卷（管�
 .\target-gnu\release\fer.exe search "foo" --count-only
 .\target-gnu\release\fer.exe index --volumes D
 .\target-gnu\release\fer.exe serve
-.\target-gnu\release\fer.exe upgrade   # 老 dump 免管理员迁移到 v5（重建 trigram 段）
+.\target-gnu\release\fer.exe upgrade   # 老 dump 免管理员迁移到最新版（重建 trigram 段）
 .\target-gnu\release\fer.exe du "D:\Kita-Tools" --top 20        # 磁盘占用聚合
 .\target-gnu\release\fer.exe du "D:\" --depth 1 --top 10 --json # 整卷顶层
+.\target-gnu\release\fer.exe du "D:\" --top 10 --allocated      # 按磁盘占用（需 fer index 重建后才有真实簇数）
 ```
 
 查询语言、HTTP API 契约、性能数据：见 README.md（以 README 为准，本文件只是速查）。

@@ -136,6 +136,7 @@ fn index_mft(vol: &VolumeInfo, mb: &mut MemBuilder) -> Result<VolStats> {
         let mut meta = EntryMeta {
             is_dir: e.is_dir,
             size: e.size,
+            allocated: e.allocated,
             mtime: e.mtime,
             ctime: e.ctime,
             frn: Some(e.frn),

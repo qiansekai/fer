@@ -76,6 +76,10 @@ enum Cmd {
         /// Maximum subdirectories to report, most space first
         #[arg(long, default_value_t = 20)]
         top: usize,
+        /// Sort and display by allocated cluster bytes instead of logical
+        /// size (WizTree's "size on disk"; needs a v6 dump / `fer index`)
+        #[arg(long)]
+        allocated: bool,
     },
     /// Format-only migration: rebuild the trigram index into the existing
     /// dump and rewrite it as v5 (no admin, no MFT re-read)
@@ -287,10 +291,10 @@ fn main() -> Result<()> {
                 println!("size:    {dump_mb} MB");
             }
         }
-        Cmd::Du { path, depth, top } => {
+        Cmd::Du { path, depth, top, allocated } => {
             let mem = load_index(&db)?;
             let t = Instant::now();
-            let report = file_engine_rust::du::scan(&mem, &path, depth, top)?;
+            let report = file_engine_rust::du::scan(&mem, &path, depth, top, allocated)?;
             let took = t.elapsed().as_millis();
             if cli.json {
                 let mut v = serde_json::to_value(&report)?;
@@ -301,18 +305,24 @@ fn main() -> Result<()> {
                 obj.insert("took_ms".to_string(), json!(took));
                 print_json(v)?;
             } else {
+                let total_shown = if allocated {
+                    report.total_allocated
+                } else {
+                    report.total_bytes
+                };
                 println!(
                     "{:<60} {:>10}  {:>9} files",
                     report.root,
-                    fmt_bytes(report.total_bytes),
+                    fmt_bytes(total_shown),
                     report.files
                 );
                 for c in &report.children {
+                    let shown = if allocated { c.allocated } else { c.size };
                     println!(
                         "{}{:<60} {:>10}  {:>9} files",
                         "  ".repeat(c.depth),
                         c.path,
-                        fmt_bytes(c.size),
+                        fmt_bytes(shown),
                         c.files
                     );
                 }

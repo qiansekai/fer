@@ -173,6 +173,7 @@ impl Store {
                 path: r.get(0)?,
                 is_dir: r.get::<_, i64>(1)? != 0,
                 size: r.get::<_, i64>(2)? as u64,
+                allocated: 0,
                 mtime: r.get(3)?,
                 ctime: r.get(4)?,
                 flags: r.get::<_, i64>(5)? as u8,
@@ -278,6 +279,7 @@ impl Store {
                 path: r.get(0)?,
                 is_dir: r.get::<_, i64>(1)? != 0,
                 size: r.get::<_, i64>(2)? as u64,
+                allocated: 0,
                 mtime: r.get(3)?,
                 ctime: r.get(4)?,
                 flags: r.get::<_, i64>(5)? as u8,
@@ -880,10 +882,10 @@ mod tests {
         {
             let mut rb = store.begin_rebuild().unwrap();
             let now = chrono::Local::now().timestamp();
-            rb.insert(r"D:\photos\a.jpg", EntryMeta { is_dir: false, size: 2 << 20, mtime: now, ctime: now - 100, frn: None, flags: EntryMeta::FLAG_HIDDEN }).unwrap();
-            rb.insert(r"D:\photos\b.png", EntryMeta { is_dir: false, size: 500, mtime: now - 999_999, ctime: now, frn: None, flags: 0 }).unwrap();
-            rb.insert(r"D:\photos\sub", EntryMeta { is_dir: true, size: 0, mtime: now, ctime: 0, frn: None, flags: 0 }).unwrap();
-            rb.insert(r"D:\photos\sub\c.jpg", EntryMeta { is_dir: false, size: 9 << 20, mtime: now, ctime: now, frn: None, flags: 0 }).unwrap();
+            rb.insert(r"D:\photos\a.jpg", EntryMeta { is_dir: false, size: 2 << 20, allocated: 0, mtime: now, ctime: now - 100, frn: None, flags: EntryMeta::FLAG_HIDDEN }).unwrap();
+            rb.insert(r"D:\photos\b.png", EntryMeta { is_dir: false, size: 500, allocated: 0, mtime: now - 999_999, ctime: now, frn: None, flags: 0 }).unwrap();
+            rb.insert(r"D:\photos\sub", EntryMeta { is_dir: true, size: 0, allocated: 0, mtime: now, ctime: 0, frn: None, flags: 0 }).unwrap();
+            rb.insert(r"D:\photos\sub\c.jpg", EntryMeta { is_dir: false, size: 9 << 20, allocated: 0, mtime: now, ctime: now, frn: None, flags: 0 }).unwrap();
             rb.commit().unwrap();
         }
         let q = crate::query::Query::parse("ext:jpg").unwrap();

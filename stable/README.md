@@ -8,11 +8,15 @@
 | 项 | 值 |
 |---|---|
 | 文件 | `stable\fer.exe` |
-| SHA256 | `EA328CD80C31BCBE0694442FF126CE4A0AA1F5F7CCAA6CF5F8C111BFF912FB88` |
-| 备份时间 | 2026-09-01（构建层优化轮完成后，commit `ae9a33c`） |
-| 来源 commit | `ae9a33c`（bitmap 跳读 + 并行解析 + trigram 三遍构建） |
+| SHA256 | `83267A52FB551C81C416E07641DA31CB9A1103F08605FE7523D848DB7E5D61BD` |
+| 备份时间 | 2026-09-01（du v2 并行聚合完成、v6 dump 改造前，commit `b90fdad`） |
+| 来源 commit | `b90fdad`（du 并行聚合 + /api/du） |
 | dump 格式 | **FERIDX01 v5**（trigram 倒排段；兼容加载 v3/v4） |
-| 已知性能 | 查询 serve 稳态子串 0-23ms/CJK 0-1ms；构建 7.9s/峰值 RSS 1.4GB |
+| 已知性能 | 查询 serve 稳态子串 0-23ms/CJK 0-1ms；du 整卷 ~1.2s/子树 35ms |
+
+> 注意：本备份**先于 v6 改造**（v6 = 追加 per-entry allocated 段）。本 exe 不支持
+> v6 dump（会报 unsupported 并提示 `fer index`）；回退后若曾用新版写过 v6 dump，
+> 需重跑 `fer index`。备份本身能读 v3/v4/v5 三种 dump。
 
 ## 回退方法
 
