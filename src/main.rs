@@ -145,6 +145,12 @@ fn main() -> Result<()> {
         }
         Cmd::Index { volumes, method } => {
             let method = Method::parse(&method)?;
+            // Un-elevated? Ask the user via UAC and re-run elevated — except
+            // for the explicit --method walk degraded choice, which is the
+            // whole point of the escape hatch.
+            if !matches!(method, Method::Walk) && !file_engine_rust::is_elevated() {
+                file_engine_rust::try_self_elevate()?;
+            }
             let vols = indexer::resolve_volumes(&volumes);
             if vols.is_empty() {
                 anyhow::bail!("no fixed NTFS volumes selected");
@@ -233,6 +239,9 @@ fn main() -> Result<()> {
             interval_secs,
             flush_secs,
         } => {
+            if !file_engine_rust::is_elevated() {
+                file_engine_rust::try_self_elevate()?;
+            }
             let mem = load_index(&db)?;
             let dump = dump_path(&db);
             file_engine_rust::monitor::run(

@@ -141,8 +141,11 @@ cargo test --test live_volume -- --ignored --nocapture       # 真实卷（管�
   （`Win32_Security` OpenProcessToken + TokenElevation），非提权直接 bail——**auto 曾经
   MFT→USN→walk 静默降级**，非提权跑 `fer index` 会悄悄用 walk 覆盖好 dump（丢硬链接/
   大小/时间）；现在降级必须显式 `--method walk`。monitor 同款门禁。`/api/rescan` 走
-  build() 自动继承。测试：`elevation_gate`（环境无关）；真实非提权验证 = 普通终端跑
-  `fer index` 应瞬间拒绝
+  build() 自动继承。**CLI 层还有 UAC 自动提权**：main.rs 的 Index（非 walk）/Monitor 在
+  非提权时 `try_self_elevate()`（ShellExecuteW runas + 同参数重启，父进程 exit 0；参数
+  用 `quote_win_arg` 按 CRT 规则重拼——只空格/制表符/引号/空串才加引号，尾部反斜杠在
+  引号前要翻倍）；取消(1223)/无交互桌面 → 退回报错。测试：`elevation_gate`、
+  `win_arg_quoting`（环境无关）；真实 UAC 弹窗 = 普通终端跑 `fer index`
 - **allocated 口径（v6）**：`$DATA` 非驻留头 allocated@+40 / real@+48（mft.rs）；**驻留文件
   allocated=0 是真实语义**（住在 MFT 记录里不占簇，与"未知"区分靠 dump 版本）；du 双口径
   始终在 JSON 里（`total_bytes`/`total_allocated`、children 的 `size`/`allocated`），

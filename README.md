@@ -41,7 +41,7 @@ rustup run stable-x86_64-pc-windows-gnu cargo build --release
 
 ```bash
 fer volumes                          # 列出固定 NTFS 卷（--json 输出 JSON）
-fer index                            # 全盘建索引（auto = 纯 MFT；非提权直接拒绝）
+fer index                            # 全盘建索引（auto = 纯 MFT；非提权时弹 UAC 自动请求提权）
 fer index --volumes D --method mft   # 指定卷 / 强制 MFT 路径
 fer index --method walk              # 显式降级（无硬链接/大小/时间，仅应急）
 fer search "AGENTS.md"               # 秒搜（子串）
