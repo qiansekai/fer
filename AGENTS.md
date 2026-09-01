@@ -114,7 +114,16 @@ cargo test --test live_volume -- --ignored --nocapture       # 真实卷（管�
   换 trigram 时 push 上一个的 end，循环后 push 最后一个的 end）——写成"起点"语义会
   让首个 trigram 的区间变成空（debug 血案）。trigram 只是超集过滤，**必须逐候选
   memmem 校验**（含 trigram 的假阳性）；常见 trigram（如 "con"）posting 巨大，
-  校验成本线性于候选数（实测 186K 候选 14ms，可接受）
+  校验成本线性于候选数（实测 186K 候选 14ms，可接受）。构建走**三遍计数/填充**
+  （HashMap counts → 前缀和 → entry 序填充，posting 天然升序），per-entry 去重用
+  256 槽 epoch 开放寻址——零排序零 pair 存储，峰值省 ~270MB
+- **MFT 扫描构建层（2026-09）**：`$MFT::$BITMAP` 跳读（1024 记录/块，全零块不读不解析）
+  + 8MB 批分片并行解析（scoped 线程，主线程按序 emit）。**血案**：①`$BITMAP` 可能是
+  驻留属性（小卷）——只信 `non_resident`，解析失败静默禁用跳读，绝不让 bitmap 问题
+  挂掉整卷（曾把 G:/H: 打进 USN 回退、丢硬链接别名）②**卷句柄裸读必须扇区对齐**
+  （bitmap 长度不是扇区倍数 → error 87）——读取长度按扇区向上取整再 truncate
+  ③MftScanner 持有裸 HANDLE（!Sync），并行闭包只许拷入 record_size/sector_size 等
+  几何参数，不许捕获 &self
 - 本仓库有 git（commit 节点：基线/测试全绿/真实卷全绿/性能优化/内存引擎/dupes/极致性能），
   改动前先看 `git log`
 

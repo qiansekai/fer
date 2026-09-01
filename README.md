@@ -9,6 +9,8 @@
 - ⚡ **完整 MFT 解析**：直读 NTFS `$MFT`（runlist + USA fixup + `$FILE_NAME` 全属性），
   一次拿到：**全部硬链接别名**（`System32\ntdll.dll` → WinSxS 本体也能搜到）、
   真实大小、修改/创建时间、hidden/system/readonly/reparse 标志；
+  **$MFT::$BITMAP 跳读**（已删除记录区段不读不解析，40-55% I/O 削减）+
+  **分片并行解析**（scoped 线程池 + 按序提交，构建 12.3s → 7.9s）；
   分片 `$MFT` 自动回退 USN 枚举，无管理员回退目录遍历
 - 🧠 **低内存**：紧凑数组 + 流式 DFS 构建，全盘 400 万条峰值内存 ~170 MB
 - 🚀 **毫秒级搜索**：全查询走内存引擎——子串（memchr SIMD 扫描）、`*.rs` 后缀（反向列二分）、
@@ -175,8 +177,9 @@ CLI 全查询 3 轮取 min/median（每项均含进程启动 + dump mmap 加载�
 | 路径子串 | `Kita-Tools\Coding`（含 `\`） | 86,189 | 281 ms | 294 ms |
 | 并行 | `report 报告`（两全扫合取） | 0 | 158 ms | 166 ms（≈单扫描） |
 
-索引构建：全盘 416.8 万条（MFT 路径含硬链接别名），**热缓存 12.3s / 冷盘 ~40-50s**
-（MFT 扫描是磁盘物理下限），收尾原子写 **FERIDX01 dump**（1021MB，写出 2.4s）。
+索引构建：全盘 416.8 万条（MFT 路径含硬链接别名），**热缓存 7.9s（含 dump 写出）/ 冷盘 ~30-40s**
+（bitmap 跳读 + 分片并行解析；峰值 RSS 1.4GB，`--json` 输出 `peak_rss`），收尾原子写
+**FERIDX01 dump**（1418MB，写出 ~0.9s）。
 - **serve**：mmap 零拷贝加载，**进程启动→listening 86ms**；HTTP 查询（热页）：
   `ext:rs` 2ms、`type:dir` 1ms、`dm:thisweek type:file` 34ms；逻辑内存 1021MB /
   RSS 350MB（mmap 按需缺页，OS 可回收）
