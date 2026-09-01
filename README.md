@@ -11,7 +11,7 @@
   真实大小、修改/创建时间、hidden/system/readonly/reparse 标志；
   **$MFT::$BITMAP 跳读**（已删除记录区段不读不解析，40-55% I/O 削减）+
   **分片并行解析**（scoped 线程池 + 按序提交，构建 12.3s → 7.9s）；
-  分片 `$MFT` 自动回退 USN 枚举，无管理员回退目录遍历
+  **降级必须显式**：auto/mft/usn 非提权直接拒绝（`--method walk` 才是显式降级选项）
 - 🧠 **低内存**：紧凑数组 + 流式 DFS 构建，全盘 400 万条峰值内存 ~170 MB
 - 🚀 **毫秒级搜索**：全查询走内存引擎——子串（memchr SIMD 扫描）、`*.rs` 后缀（反向列二分）、
   通配符、大小写不敏感、CJK
@@ -41,8 +41,9 @@ rustup run stable-x86_64-pc-windows-gnu cargo build --release
 
 ```bash
 fer volumes                          # 列出固定 NTFS 卷（--json 输出 JSON）
-fer index                            # 全盘建索引（auto：MFT → USN → walk 逐级回退）
+fer index                            # 全盘建索引（auto = 纯 MFT；非提权直接拒绝）
 fer index --volumes D --method mft   # 指定卷 / 强制 MFT 路径
+fer index --method walk              # 显式降级（无硬链接/大小/时间，仅应急）
 fer search "AGENTS.md"               # 秒搜（子串）
 fer search "*.rs"                    # 通配符
 fer search "ext:mp4 size:>1gb dm:thisweek"   # 过滤查询语言
@@ -165,7 +166,7 @@ src/
 │               子串先走 trigram posting 交集（候选超集，逐候选 memmem 校验）
 ├── store.rs    SQLite + FTS5 oracle（feature `sqlite`，仅测试交叉验证，不进生产路径）
 ├── query.rs    查询语言解析（纯函数 + 单测）
-├── indexer.rs  mft → usn → walk 逐级回退编排
+├── indexer.rs  build 编排：auto = 纯 MFT；usn/walk 仅显式可选（非提权硬拒绝）
 ├── monitor.rs  USN 日志轮询 → 内存增量（FRN 直删）+ 防抖写回 dump
 ├── dupes.rs    重复文件查找（同大小分组 + FNV 哈希 + 字节校验）
 ├── server.rs   axum HTTP API + 内嵌网页
@@ -263,8 +264,8 @@ posting 交集得候选超集，再逐候选 memmem 校验。glob 匹配编译�
 - trigram 段只覆盖文件名（≥3 字节子串）；路径子串与 <3 字节子串走 arena 扫描
 - 内存引擎的路径排序只折叠 ASCII 大小写（非 ASCII 大小写字母如 É/Ö 按字节比较）
   ——Windows 路径中极少见
-- 8.3 短名（namespace=2）不入索引（避免噪音）；分片 `$MFT` 回退 USN 路径会丢失
-  硬链接别名与大小/时间元数据
+- 8.3 短名（namespace=2）不入索引（避免噪音）；分片 `$MFT` 不支持 attribute-list 布局
+  （报错退出，可用 `--method usn|walk` 显式降级，会丢失硬链接别名与大小/时间元数据）
 - FAT/exFAT 卷不支持（监控需 ReadDirectoryChangesW，列为 TODO）
 - 多卷监控需逐个 `fer monitor`；USN 日志回卷会报错提示重建
 - release 构建开 `target-cpu=native`（本机专用，exe 不可分发）

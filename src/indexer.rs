@@ -1,7 +1,7 @@
 //! Index build orchestration: raw $MFT scan (full parity, admin) with USN and
-//! walk fallbacks. The build streams straight into the in-memory engine —
-//! SQLite is no longer on the build path (it survives only as a dev-time
-//! query oracle in the test suite).
+//! walk as *explicit* degraded alternatives. The build streams straight into
+//! the in-memory engine — SQLite is no longer on the build path (it survives
+//! only as a dev-time query oracle in the test suite).
 
 use std::time::Instant;
 
@@ -32,6 +32,32 @@ impl Method {
     }
 }
 
+impl std::fmt::Display for Method {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Method::Auto => "auto",
+            Method::Mft => "mft",
+            Method::Usn => "usn",
+            Method::Walk => "walk",
+        })
+    }
+}
+
+/// Hard gate for raw-volume methods: raw $MFT / USN journal access needs an
+/// elevated token. Silently degrading to the metadata-less walk path would
+/// overwrite a good dump with a worse one — degradation must be an explicit
+/// `--method walk` choice instead.
+fn ensure_elevated(method: Method, elevated: bool) -> Result<()> {
+    if !matches!(method, Method::Walk) && !elevated {
+        bail!(
+            "fer index ({method}) needs an elevated process for raw volume access — \
+             run as administrator, or pass --method walk explicitly to accept a degraded \
+             index (no hard-link aliases, sizes, or timestamps)"
+        );
+    }
+    Ok(())
+}
+
 /// Resolve a comma-separated drive-letter list against the fixed NTFS volumes;
 /// an empty list selects all of them.
 pub fn resolve_volumes(volumes: &str) -> Vec<VolumeInfo> {
@@ -47,9 +73,27 @@ pub fn resolve_volumes(volumes: &str) -> Vec<VolumeInfo> {
     all.into_iter().filter(|v| wanted.contains(&v.drive)).collect()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn elevation_gate() {
+        // auto/mft/usn refuse without an elevated token; walk is the explicit
+        // degraded escape hatch and stays allowed.
+        for m in [Method::Auto, Method::Mft, Method::Usn] {
+            let err = ensure_elevated(m, false).unwrap_err();
+            assert!(err.to_string().contains("--method walk"), "{m}: {err}");
+            assert!(ensure_elevated(m, true).is_ok());
+        }
+        assert!(ensure_elevated(Method::Walk, false).is_ok());
+    }
+}
+
 /// Full rebuild: streams every volume straight into the in-memory engine and
 /// returns it (the caller saves the dump).
 pub fn build(volumes: &[VolumeInfo], method: Method) -> Result<(BuildReport, MemIndex)> {
+    ensure_elevated(method, crate::is_elevated())?;
     let start = Instant::now();
     let mut report = BuildReport {
         volumes: volumes
@@ -97,29 +141,10 @@ fn index_volume(vol: &VolumeInfo, method: Method, mb: &mut MemBuilder) -> Result
         Method::Walk => index_walk(vol, mb),
         Method::Usn => index_usn(vol, mb),
         Method::Mft => index_mft(vol, mb),
-        Method::Auto => {
-            // Full-parity MFT scan first; USN enumeration as middle fallback;
-            // directory walk as last resort.
-            match index_mft(vol, mb) {
-                Ok(stats) => Ok(stats),
-                Err(e) => {
-                    eprintln!(
-                        "[warn] raw MFT scan failed for {}: — falling back to USN: {e:#}",
-                        vol.drive
-                    );
-                    match index_usn(vol, mb) {
-                        Ok(stats) => Ok(stats),
-                        Err(e2) => {
-                            eprintln!(
-                                "[warn] USN indexing failed for {}: — falling back to walk: {e2:#}",
-                                vol.drive
-                            );
-                            index_walk(vol, mb)
-                        }
-                    }
-                }
-            }
-        }
+        // Auto = full-parity MFT scan, period. Degradation to USN/walk is
+        // explicit-only (`--method usn|walk`): silent fallback used to replace
+        // good dumps with metadata-less ones when run un-elevated.
+        Method::Auto => index_mft(vol, mb),
     }
 }
 

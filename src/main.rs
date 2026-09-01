@@ -28,12 +28,14 @@ struct Cli {
 enum Cmd {
     /// List fixed NTFS volumes
     Volumes,
-    /// (Re)build the index (writes the .feridx dump)
+    /// (Re)build the index (writes the .feridx dump); needs an elevated
+    /// process unless --method walk is chosen explicitly
     Index {
         /// Comma-separated drive letters; empty = all fixed NTFS volumes
         #[arg(long, default_value = "")]
         volumes: String,
-        /// auto | mft | usn | walk
+        /// auto | mft | usn | walk. auto/mft/usn refuse to run un-elevated;
+        /// walk is an explicit degraded mode (no hard links/sizes/timestamps)
         #[arg(long, default_value = "auto")]
         method: String,
     },
@@ -52,7 +54,8 @@ enum Cmd {
         #[arg(long, default_value = "127.0.0.1:9876")]
         addr: String,
     },
-    /// Watch the USN journal and keep the index live (requires admin)
+    /// Watch the USN journal and keep the index live (requires admin — refuses
+    /// to start un-elevated)
     Monitor {
         #[arg(long)]
         volume: char,
