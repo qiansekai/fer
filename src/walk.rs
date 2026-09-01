@@ -34,7 +34,7 @@ pub fn scan_tree(root: &str, mut on_entry: impl FnMut(&str, EntryMeta)) -> u64 {
                 let path = de.path().to_string_lossy();
                 on_entry(
                     path.as_ref(),
-                    EntryMeta { is_dir, size, mtime, ctime, flags: 0, frn: None },
+                    EntryMeta { is_dir, size, allocated: 0, mtime, ctime, flags: 0, frn: None },
                 );
             }
             Err(_) => skipped += 1,

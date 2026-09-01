@@ -101,6 +101,7 @@ struct DuQuery {
     path: String,
     depth: Option<usize>,
     top: Option<usize>,
+    allocated: Option<bool>,
 }
 
 /// WizTree-style directory size aggregation from the in-memory index.
@@ -111,7 +112,7 @@ async fn du(State(st): State<AppState>, Query(q): Query<DuQuery>) -> Json<Value>
     let mem = st.mem.read().unwrap().clone();
     let path = q.path.clone();
     let outcome = tokio::task::spawn_blocking(move || {
-        crate::du::scan(&mem, &path, q.depth, q.top.unwrap_or(20))
+        crate::du::scan(&mem, &path, q.depth, q.top.unwrap_or(20), q.allocated.unwrap_or(false))
     })
     .await;
     match outcome {

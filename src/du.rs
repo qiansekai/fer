@@ -39,6 +39,9 @@ const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 pub struct DuEntry {
     pub path: String,
     pub size: u64,
+    /// Sum of allocated cluster bytes (v6 dumps; equals `size` on pre-v6
+    /// dumps and for resident files).
+    pub allocated: u64,
     pub files: u64,
     /// Levels below the root (root's direct children = 1).
     pub depth: usize,
@@ -50,6 +53,8 @@ pub struct DuReport {
     pub root: String,
     /// Sum of unique file sizes in the subtree.
     pub total_bytes: u64,
+    /// Sum of unique allocated cluster bytes in the subtree.
+    pub total_allocated: u64,
     /// Unique files counted (hard links once).
     pub files: u64,
     /// Distinct directories below the root.
@@ -65,8 +70,16 @@ pub struct DuReport {
 /// Aggregate sizes for `root` (a directory, volume root like `D:\`, or a
 /// single file). `max_depth` limits reported subdirectories to that many
 /// levels below the root (`None` = unlimited, `0` = total only); `top` caps
-/// how many are reported (most space first).
-pub fn scan(mem: &MemIndex, root: &str, max_depth: Option<usize>, top: usize) -> Result<DuReport> {
+/// how many are reported (most space first). With `by_allocated`, children
+/// sort by allocated cluster bytes instead of logical size (both totals are
+/// always reported).
+pub fn scan(
+    mem: &MemIndex,
+    root: &str,
+    max_depth: Option<usize>,
+    top: usize,
+    by_allocated: bool,
+) -> Result<DuReport> {
     let norm = root.trim_end_matches(['\\', '/']);
     if norm.is_empty() {
         bail!("du: empty root path");
@@ -79,8 +92,9 @@ pub fn scan(mem: &MemIndex, root: &str, max_depth: Option<usize>, top: usize) ->
     // --- Pass A: FRN dedup + directory index. ---
     let mut seen: HashSet<u64> = HashSet::with_capacity(ids.len());
     let mut dir_hash: HashMap<u64, Vec<u32>> = HashMap::new();
-    let mut uniq: Vec<(u32, u64)> = Vec::new();
+    let mut uniq: Vec<(u32, u64, u64)> = Vec::new();
     let mut total: u64 = 0;
+    let mut total_allocated: u64 = 0;
     let mut files: u64 = 0;
     let mut dirs_seen: u64 = 0;
     let mut dir_max: u32 = 0;
@@ -103,8 +117,9 @@ pub fn scan(mem: &MemIndex, root: &str, max_depth: Option<usize>, top: usize) ->
             continue; // hard-link alias of an already counted file
         }
         total = total.saturating_add(meta.size);
+        total_allocated = total_allocated.saturating_add(meta.allocated);
         files += 1;
-        uniq.push((id, meta.size));
+        uniq.push((id, meta.size, meta.allocated));
     }
 
     // --- Pass B: parallel aggregation into dense per-dir atomic counters. ---
@@ -117,14 +132,17 @@ pub fn scan(mem: &MemIndex, root: &str, max_depth: Option<usize>, top: usize) ->
         .min(16);
     let dir_sizes: Vec<AtomicU64> = (0..=dir_max).map(|_| AtomicU64::new(0)).collect();
     let dir_counts: Vec<AtomicU64> = (0..=dir_max).map(|_| AtomicU64::new(0)).collect();
+    let dir_allocs: Vec<AtomicU64> = (0..=dir_max).map(|_| AtomicU64::new(0)).collect();
     if uniq.len() < 4096 {
-        aggregate(&uniq, &dir_hash, mem, &dir_sizes, &dir_counts);
+        aggregate(&uniq, &dir_hash, mem, &dir_sizes, &dir_counts, &dir_allocs);
     } else {
         let chunk = uniq.len().div_ceil(threads).max(1);
         std::thread::scope(|s| {
             let handles: Vec<_> = uniq
                 .chunks(chunk)
-                .map(|c| s.spawn(|| aggregate(c, &dir_hash, mem, &dir_sizes, &dir_counts)))
+                .map(|c| {
+                    s.spawn(|| aggregate(c, &dir_hash, mem, &dir_sizes, &dir_counts, &dir_allocs))
+                })
                 .collect();
             for h in handles {
                 h.join().expect("du aggregation thread panicked");
@@ -138,8 +156,9 @@ pub fn scan(mem: &MemIndex, root: &str, max_depth: Option<usize>, top: usize) ->
     for cands in dir_hash.values() {
         for &did in cands {
             let size = dir_sizes[did as usize].load(Relaxed);
+            let allocated = dir_allocs[did as usize].load(Relaxed);
             let files = dir_counts[did as usize].load(Relaxed);
-            if size == 0 && files == 0 {
+            if size == 0 && allocated == 0 && files == 0 {
                 continue;
             }
             let display = mem.path_at(did as usize);
@@ -155,12 +174,20 @@ pub fn scan(mem: &MemIndex, root: &str, max_depth: Option<usize>, top: usize) ->
             children.push(DuEntry {
                 path: display,
                 size,
+                allocated,
                 files,
                 depth,
             });
         }
     }
-    children.sort_unstable_by(|a, b| b.size.cmp(&a.size).then_with(|| a.path.cmp(&b.path)));
+    children.sort_unstable_by(|a, b| {
+        let (ka, kb) = if by_allocated {
+            (a.allocated, b.allocated)
+        } else {
+            (a.size, b.size)
+        };
+        kb.cmp(&ka).then_with(|| a.path.cmp(&b.path))
+    });
     let truncated = children.len() > top;
     if let Some(max_depth) = max_depth {
         children.retain(|c| c.depth <= max_depth);
@@ -170,6 +197,7 @@ pub fn scan(mem: &MemIndex, root: &str, max_depth: Option<usize>, top: usize) ->
     Ok(DuReport {
         root: norm.to_string(),
         total_bytes: total,
+        total_allocated,
         files,
         dirs: dirs_seen - root_present as u64,
         entries: ids.len() as u64,
@@ -185,13 +213,14 @@ pub fn scan(mem: &MemIndex, root: &str, max_depth: Option<usize>, top: usize) ->
 /// is a relaxed atomic add into the dense per-dir counters (different threads
 /// writing the same directory is rare and harmless: add is commutative).
 fn aggregate(
-    chunk: &[(u32, u64)],
+    chunk: &[(u32, u64, u64)],
     dir_hash: &HashMap<u64, Vec<u32>>,
     mem: &MemIndex,
     dir_sizes: &[AtomicU64],
     dir_counts: &[AtomicU64],
+    dir_allocs: &[AtomicU64],
 ) {
-    for &(id, size) in chunk {
+    for &(id, size, allocated) in chunk {
         let raw = mem.path_bytes(id as usize);
         let mut h = FNV_OFFSET;
         let mut i = 0usize;
@@ -208,6 +237,7 @@ fn aggregate(
             {
                 dir_sizes[did as usize].fetch_add(size, Relaxed);
                 dir_counts[did as usize].fetch_add(1, Relaxed);
+                dir_allocs[did as usize].fetch_add(allocated, Relaxed);
             }
         }
     }
@@ -247,7 +277,13 @@ mod tests {
     use crate::mem::MemBuilder;
 
     fn file(size: u64, frn: u64) -> EntryMeta {
-        EntryMeta { size, frn: Some(frn), ..Default::default() }
+        EntryMeta { size, allocated: size, frn: Some(frn), ..Default::default() }
+    }
+
+    /// A file whose allocated clusters differ from its logical size (sparse
+    /// or compressed): allocated = `alloc`.
+    fn file_alloc(size: u64, alloc: u64, frn: u64) -> EntryMeta {
+        EntryMeta { size, allocated: alloc, frn: Some(frn), ..Default::default() }
     }
 
     fn dir() -> EntryMeta {
@@ -270,8 +306,9 @@ mod tests {
     #[test]
     fn totals_dedupe_and_boundary() {
         let mem = idx();
-        let r = scan(&mem, r"D:\proj", None, 100).unwrap();
+        let r = scan(&mem, r"D:\proj", None, 100, false).unwrap();
         assert_eq!(r.total_bytes, 150); // hard link counted once: 100 + 50
+        assert_eq!(r.total_allocated, 150); // allocated mirrors size in fixtures
         assert_eq!(r.files, 2);
         assert_eq!(r.entries, 6); // proj, src, main, lib, alias, sub
         assert_eq!(r.dirs, 2); // src + sub (root excluded)
@@ -281,6 +318,7 @@ mod tests {
         // src aggregates everything below it
         let src = r.children.iter().find(|c| c.path.ends_with("src")).unwrap();
         assert_eq!(src.size, 150);
+        assert_eq!(src.allocated, 150);
         assert_eq!(src.files, 2);
         assert_eq!(src.depth, 1);
     }
@@ -288,8 +326,8 @@ mod tests {
     #[test]
     fn case_insensitive_root() {
         let mem = idx();
-        let a = scan(&mem, r"D:\PROJ", None, 100).unwrap();
-        let b = scan(&mem, r"d:\proj", None, 100).unwrap();
+        let a = scan(&mem, r"D:\PROJ", None, 100, false).unwrap();
+        let b = scan(&mem, r"d:\proj", None, 100, false).unwrap();
         assert_eq!(a.total_bytes, b.total_bytes);
         assert_eq!(a.files, b.files);
         assert_eq!(a.children.len(), b.children.len());
@@ -298,7 +336,7 @@ mod tests {
     #[test]
     fn volume_root_and_depth() {
         let mem = idx();
-        let r = scan(&mem, r"D:\", None, 100).unwrap();
+        let r = scan(&mem, r"D:\", None, 100, false).unwrap();
         assert_eq!(r.total_bytes, 1149); // 100 + 50 + 999
         assert_eq!(r.files, 3);
         // proj (150) sits at depth 1, src at depth 2
@@ -308,12 +346,12 @@ mod tests {
         let src = r.children.iter().find(|c| c.path.ends_with("src")).unwrap();
         assert_eq!(src.depth, 2);
 
-        let d1 = scan(&mem, r"D:\", Some(1), 100).unwrap();
+        let d1 = scan(&mem, r"D:\", Some(1), 100, false).unwrap();
         assert!(d1.children.iter().all(|c| c.depth <= 1));
         assert!(d1.children.iter().any(|c| c.path.ends_with("proj")));
         assert!(!d1.children.iter().any(|c| c.path.ends_with("src")));
 
-        let d0 = scan(&mem, r"D:\", Some(0), 100).unwrap();
+        let d0 = scan(&mem, r"D:\", Some(0), 100, false).unwrap();
         assert!(d0.children.is_empty());
         assert_eq!(d0.total_bytes, 1149); // total survives depth 0
     }
@@ -321,17 +359,43 @@ mod tests {
     #[test]
     fn top_cap_and_truncation() {
         let mem = idx();
-        let r = scan(&mem, r"D:\", None, 1).unwrap();
+        let r = scan(&mem, r"D:\", None, 1, false).unwrap();
         assert_eq!(r.children.len(), 1);
         assert!(r.truncated);
         assert_eq!(r.children[0].path.to_lowercase(), "d:\\proj2"); // biggest first
     }
 
     #[test]
+    fn allocated_sort_and_resident_files() {
+        // A resident file (allocated = 0) and a sparse file (allocated < size)
+        // exercise the dual-metric path.
+        let mut b = MemBuilder::default();
+        b.push(r"D:\s", dir());
+        b.push(r"D:\s\resident.txt", EntryMeta { size: 30, allocated: 0, frn: Some(1), ..Default::default() });
+        b.push(r"D:\s\sparse.bin", file_alloc(1000, 400, 2));
+        b.push(r"D:\t", dir());
+        b.push(r"D:\t\plain.bin", file_alloc(500, 500, 3));
+        let mem = b.finish();
+
+        let by_size = scan(&mem, r"D:\", None, 100, false).unwrap();
+        assert_eq!(by_size.total_bytes, 1530);
+        assert_eq!(by_size.total_allocated, 900); // 0 + 400 + 500
+        // logical size order: sparse.bin's dir (s) first
+        assert_eq!(by_size.children[0].path.to_lowercase(), "d:\\s");
+
+        let by_alloc = scan(&mem, r"D:\", None, 100, true).unwrap();
+        // allocated order: t (500) beats s (400)
+        assert_eq!(by_alloc.children[0].path.to_lowercase(), "d:\\t");
+        assert_eq!(by_alloc.total_allocated, 900);
+        assert_eq!(by_alloc.total_bytes, 1530); // totals identical either way
+    }
+
+    #[test]
     fn single_file_root() {
         let mem = idx();
-        let r = scan(&mem, r"D:\proj\src\main.rs", None, 100).unwrap();
+        let r = scan(&mem, r"D:\proj\src\main.rs", None, 100, false).unwrap();
         assert_eq!(r.total_bytes, 100);
+        assert_eq!(r.total_allocated, 100);
         assert_eq!(r.files, 1);
         assert_eq!(r.dirs, 0);
         assert_eq!(r.entries, 1);
@@ -341,7 +405,7 @@ mod tests {
     #[test]
     fn missing_root_is_empty() {
         let mem = idx();
-        let r = scan(&mem, r"D:\nowhere", None, 100).unwrap();
+        let r = scan(&mem, r"D:\nowhere", None, 100, false).unwrap();
         assert_eq!(r.total_bytes, 0);
         assert_eq!(r.entries, 0);
         assert!(r.children.is_empty());
@@ -350,8 +414,8 @@ mod tests {
     #[test]
     fn trailing_separator_root() {
         let mem = idx();
-        let a = scan(&mem, r"D:\proj\", None, 100).unwrap();
-        let b = scan(&mem, r"D:\proj", None, 100).unwrap();
+        let a = scan(&mem, r"D:\proj\", None, 100, false).unwrap();
+        let b = scan(&mem, r"D:\proj", None, 100, false).unwrap();
         assert_eq!(a.total_bytes, b.total_bytes);
         assert_eq!(a.children.len(), b.children.len());
     }
@@ -366,7 +430,7 @@ mod tests {
         b.push(r"D:\b", dir());
         b.push(r"D:\b\g.txt", file(10, 7)); // alias
         let mem = b.finish();
-        let r = scan(&mem, r"D:\", None, 100).unwrap();
+        let r = scan(&mem, r"D:\", None, 100, false).unwrap();
         assert_eq!(r.total_bytes, 10);
         assert_eq!(r.files, 1);
         assert_eq!(r.children.len(), 1); // only "a" holds the file

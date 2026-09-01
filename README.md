@@ -48,7 +48,7 @@ fer search "*.rs"                    # 通配符
 fer search "ext:mp4 size:>1gb dm:thisweek"   # 过滤查询语言
 fer search "foo" --limit 50 --count-only     # 只看命中数
 fer serve --addr 127.0.0.1:9876      # HTTP API + 网页 UI
-fer upgrade                          # 格式迁移：老 dump 就地重建 trigram 段并写为 v5（免管理员）
+fer upgrade                          # 格式迁移：老 dump 就地重建 trigram 段并写为最新版（免管理员）
 fer monitor --volume D               # USN 实时增量（需管理员）
 fer stats                            # 索引统计
 fer dupes --min-size 1kb --limit 50  # 找重复文件（同大小分组 + 内容哈希 + 字节校验）
@@ -90,25 +90,32 @@ fer --db <path> <cmd>                # 自定义索引库（默认 %LOCALAPPDATA
 零磁盘 IO：直接从 dump 聚合，和 WizTree 从 MFT 出树同源。
 
 ```bash
-fer du <root> [--depth N] [--top N] [--json]
+fer du <root> [--depth N] [--top N] [--allocated] [--json]
 ```
 
 - `<root>`：目录、卷根（`D:\`）、或单个文件；大小写不敏感，尾部分隔符可省。
 - `--depth N`：只报告 root 以下 N 层的子目录（0 = 只出总数；缺省 = 不限层）。
 - `--top N`：按占用降序最多报 N 个子目录（缺省 20；`truncated` 标记是否截断）。
-- `--json`：稳定字段 `root/total_bytes/files/dirs/entries/children[]/truncated`，
-  `children[].depth` = 相对 root 的层数（root 直接子目录 = 1）。
+- `--allocated`：按**分配簇字节**（磁盘实际占用，WizTree 的 "size on disk"）排序/显示；
+  缺省按逻辑大小。JSON 里两种口径始终同时输出。
+- `--json`：稳定字段 `root/total_bytes/total_allocated/files/dirs/entries/children[]/truncated`，
+  `children[].depth` = 相对 root 的层数（root 直接子目录 = 1），`children[]` 同时带
+  `size` 与 `allocated`。
 
 语义：只统计文件（NTFS 目录记录自身无有效大小）；**硬链接按 FRN 去重只计一次**；
-每个文件计入其全部祖先目录（父目录 = 自身文件 + 子目录之和）。逻辑大小
-（`$DATA` real_size），不含分配簇/压缩后的磁盘占用。
+每个文件计入其全部祖先目录（父目录 = 自身文件 + 子目录之和）。
+
+两种口径：`size` = 逻辑大小（`$DATA` real_size，压缩文件为解压后大小）；
+`allocated` = 分配簇字节（驻留文件为 0——它们住在 MFT 记录里不占簇）。
+**allocated 需要 dump v6**（`fer index` 重扫后生效）；旧 dump（v3-v5）加载时
+`allocated` 回退为 `size` 近似值，`fer upgrade` 只能迁移格式、无法补回真实簇数。
 
 ## HTTP API
 
 ```
 GET /api/health                     → {"ok":true}
 GET /api/search?q=<query>&limit=<n> → 命中列表（带 size/mtime/ctime/flags）
-GET /api/du?path=<p>&depth=<n>&top=<n> → 目录占用聚合（WizTree 式，字段同 `fer du --json`）
+GET /api/du?path=<p>&depth=<n>&top=<n>&allocated=<bool> → 目录占用聚合（WizTree 式，字段同 `fer du --json`）
 GET /api/stats                      → 索引统计 + 卷列表
 POST /api/rescan                    → 后台全量重建
 GET /                              → 网页搜索 UI
@@ -247,7 +254,9 @@ posting 交集得候选超集，再逐候选 memmem 校验。glob 匹配编译�
 - 索引 = dump 快照 + monitor 增量；monitor 不在线时文件变动不反映（下次
   `fer index` 或 monitor 启动回放 USN 日志补齐）
 - v3 dump 兼容加载会在启动时重建加速段（一次性 ~百 ms 级）；`fer upgrade`
-  就地重建 trigram 段并重写为 v5（免管理员），`fer index` 则是全量刷新
+  就地重建 trigram 段并重写为最新版（免管理员），`fer index` 则是全量刷新。
+  v6 新增 per-entry allocated 段（磁盘占用口径）；v5- 老 dump 加载时
+  `allocated` 回退为逻辑大小，真实簇数需 `fer index` 重扫 $MFT
 - trigram 段只覆盖文件名（≥3 字节子串）；路径子串与 <3 字节子串走 arena 扫描
 - 内存引擎的路径排序只折叠 ASCII 大小写（非 ASCII 大小写字母如 É/Ö 按字节比较）
   ——Windows 路径中极少见

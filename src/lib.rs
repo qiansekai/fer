@@ -34,6 +34,11 @@ pub const FRN_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 pub struct EntryMeta {
     pub is_dir: bool,
     pub size: u64,
+    /// Bytes of clusters actually allocated ($DATA AllocatedSize, 0 for
+    /// resident files that live inside the MFT record). `0` can also mean
+    /// "unknown" (walk/USN fallback paths); indexes loaded from pre-v6 dumps
+    /// fall back to `size` at load time.
+    pub allocated: u64,
     pub mtime: i64, // unix seconds (0 = unknown)
     pub ctime: i64, // unix seconds (0 = unknown)
     /// bit0 hidden, bit1 system, bit2 readonly, bit3 reparse
@@ -68,6 +73,7 @@ pub struct Hit {
     pub path: String,
     pub is_dir: bool,
     pub size: u64,
+    pub allocated: u64,
     pub mtime: i64,
     pub ctime: i64,
     pub flags: u8,

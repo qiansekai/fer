@@ -2,7 +2,8 @@
 //! queries never touch the database, they run against compact sorted arrays
 //! and SIMD scans.
 //!
-//! Layout (56-byte packed `Entry` + string arenas, ≈1 GB for 4M files):
+//! Layout (56-byte packed `Entry` + string arenas + a per-entry allocated-size
+//! section, ≈1 GB for 4M files):
 //! * one packed `Entry` per file (id, arena offsets, size, timestamps, flags)
 //! * `paths` (original case, for display + CI prefix search),
 //!   `names` (lowercased, for substring/glob scans),
@@ -43,21 +44,24 @@ use crate::query::{Query, Term};
 /// the `name_offs` / `path_offs` accelerator arrays (arena-offset → entry
 /// mapping, enabling whole-arena SIMD scans). v5 adds the trigram index
 /// (`trigrams` / `trig_offs` / `trig_posts`) for O(posting) substring
-/// candidate generation. Older dumps stay loadable: v3 rebuilds the two
-/// accelerator arrays in memory, v3/v4 simply fall back to arena scans.
+/// candidate generation. v6 appends the `alloc` section (per-entry allocated
+/// cluster bytes, one u64 each) for WizTree-style disk-usage totals. Older
+/// dumps stay loadable: v3 rebuilds the accelerator arrays in memory, v3/v4
+/// fall back to arena scans, and pre-v6 dumps report `allocated = size`
+/// (approximation — only a fresh `fer index` recovers true cluster counts).
 const MAGIC: &[u8; 8] = b"FERIDX01";
-const FORMAT_VERSION: u32 = 5;
+const FORMAT_VERSION: u32 = 6;
 
 /// Fixed dump section order: entries, paths, names, revs, the six sorted
-/// permutations, the six id lists, `by_frn`, `name_offs`, `path_offs`, then
-/// the trigram index (`trigrams` sorted-unique u32, `trig_offs` cumulative
-/// u32 posting offsets, `trig_posts` ascending entry indices). The header
-/// stores byte offsets for each section plus the total file length (SEC+1
-/// table entries), followed by the six id-list element counts — logical
-/// lengths come from these, so inter-section alignment padding never leaks
-/// into the data.
-const SEC: usize = 22;
-const HDR_LEN: usize = 32 + (SEC + 1) * 8 + 6 * 4; // 240
+/// permutations, the six id lists, `by_frn`, `name_offs`, `path_offs`, the
+/// trigram index (`trigrams` sorted-unique u32, `trig_offs` cumulative
+/// u32 posting offsets, `trig_posts` ascending entry indices), then `alloc`
+/// (u64 allocated bytes per entry, v6). The header stores byte offsets for
+/// each section plus the total file length (SEC+1 table entries), followed by
+/// the six id-list element counts — logical lengths come from these, so
+/// inter-section alignment padding never leaks into the data.
+const SEC: usize = 23;
+const HDR_LEN: usize = 32 + (SEC + 1) * 8 + 6 * 4; // 248
 /// v3 layout constants (no accelerator/trigram sections) for
 /// backward-compatible loading: existing dumps keep working without an
 /// immediate rebuild.
@@ -67,6 +71,10 @@ const HDR_LEN_V3: usize = 32 + (SEC_V3 + 1) * 8 + 6 * 4; // 200
 /// accelerators and arena-scan fallback for substrings.
 const SEC_V4: usize = 19;
 const HDR_LEN_V4: usize = 32 + (SEC_V4 + 1) * 8 + 6 * 4; // 216
+/// v5 layout (trigram index, no alloc section): loads zero-copy, `allocated`
+/// falls back to the logical size.
+const SEC_V5: usize = 22;
+const HDR_LEN_V5: usize = 32 + (SEC_V5 + 1) * 8 + 6 * 4; // 240
 
 /// Packed, dump-stable 56-byte record. Field order groups the u64s so there
 /// is no interior padding; the dump is written/read as raw little-endian
@@ -99,6 +107,7 @@ pub struct MemBuilder {
     paths: Vec<u8>,
     names: Vec<u8>,
     revs: Vec<u8>,
+    alloc: Vec<u64>,
 }
 
 impl MemBuilder {
@@ -128,10 +137,11 @@ impl MemBuilder {
             is_dir: meta.is_dir as u8,
             frn: meta.frn.unwrap_or(0),
         });
+        self.alloc.push(meta.allocated);
     }
 
     pub fn finish(self) -> MemIndex {
-        finalize(self.entries, self.paths, self.names, self.revs)
+        finalize(self.entries, self.paths, self.names, self.revs, self.alloc)
     }
 
     /// Append an entry whose arena strings are already materialized (the
@@ -161,6 +171,7 @@ impl MemBuilder {
             is_dir: meta.is_dir as u8,
             frn: meta.frn.unwrap_or(0),
         });
+        self.alloc.push(meta.allocated);
     }
 }
 
@@ -225,6 +236,7 @@ struct OwnedData {
     trigrams: Vec<u32>,
     trig_offs: Vec<u32>,
     trig_posts: Vec<u32>,
+    alloc: Vec<u64>,
 }
 
 /// Immutable pointer+len slice view. Backed either by the owned Vecs or by the
@@ -293,6 +305,9 @@ pub struct Sections {
     trigrams: View<u32>,
     trig_offs: View<u32>,
     trig_posts: View<u32>,
+    /// v6 only: per-entry allocated bytes (`None` for pre-v6 dumps — the
+    /// metadata path then falls back to the logical size).
+    alloc: Option<View<u64>>,
 }
 
 impl std::ops::Deref for MemIndex {
@@ -343,7 +358,8 @@ impl MemIndex {
                 frn: row.get::<_, Option<i64>>(8)?.map(|f| f as u64).unwrap_or(0),
             });
         }
-        Ok(finalize(entries, paths, names, revs))
+        let alloc = vec![0u64; entries.len()];
+        Ok(finalize(entries, paths, names, revs, alloc))
     }
 
     /// Serialize the finished index (packed entries + arenas + permutations)
@@ -360,6 +376,16 @@ impl MemIndex {
         let mut offs = [0u64; SEC + 1];
         w.write_all(&[0u8; HDR_LEN])?; // header placeholder, rewritten below
         let mut off = HDR_LEN as u64;
+        // Pre-v6 dumps loaded in memory have no alloc section; upgrading them
+        // writes the size-fallback approximation (only `fer index` recovers
+        // true cluster counts from the $MFT).
+        let alloc_fallback: Option<Vec<u64>> = self.sec.alloc.is_none().then(|| {
+            self.entries.slice().iter().map(|e| e.size).collect()
+        });
+        let alloc_bytes: &[u64] = match &self.sec.alloc {
+            Some(a) => a.slice(),
+            None => alloc_fallback.as_deref().expect("fallback built above"),
+        };
         let secs: [&[u8]; SEC] = [
             pod_bytes(&self.entries),
             &self.paths,
@@ -383,6 +409,7 @@ impl MemIndex {
             pod_bytes(&self.trigrams),
             pod_bytes(&self.trig_offs),
             pod_bytes(&self.trig_posts),
+            pod_bytes(alloc_bytes),
         ];
         for (i, bytes) in secs.into_iter().enumerate() {
             offs[i] = off;
@@ -440,14 +467,16 @@ impl MemIndex {
             bail!("not a FERIDX dump: {}", path.display());
         }
         let version = u32::from_le_bytes(buf[8..12].try_into().unwrap());
-        if version != FORMAT_VERSION && version != 4 && version != 3 {
+        if !(3..=FORMAT_VERSION).contains(&version) {
             bail!(
-                "dump format v{version} unsupported (want v{FORMAT_VERSION}, v4 or v3) — re-run `fer index`"
+                "dump format v{version} unsupported (want v{FORMAT_VERSION} or v3-v{}) — re-run `fer index`",
+                FORMAT_VERSION - 1
             );
         }
         let (sec, hdr_len) = match version {
             3 => (SEC_V3, HDR_LEN_V3),
             4 => (SEC_V4, HDR_LEN_V4),
+            5 => (SEC_V5, HDR_LEN_V5),
             _ => (SEC, HDR_LEN),
         };
         let n = u32::from_le_bytes(buf[12..16].try_into().unwrap()) as usize;
@@ -477,6 +506,7 @@ impl MemIndex {
                 && (offs[1] - offs[0]) as usize == n * std::mem::size_of::<Entry>()
                 && padded(offs[17] - offs[16], n * 4)
                 && (version == 3 || padded(offs[18] - offs[17], n * 4))
+                && (version < 6 || padded(offs[23] - offs[22], n * 8))
                 && counts[0] + counts[1] == n,
             "dump layout corrupt: {}",
             path.display()
@@ -520,9 +550,9 @@ impl MemIndex {
             Some(a) => View::from_slice(&a.path_offs),
             None => view_of(view_at(offs[18], perm_bytes)),
         };
-        // Trigram sections exist only in v5; older dumps fall back to the
+        // Trigram sections exist from v5; older dumps fall back to the
         // whole-arena scan path (empty views).
-        let (trigrams, trig_offs, trig_posts) = if version == 5 {
+        let (trigrams, trig_offs, trig_posts) = if version >= 5 {
             (
                 view_of(view_at(offs[19], (offs[20] - offs[19]) as usize)),
                 view_of(view_at(offs[20], (offs[21] - offs[20]) as usize)),
@@ -534,6 +564,12 @@ impl MemIndex {
                 View::<u32>::from_slice(&[]),
                 View::<u32>::from_slice(&[]),
             )
+        };
+        // v6 only: per-entry allocated bytes (pre-v6 dumps fall back to size).
+        let alloc = if version >= 6 {
+            Some(view_of(view_at(offs[22], n * 8)))
+        } else {
+            None
         };
         let sec = Sections {
             entries: view_of(view_at(offs[0], entry_bytes)),
@@ -558,6 +594,7 @@ impl MemIndex {
             trigrams,
             trig_offs,
             trig_posts,
+            alloc,
         };
         Ok(MemIndex { _keep: Keep::Mapped(MappedData { mmap, aux }), sec })
     }
@@ -655,6 +692,9 @@ impl MemIndex {
         EntryMeta {
             is_dir: e.is_dir != 0,
             size: e.size,
+            // pre-v6 dumps: approximation (only `fer index` recovers true
+            // cluster counts from the $MFT)
+            allocated: self.alloc.map(|a| a[i]).unwrap_or(e.size),
             mtime: e.mtime,
             ctime: e.ctime,
             flags: e.flags,
@@ -733,6 +773,7 @@ impl MemIndex {
             + self.paths.len()
             + self.names.len()
             + self.revs.len()
+            + self.alloc.map(|a| a.len() * 8).unwrap_or(0)
             + (self.by_path.len()
                 + self.by_name.len()
                 + self.by_rev.len()
@@ -810,6 +851,7 @@ impl MemIndex {
                 path,
                 is_dir: e.is_dir != 0,
                 size: e.size,
+                allocated: self.alloc.map(|a| a[idx]).unwrap_or(e.size),
                 mtime: e.mtime,
                 ctime: e.ctime,
                 flags: e.flags,
@@ -1255,7 +1297,13 @@ impl MemIndex {
 /// The six sorts and the attribute filter pass are independent — they run on
 /// scoped threads, so finalizing a 4M-entry index takes a few hundred
 /// milliseconds instead of a serial second-plus.
-fn finalize(entries: Vec<Entry>, paths: Vec<u8>, names: Vec<u8>, revs: Vec<u8>) -> MemIndex {
+fn finalize(
+    entries: Vec<Entry>,
+    paths: Vec<u8>,
+    names: Vec<u8>,
+    revs: Vec<u8>,
+    alloc: Vec<u64>,
+) -> MemIndex {
     let n = entries.len();
     let seq = (0..n as u32).collect::<Vec<u32>>();
     let mut by_path = seq.clone();
@@ -1352,6 +1400,7 @@ fn finalize(entries: Vec<Entry>, paths: Vec<u8>, names: Vec<u8>, revs: Vec<u8>) 
         trigrams,
         trig_offs,
         trig_posts,
+        alloc,
     })
 }
 
@@ -1458,6 +1507,7 @@ impl MemIndex {
             trigrams: View::from_slice(&o.trigrams),
             trig_offs: View::from_slice(&o.trig_offs),
             trig_posts: View::from_slice(&o.trig_posts),
+            alloc: Some(View::from_slice(&o.alloc)),
         };
         MemIndex { _keep: Keep::Owned(o), sec }
     }
@@ -2287,26 +2337,96 @@ mod tests {
 
     #[test]
     fn v5_dump_roundtrip_trigram() {
-        // The trigram index must survive a dump roundtrip (mapped views) and
-        // serve the fast path identically to the owned index.
+        // The trigram index and the alloc section must survive a dump
+        // roundtrip (mapped views) and serve the fast path identically to
+        // the owned index.
         let mut b = MemBuilder::default();
         let meta = EntryMeta { size: 0, mtime: 0, ctime: 0, flags: 0, ..Default::default() };
+        let big = EntryMeta { size: 100, allocated: 400, mtime: 0, ctime: 0, flags: 0, ..Default::default() };
         b.push(r"D:\t\report.md", meta.clone());
         b.push(r"D:\t\年度报告.md", meta.clone());
-        b.push(r"D:\t\main.rs", meta.clone());
+        b.push(r"D:\t\main.rs", big);
         let mem = b.finish();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.feridx");
         mem.save(&path).unwrap();
         let loaded = MemIndex::load_dump(&path).unwrap();
         assert!(!loaded.trigrams.is_empty());
+        for i in 0..mem.len() {
+            assert_eq!(loaded.meta_at(i).allocated, mem.meta_at(i).allocated);
+        }
         for q in ["rep", "report", "报告", "年度", "main", "rs", "zzz"] {
             assert_eq!(
                 loaded.search(&Query::parse(q).unwrap()),
                 mem.search(&Query::parse(q).unwrap()),
-                "query {q}: v5 roundtrip mismatch"
+                "query {q}: v6 roundtrip mismatch"
             );
         }
+    }
+
+    #[test]
+    fn v5_dump_compat_allocated_fallback() {
+        // A genuine v5-layout file (no alloc section) must load zero-copy and
+        // report allocated = size (approximation), while queries stay
+        // identical to the owned index.
+        let mut b = MemBuilder::default();
+        b.push(
+            r"D:\t\big.bin",
+            EntryMeta { size: 100, allocated: 400, frn: Some(1), ..Default::default() },
+        );
+        b.push(r"D:\t\dir", EntryMeta { is_dir: true, ..Default::default() });
+        let mem = b.finish();
+        let dir = tempfile::tempdir().unwrap();
+        let v6path = dir.path().join("v6.feridx");
+        mem.save(&v6path).unwrap();
+        // Rebuild a genuine v5 file: same section payloads minus the trailing
+        // alloc section, 240-byte v5 header.
+        let v6 = std::fs::read(&v6path).unwrap();
+        let mut offs6 = [0u64; SEC + 1];
+        for (i, o) in offs6.iter_mut().enumerate() {
+            *o = u64::from_le_bytes(v6[32 + i * 8..40 + i * 8].try_into().unwrap());
+        }
+        let counts6: Vec<u32> = (0..6)
+            .map(|i| {
+                u32::from_le_bytes(
+                    v6[32 + (SEC + 1) * 8 + i * 4..32 + (SEC + 1) * 8 + (i + 1) * 4]
+                        .try_into()
+                        .unwrap(),
+                )
+            })
+            .collect();
+        let payload = v6[offs6[0] as usize..offs6[SEC_V5] as usize].to_vec();
+        let mut hdr = Vec::with_capacity(HDR_LEN_V5);
+        hdr.extend_from_slice(MAGIC);
+        hdr.extend_from_slice(&5u32.to_le_bytes());
+        hdr.extend_from_slice(&(mem.len() as u32).to_le_bytes());
+        hdr.extend_from_slice(&0i64.to_le_bytes()); // created
+        hdr.extend_from_slice(&0i64.to_le_bytes()); // reserved
+        let mut offs5 = [0u64; SEC_V5 + 1];
+        offs5[0] = HDR_LEN_V5 as u64;
+        for i in 1..=SEC_V5 {
+            offs5[i] = HDR_LEN_V5 as u64 + (offs6[i] - offs6[0]);
+        }
+        for o in offs5 {
+            hdr.extend_from_slice(&o.to_le_bytes());
+        }
+        for c in counts6 {
+            hdr.extend_from_slice(&c.to_le_bytes());
+        }
+        let mut v5file = hdr;
+        v5file.extend_from_slice(&payload);
+        let v5path = dir.path().join("v5.feridx");
+        std::fs::write(&v5path, &v5file).unwrap();
+
+        let loaded = MemIndex::load_dump(&v5path).unwrap();
+        assert_eq!(loaded.len(), mem.len());
+        // pre-v6: allocated falls back to the logical size
+        assert_eq!(loaded.meta_at(0).allocated, 100);
+        assert_eq!(loaded.meta_at(0).size, 100);
+        assert_eq!(
+            loaded.search(&Query::parse("big.bin").unwrap()),
+            mem.search(&Query::parse("big.bin").unwrap())
+        );
     }
 
     #[test]
