@@ -137,17 +137,19 @@ fn main() -> Result<()> {
             let dump = dump_path(&db);
             mem.save(&dump)?;
             eprintln!(
-                "[dump] {} entries, {} MB written to {} in {} ms",
+                "[dump] {} entries, {} MB written to {} in {} ms (peak RSS {})",
                 mem.len(),
                 mem.memory_bytes() / (1 << 20),
                 dump.display(),
-                t_dump.elapsed().as_millis()
+                t_dump.elapsed().as_millis(),
+                fmt_bytes(peak_rss_bytes())
             );
             if cli.json {
                 print_json(json!({
                     "ok": true,
                     "report": report,
                     "dump": dump.display().to_string(),
+                    "peak_rss": peak_rss_bytes(),
                 }))?;
             } else {
                 println!(
@@ -333,5 +335,24 @@ fn fmt_bytes(n: u64) -> String {
         format!("{:.2} KB", n as f64 / KB as f64)
     } else {
         format!("{n} B")
+    }
+}
+
+/// Peak working-set size of the current process (build memory observability).
+fn peak_rss_bytes() -> u64 {
+    use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut pmc: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+    let ok = unsafe {
+        GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            &mut pmc,
+            std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        )
+    };
+    if ok != 0 {
+        pmc.PeakWorkingSetSize as u64
+    } else {
+        0
     }
 }

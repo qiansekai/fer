@@ -1321,46 +1321,77 @@ fn finalize(entries: Vec<Entry>, paths: Vec<u8>, names: Vec<u8>, revs: Vec<u8>) 
 }
 
 /// Build the trigram index: every distinct 3-byte window of every (lowercased)
-/// name maps to the sorted list of entries containing it. `(trigram, idx)`
-/// pairs are packed into u64s, sorted once, then deduplicated and split into
-/// the three dump sections. Peak cost is one u64 per name-window (~500 MB at
-/// 4M entries of ~18-byte names) — acceptable for a build-time phase.
+/// name maps to the sorted list of entries containing it.
+///
+/// Memory-conscious construction — NO (trigram, idx) pair array, NO sort:
+/// 1. pass one counts occurrences per trigram (HashMap, ~85K entries ≈ 3 MB);
+/// 2. prefix sums turn counts into the `trig_offs` layout and per-trigram
+///    fill cursors;
+/// 3. pass two walks entries in order and appends each entry index directly
+///    into its trigram's posting slot — entry order IS ascending index order,
+///    so postings come out sorted for free.
+///
+/// Per-entry duplicate trigrams are filtered by a 256-slot open-addressing
+/// set with an epoch counter (no per-entry allocation, no rehash cost).
+/// Peak extra memory ≈ the final trigs/offs/posts arrays (~255 MB at 4.17M
+/// entries), instead of ~530 MB of sortable u64 pairs.
 fn build_trigrams(names: &[u8], entries: &[Entry]) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
-    let mut pairs: Vec<u64> = Vec::with_capacity(entries.len().saturating_mul(12));
-    for (i, e) in entries.iter().enumerate() {
+    use std::collections::HashMap;
+    let mut counts: HashMap<u32, u32> = HashMap::new();
+    let mut dedup: Vec<(u32, u32)> = vec![(0, u32::MAX); 256]; // (epoch, trigram)
+    let mut epoch: u32 = 0;
+    // pass 1: per-entry distinct-trigram counting
+    for e in entries {
+        epoch = epoch.wrapping_add(1);
         let name = &names[e.name_off as usize..e.name_off as usize + e.name_len as usize];
-        let mut prev: u32 = u32::MAX;
         for w in name.windows(3) {
             let t = ((w[0] as u32) << 16) | ((w[1] as u32) << 8) | w[2] as u32;
-            // consecutive-duplicate skip; exact duplicates collapse in dedup()
-            if t != prev {
-                pairs.push(((t as u64) << 32) | i as u64);
-                prev = t;
+            // open addressing: 24-bit trigram hashed into 256 slots
+            let mut slot = (t as usize) & 255;
+            loop {
+                if dedup[slot].0 != epoch {
+                    dedup[slot] = (epoch, t);
+                    *counts.entry(t).or_insert(0) += 1;
+                    break;
+                } else if dedup[slot].1 == t {
+                    break; // already counted for this entry
+                }
+                slot = (slot + 1) & 255;
             }
         }
     }
-    pairs.sort_unstable();
-    pairs.dedup();
-    let mut trigs: Vec<u32> = Vec::with_capacity(pairs.len());
-    let mut offs: Vec<u32> = Vec::with_capacity(pairs.len());
-    let mut posts: Vec<u32> = Vec::with_capacity(pairs.len());
+    // pass 2 (prefix): trig_offs layout + per-trigram fill cursors
+    let mut trigs: Vec<u32> = counts.keys().copied().collect();
+    trigs.sort_unstable();
+    let mut cursor: HashMap<u32, u32> = HashMap::with_capacity(trigs.len());
+    let mut offs: Vec<u32> = Vec::with_capacity(trigs.len() + 1);
     offs.push(0);
-    let mut cur: Option<u32> = None;
-    for p in pairs {
-        let t = (p >> 32) as u32;
-        let i = (p & 0xFFFF_FFFF) as u32;
-        if Some(t) != cur {
-            // end of the PREVIOUS trigram's posting run
-            if cur.is_some() {
-                offs.push(posts.len() as u32);
-            }
-            trigs.push(t);
-            cur = Some(t);
-        }
-        posts.push(i);
+    for &t in &trigs {
+        cursor.insert(t, offs.last().copied().unwrap_or(0));
+        offs.push(offs.last().copied().unwrap_or(0) + counts[&t]);
     }
-    // end of the last trigram's posting run
-    offs.push(posts.len() as u32);
+    let mut posts: Vec<u32> = vec![0; offs.last().copied().unwrap_or(0) as usize];
+    // pass 3: fill postings in entry order (ascending per trigram by design)
+    for (i, e) in entries.iter().enumerate() {
+        epoch = epoch.wrapping_add(1);
+        let name = &names[e.name_off as usize..e.name_off as usize + e.name_len as usize];
+        for w in name.windows(3) {
+            let t = ((w[0] as u32) << 16) | ((w[1] as u32) << 8) | w[2] as u32;
+            let mut slot = (t as usize) & 255;
+            loop {
+                if dedup[slot].0 != epoch {
+                    dedup[slot] = (epoch, t);
+                    let c = cursor.get_mut(&t).expect("trigram counted in pass 1");
+                    posts[*c as usize] = i as u32;
+                    *c += 1;
+                    break;
+                } else if dedup[slot].1 == t {
+                    break;
+                }
+                slot = (slot + 1) & 255;
+            }
+        }
+    }
     (trigs, offs, posts)
 }
 
