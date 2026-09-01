@@ -10,14 +10,29 @@
 //!   total always equals its own files plus its children;
 //! * subtree membership is boundary-aware (`d:\proj` never matches
 //!   `d:\proj2`), case-insensitive like the rest of the engine.
+//!
+//! Performance design (whole volume ≈ 3M entries):
+//! * directory lookup is allocation-free: dirs are keyed by an FNV-1a hash
+//!   over ASCII-folded path bytes (hash = prefilter, `ci_eq` = exact verify),
+//!   and the per-file ancestor walk maintains the hash incrementally in one
+//!   byte pass;
+//! * aggregation runs on scoped threads over contiguous, evenly sized file
+//!   chunks and accumulates into dense per-dir atomic counters (one slot per
+//!   directory id): no per-thread maps, no merge phase, balanced load even
+//!   when one top-level directory dominates the volume.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 use anyhow::{Result, bail};
 use serde::Serialize;
 
 use crate::fold_lower;
 use crate::mem::MemIndex;
+
+/// FNV-1a (64-bit) constants.
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 /// One directory's aggregated size (descendant of the measured root).
 #[derive(Debug, Clone, Serialize)]
@@ -61,113 +76,168 @@ pub fn scan(mem: &MemIndex, root: &str, max_depth: Option<usize>, top: usize) ->
 
     let ids = mem.subtree_ids(root_bytes);
 
-    // Directory index: lowercased path → entry id (only within the subtree).
-    let mut dir_map: HashMap<String, u32> = HashMap::new();
-    let mut dir_display: HashMap<u32, String> = HashMap::new();
-    for &id in &ids {
-        let meta = mem.meta_at(id as usize);
-        if meta.is_dir {
-            let display = mem.path_at(id as usize);
-            dir_map.insert(fold_lower_bytes(mem.path_bytes(id as usize)), id);
-            dir_display.insert(id, display);
-        }
-    }
-
-    // Per-directory aggregation, keyed by entry id.
-    let mut dir_size: HashMap<u32, u64> = HashMap::new();
-    let mut dir_files: HashMap<u32, u64> = HashMap::new();
-    // FRN dedupe: count each hard-linked file once. FRN keys get the top bit
-    // set; entries without an FRN key on their entry id (ids < 2^32 < 2^63),
-    // so the two key spaces never collide.
-    let mut seen: HashSet<u64> = HashSet::new();
+    // --- Pass A: FRN dedup + directory index. ---
+    let mut seen: HashSet<u64> = HashSet::with_capacity(ids.len());
+    let mut dir_hash: HashMap<u64, Vec<u32>> = HashMap::new();
+    let mut uniq: Vec<(u32, u64)> = Vec::new();
     let mut total: u64 = 0;
     let mut files: u64 = 0;
+    let mut dirs_seen: u64 = 0;
+    let mut dir_max: u32 = 0;
+    let mut root_present = false;
 
     for &id in &ids {
         let meta = mem.meta_at(id as usize);
         if meta.is_dir {
+            let raw = mem.path_bytes(id as usize);
+            dir_hash.entry(ci_fnv(raw)).or_default().push(id);
+            dirs_seen += 1;
+            dir_max = dir_max.max(id);
+            root_present |= ci_eq(raw, root_bytes);
             continue;
         }
+        // FRN keys get the top bit set; entries without an FRN key on their
+        // entry id (ids < 2^32 < 2^63), so the key spaces never collide.
         let key = meta.frn.map(|f| f | (1 << 63)).unwrap_or(id as u64);
         if !seen.insert(key) {
             continue; // hard-link alias of an already counted file
         }
         total = total.saturating_add(meta.size);
         files += 1;
-
-        // Attribute this file to every ancestor directory (all prefixes
-        // ending at a separator; the volume root itself is implicit and the
-        // measured root gets the remainder).
-        let lc = fold_lower_bytes(mem.path_bytes(id as usize));
-        for (pos, &b) in lc.as_bytes().iter().enumerate() {
-            if pos > 0
-                && (b == b'\\' || b == b'/')
-                && let Some(&did) = dir_map.get(&lc[..pos])
-            {
-                let slot = dir_size.entry(did).or_insert(0);
-                *slot = slot.saturating_add(meta.size);
-                *dir_files.entry(did).or_insert(0) += 1;
-            }
-        }
+        uniq.push((id, meta.size));
     }
 
-    // Assemble the child list: distinct directories below the root, depth
-    // limited, most space first.
-    let mut children: Vec<DuEntry> = Vec::with_capacity(dir_size.len());
-    for (&did, &size) in &dir_size {
-        let files = dir_files[&did];
-        if size == 0 && files == 0 {
-            continue;
-        }
-        let Some(display) = dir_display.get(&did) else {
-            continue;
-        };
-        let lc = fold_lower(display);
-        let rel = &lc.as_bytes()[root_bytes.len()..];
-        let depth = rel
-            .iter()
-            .filter(|&&b| b == b'\\' || b == b'/')
-            .count();
-        if depth == 0 {
-            continue; // the measured root itself
-        }
-        children.push(DuEntry {
-            path: display.clone(),
-            size,
-            files,
-            depth,
+    // --- Pass B: parallel aggregation into dense per-dir atomic counters. ---
+    // One slot per directory id — at most the largest dir id in the subtree,
+    // so small subtrees stay small. Contiguous chunks keep every thread busy
+    // even when one top-level directory dominates the volume.
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(16);
+    let dir_sizes: Vec<AtomicU64> = (0..=dir_max).map(|_| AtomicU64::new(0)).collect();
+    let dir_counts: Vec<AtomicU64> = (0..=dir_max).map(|_| AtomicU64::new(0)).collect();
+    if uniq.len() < 4096 {
+        aggregate(&uniq, &dir_hash, mem, &dir_sizes, &dir_counts);
+    } else {
+        let chunk = uniq.len().div_ceil(threads).max(1);
+        std::thread::scope(|s| {
+            let handles: Vec<_> = uniq
+                .chunks(chunk)
+                .map(|c| s.spawn(|| aggregate(c, &dir_hash, mem, &dir_sizes, &dir_counts)))
+                .collect();
+            for h in handles {
+                h.join().expect("du aggregation thread panicked");
+            }
         });
     }
-    children.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.path.cmp(&b.path)));
+
+    // --- Assemble the child list: distinct dirs below the root, depth
+    // limited, most space first. ---
+    let mut children: Vec<DuEntry> = Vec::new();
+    for cands in dir_hash.values() {
+        for &did in cands {
+            let size = dir_sizes[did as usize].load(Relaxed);
+            let files = dir_counts[did as usize].load(Relaxed);
+            if size == 0 && files == 0 {
+                continue;
+            }
+            let display = mem.path_at(did as usize);
+            let raw = display.as_bytes();
+            let rel = &raw[root_bytes.len()..];
+            let depth = rel
+                .iter()
+                .filter(|&&b| b == b'\\' || b == b'/')
+                .count();
+            if depth == 0 {
+                continue; // the measured root itself
+            }
+            children.push(DuEntry {
+                path: display,
+                size,
+                files,
+                depth,
+            });
+        }
+    }
+    children.sort_unstable_by(|a, b| b.size.cmp(&a.size).then_with(|| a.path.cmp(&b.path)));
     let truncated = children.len() > top;
     if let Some(max_depth) = max_depth {
         children.retain(|c| c.depth <= max_depth);
     }
     children.truncate(top);
 
-    let root_present = dir_map.contains_key(&root_lc);
     Ok(DuReport {
         root: norm.to_string(),
         total_bytes: total,
         files,
-        dirs: dir_map.len() as u64 - root_present as u64,
+        dirs: dirs_seen - root_present as u64,
         entries: ids.len() as u64,
         children,
         truncated,
     })
 }
 
-/// Lowercase path bytes without an intermediate UTF-8 round-trip on the
-/// (overwhelmingly ASCII) fast path.
-fn fold_lower_bytes(b: &[u8]) -> String {
-    if b.is_ascii() {
-        // ASCII lowercase is byte-length preserving, so the result is valid
-        // UTF-8 by construction.
-        String::from_utf8(b.iter().map(u8::to_ascii_lowercase).collect())
-            .expect("ascii-lowered bytes are valid utf8")
-    } else {
-        fold_lower(&String::from_utf8_lossy(b))
+/// Aggregate one chunk: attribute every file to all its ancestor directories
+/// (all prefixes ending at a separator; the volume root is implicit and the
+/// measured root is skipped later). The FNV hash is maintained incrementally
+/// over the raw path bytes — one pass, zero allocation per file. Accumulation
+/// is a relaxed atomic add into the dense per-dir counters (different threads
+/// writing the same directory is rare and harmless: add is commutative).
+fn aggregate(
+    chunk: &[(u32, u64)],
+    dir_hash: &HashMap<u64, Vec<u32>>,
+    mem: &MemIndex,
+    dir_sizes: &[AtomicU64],
+    dir_counts: &[AtomicU64],
+) {
+    for &(id, size) in chunk {
+        let raw = mem.path_bytes(id as usize);
+        let mut h = FNV_OFFSET;
+        let mut i = 0usize;
+        for &b in raw {
+            // Hash of raw[..i] — the prefix WITHOUT the current byte. The
+            // separator itself is not part of any directory path, so the
+            // lookup key must be the hash from before this byte.
+            let before = h;
+            h ^= b.to_ascii_lowercase() as u64;
+            h = h.wrapping_mul(FNV_PRIME);
+            i += 1;
+            if (b == b'\\' || b == b'/')
+                && let Some(did) = lookup_dir(dir_hash, mem, &raw[..i - 1], before)
+            {
+                dir_sizes[did as usize].fetch_add(size, Relaxed);
+                dir_counts[did as usize].fetch_add(1, Relaxed);
+            }
+        }
     }
+}
+
+/// Directory lookup by folded-path hash: the hash is only a prefilter, exact
+/// equality re-checks the bytes (ASCII-folded) — hash collisions cannot
+/// corrupt results.
+fn lookup_dir(map: &HashMap<u64, Vec<u32>>, mem: &MemIndex, prefix: &[u8], hash: u64) -> Option<u32> {
+    let cands = map.get(&hash)?;
+    cands
+        .iter()
+        .copied()
+        .find(|&did| ci_eq(mem.path_bytes(did as usize), prefix))
+}
+
+/// FNV-1a over ASCII-folded bytes (non-ASCII compares raw, matching the
+/// engine-wide CI contract).
+fn ci_fnv(bytes: &[u8]) -> u64 {
+    let mut h = FNV_OFFSET;
+    for &b in bytes {
+        h ^= b.to_ascii_lowercase() as u64;
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    h
+}
+
+/// ASCII-case-insensitive byte equality (non-ASCII raw), engine contract.
+fn ci_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
 }
 
 #[cfg(test)]
@@ -284,5 +354,40 @@ mod tests {
         let b = scan(&mem, r"D:\proj", None, 100).unwrap();
         assert_eq!(a.total_bytes, b.total_bytes);
         assert_eq!(a.children.len(), b.children.len());
+    }
+
+    #[test]
+    fn hard_link_across_top_dirs() {
+        // One FRN aliased under two top-level directories: counted once and
+        // attributed to the first-seen alias's chain (id order).
+        let mut b = MemBuilder::default();
+        b.push(r"D:\a", dir());
+        b.push(r"D:\a\f.txt", file(10, 7));
+        b.push(r"D:\b", dir());
+        b.push(r"D:\b\g.txt", file(10, 7)); // alias
+        let mem = b.finish();
+        let r = scan(&mem, r"D:\", None, 100).unwrap();
+        assert_eq!(r.total_bytes, 10);
+        assert_eq!(r.files, 1);
+        assert_eq!(r.children.len(), 1); // only "a" holds the file
+        assert!(r.children[0].path.ends_with("a"));
+    }
+
+    #[test]
+    fn hashing_and_partition_primitives() {
+        // The walk keeps the hash of the prefix WITHOUT the current byte;
+        // at each separator that must equal ci_fnv over the path so far.
+        let raw = br"d:\proj\src\main.rs";
+        let mut h = FNV_OFFSET;
+        for (i, &b) in raw.iter().enumerate() {
+            let before = h;
+            h ^= b.to_ascii_lowercase() as u64;
+            h = h.wrapping_mul(FNV_PRIME);
+            if i == 7 || i == 11 {
+                assert_eq!(before, ci_fnv(&raw[..i]));
+            }
+        }
+        assert!(ci_eq(br"d:\proj", br"D:\PROJ"));
+        assert!(!ci_eq(br"d:\proj", br"d:\proj2"));
     }
 }

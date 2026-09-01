@@ -108,6 +108,7 @@ fer du <root> [--depth N] [--top N] [--json]
 ```
 GET /api/health                     → {"ok":true}
 GET /api/search?q=<query>&limit=<n> → 命中列表（带 size/mtime/ctime/flags）
+GET /api/du?path=<p>&depth=<n>&top=<n> → 目录占用聚合（WizTree 式，字段同 `fer du --json`）
 GET /api/stats                      → 索引统计 + 卷列表
 POST /api/rescan                    → 后台全量重建
 GET /                              → 网页搜索 UI
@@ -208,9 +209,10 @@ CLI 全查询 3 轮取 min/median（每项均含进程启动 + dump mmap 加载�
   `ext:rs` 2ms、`type:dir` 1ms、`dm:thisweek type:file` 34ms；逻辑内存 1021MB /
   RSS 350MB（mmap 按需缺页，OS 可回收）
 - **CLI**：全查询 **0-294ms**（含进程启动 + dump 加载），无 SQLite、无门控
-- **du**（2026-09 新增）：子树 `D:\Kita-Tools\Coding`（9.5 万条目/1.8 万目录）
-  **135ms**（第二跑 74ms 热页）；整卷 `D:\`（299 万条目/39 万目录）聚合 **2.9s**
-  （含进程启动 ~4.6s）。成本 = 每文件一次路径折叠 + 祖先归桶，后续可并行化
+- **du**（2026-09 新增，v2 并行化）：子树 `D:\Kita-Tools\Coding`（9.5 万条目/1.8 万目录）
+  **35ms**；整卷 `D:\`（299 万条目/39 万目录）聚合 **~1.2s**（v1 顺序版 2.9s）。实现 =
+  FRN 去重 → 连续均分块 scoped 线程并行 → 稠密 per-dir 原子计数（无 merge 阶段），
+  目录查找走 FNV 折叠哈希预筛 + 精确校验，每文件零分配；serve 内热页同查询 ~35ms
 
 ### serve 稳态查询（2026-09 优化后，dump v5 含 trigram 倒排段）
 
