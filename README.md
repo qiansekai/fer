@@ -53,6 +53,8 @@ fer monitor --volume D               # USN 实时增量（需管理员）
 fer stats                            # 索引统计
 fer dupes --min-size 1kb --limit 50  # 找重复文件（同大小分组 + 内容哈希 + 字节校验）
 fer dupes --name adb.exe             # 只看文件名含 adb.exe 的重复组
+fer du "D:\Kita-Tools" --top 20      # 磁盘占用聚合（WizTree 式 du，见下节）
+fer du "D:\" --depth 1 --top 10 --json  # 整卷顶层占用，JSON 输出
 fer --db <path> <cmd>                # 自定义索引库（默认 %LOCALAPPDATA%\file-engine-rust\index.db）
 ```
 
@@ -78,6 +80,28 @@ fer --db <path> <cmd>                # 自定义索引库（默认 %LOCALAPPDATA
 | `parent:D:\proj` | 该目录**子树**（前缀匹配） |
 | `path:D:\proj\src` | 全路径前缀 |
 | `!term` | 取反（与其它 term 为 AND 关系） |
+
+> 注意：`parent:`/`path:` 是**朴素前缀**——`parent:D:\proj` 也会匹配 `D:\proj2`。
+> 需要组件边界语义（`d:\proj` 绝不匹配 `d:\proj2`）请用 `fer du`，其底层
+> `subtree_ids` 是边界感知的。
+
+## fer du — 磁盘占用聚合（WizTree 式）
+
+零磁盘 IO：直接从 dump 聚合，和 WizTree 从 MFT 出树同源。
+
+```bash
+fer du <root> [--depth N] [--top N] [--json]
+```
+
+- `<root>`：目录、卷根（`D:\`）、或单个文件；大小写不敏感，尾部分隔符可省。
+- `--depth N`：只报告 root 以下 N 层的子目录（0 = 只出总数；缺省 = 不限层）。
+- `--top N`：按占用降序最多报 N 个子目录（缺省 20；`truncated` 标记是否截断）。
+- `--json`：稳定字段 `root/total_bytes/files/dirs/entries/children[]/truncated`，
+  `children[].depth` = 相对 root 的层数（root 直接子目录 = 1）。
+
+语义：只统计文件（NTFS 目录记录自身无有效大小）；**硬链接按 FRN 去重只计一次**；
+每个文件计入其全部祖先目录（父目录 = 自身文件 + 子目录之和）。逻辑大小
+（`$DATA` real_size），不含分配簇/压缩后的磁盘占用。
 
 ## HTTP API
 
@@ -184,6 +208,9 @@ CLI 全查询 3 轮取 min/median（每项均含进程启动 + dump mmap 加载�
   `ext:rs` 2ms、`type:dir` 1ms、`dm:thisweek type:file` 34ms；逻辑内存 1021MB /
   RSS 350MB（mmap 按需缺页，OS 可回收）
 - **CLI**：全查询 **0-294ms**（含进程启动 + dump 加载），无 SQLite、无门控
+- **du**（2026-09 新增）：子树 `D:\Kita-Tools\Coding`（9.5 万条目/1.8 万目录）
+  **135ms**（第二跑 74ms 热页）；整卷 `D:\`（299 万条目/39 万目录）聚合 **2.9s**
+  （含进程启动 ~4.6s）。成本 = 每文件一次路径折叠 + 祖先归桶，后续可并行化
 
 ### serve 稳态查询（2026-09 优化后，dump v5 含 trigram 倒排段）
 

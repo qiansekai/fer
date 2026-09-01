@@ -64,6 +64,19 @@ enum Cmd {
     },
     /// Index statistics
     Stats,
+    /// Directory size breakdown (WizTree-style du, aggregated from the index)
+    Du {
+        /// Root path to measure: a directory, a volume root ("D:\"), or a
+        /// single file. Case-insensitive; component boundaries respected.
+        path: String,
+        /// Only report subdirectories at most this many levels below the root
+        /// (0 = total only, omitted = unlimited)
+        #[arg(long)]
+        depth: Option<usize>,
+        /// Maximum subdirectories to report, most space first
+        #[arg(long, default_value_t = 20)]
+        top: usize,
+    },
     /// Format-only migration: rebuild the trigram index into the existing
     /// dump and rewrite it as v5 (no admin, no MFT re-read)
     Upgrade,
@@ -272,6 +285,44 @@ fn main() -> Result<()> {
                 println!("dirs:    {dirs}");
                 println!("entries: {}", files + dirs);
                 println!("size:    {dump_mb} MB");
+            }
+        }
+        Cmd::Du { path, depth, top } => {
+            let mem = load_index(&db)?;
+            let t = Instant::now();
+            let report = file_engine_rust::du::scan(&mem, &path, depth, top)?;
+            let took = t.elapsed().as_millis();
+            if cli.json {
+                let mut v = serde_json::to_value(&report)?;
+                v.as_object_mut()
+                    .expect("report serializes to an object")
+                    .insert("took_ms".to_string(), json!(took));
+                print_json(v)?;
+            } else {
+                println!(
+                    "{:<60} {:>10}  {:>9} files",
+                    report.root,
+                    fmt_bytes(report.total_bytes),
+                    report.files
+                );
+                for c in &report.children {
+                    println!(
+                        "{}{:<60} {:>10}  {:>9} files",
+                        "  ".repeat(c.depth),
+                        c.path,
+                        fmt_bytes(c.size),
+                        c.files
+                    );
+                }
+                if report.truncated {
+                    eprintln!(
+                        "(more subdirectories hidden — raise --top; --json for machine use)"
+                    );
+                }
+                eprintln!(
+                    "{} files / {} dirs / {} entries in {took} ms",
+                    report.files, report.dirs, report.entries
+                );
             }
         }
         Cmd::Dupes { min_size, name, limit } => {

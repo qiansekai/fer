@@ -35,7 +35,8 @@ CLI `--json` 与 HTTP API 双通道。
 - 源码 `src/`：mft.rs（原始 $MFT 扫描，核心）、usn.rs（回退索引 + 变更监控）、
   walk.rs（回退）、store.rs（SQLite oracle，feature `sqlite` 门控）、query.rs（查询语言）、
   indexer.rs（mft→usn→walk 编排）、monitor.rs、server.rs、mem.rs（dump 内存引擎：
-  **v4 + name_offs/path_offs 加速段 + 整 arena 单遍 SIMD 扫描**）、dupes.rs、main.rs（CLI）
+  **v4 + name_offs/path_offs 加速段 + 整 arena 单遍 SIMD 扫描**）、du.rs（磁盘占用
+  聚合：subtree_ids 边界感知枚举 + FRN 去重 + 祖先 roll-up）、dupes.rs、main.rs（CLI）
 - 产物 `target-gnu\release\fer.exe`；默认索引库 `%LOCALAPPDATA%\file-engine-rust\index.db`
 - **在役稳定备份** `stable\fer.exe`（gitignored 二进制 + `stable\README.md` 记录来源
   commit/hash/dump 版本）；大改前先更新备份再动代码
@@ -124,6 +125,11 @@ cargo test --test live_volume -- --ignored --nocapture       # 真实卷（管�
   （bitmap 长度不是扇区倍数 → error 87）——读取长度按扇区向上取整再 truncate
   ③MftScanner 持有裸 HANDLE（!Sync），并行闭包只许拷入 record_size/sector_size 等
   几何参数，不许捕获 &self
+- `parent:`/`path:` 是**朴素前缀**（`parent:D:\proj` 会误匹配 `D:\proj2`，README 已明示）；
+  **边界感知枚举用 `MemIndex::subtree_ids`**（du.rs 使用；前缀需 caller 折叠小写，
+  尾分隔符内部 trim）。改 parent: 语义前先看 README 契约与 du 测试
+- **du 聚合**：FRN 键置顶位（`frn | 1<<63`）与无 FRN 条目的 entry-id 键（<2^32）不冲突；
+  文件计入全部祖先目录（前缀在 dir_map 中命中才归桶，卷根隐式）；逻辑大小不含分配簇
 - 本仓库有 git（commit 节点：基线/测试全绿/真实卷全绿/性能优化/内存引擎/dupes/极致性能），
   改动前先看 `git log`
 
@@ -135,6 +141,8 @@ cargo test --test live_volume -- --ignored --nocapture       # 真实卷（管�
 .\target-gnu\release\fer.exe index --volumes D
 .\target-gnu\release\fer.exe serve
 .\target-gnu\release\fer.exe upgrade   # 老 dump 免管理员迁移到 v5（重建 trigram 段）
+.\target-gnu\release\fer.exe du "D:\Kita-Tools" --top 20        # 磁盘占用聚合
+.\target-gnu\release\fer.exe du "D:\" --depth 1 --top 10 --json # 整卷顶层
 ```
 
 查询语言、HTTP API 契约、性能数据：见 README.md（以 README 为准，本文件只是速查）。

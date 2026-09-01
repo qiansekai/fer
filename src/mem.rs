@@ -693,6 +693,41 @@ impl MemIndex {
             .map(|&i| i as usize)
     }
 
+    /// Boundary-aware subtree enumeration: ids of every entry whose path is
+    /// `prefix_lc` itself or below it (case-insensitive, component boundary
+    /// respected — `d:\proj` matches `d:\proj\src` but never `d:\proj2`).
+    /// The caller must lower the prefix (ASCII-CI is the engine-wide
+    /// contract); trailing separators are tolerated (`D:\` → `d:`).
+    pub fn subtree_ids(&self, prefix_lc: &[u8]) -> Vec<u32> {
+        let prefix_lc = trim_seps(prefix_lc);
+        if prefix_lc.is_empty() {
+            return Vec::new();
+        }
+        // The naive CI prefix range over `by_path` is a superset of the
+        // boundary-correct subtree; filter each candidate with a cheap
+        // component-boundary check (next byte after the prefix must be a
+        // separator or the path must end exactly at the prefix).
+        let lo = self.by_path.partition_point(|&i| {
+            ci_cmp(path_of(&self.entries, &self.paths, i), prefix_lc) == Ordering::Less
+        });
+        let hi = self.by_path.partition_point(|&i| {
+            let p = path_of(&self.entries, &self.paths, i);
+            ci_cmp(p, prefix_lc) == Ordering::Less || ci_starts_with(p, prefix_lc)
+        });
+        let mut out: Vec<u32> = self.by_path[lo..hi]
+            .iter()
+            .filter(|&&i| {
+                let p = path_of(&self.entries, &self.paths, i);
+                p.len() == prefix_lc.len()
+                    || p[prefix_lc.len()] == b'\\'
+                    || p[prefix_lc.len()] == b'/'
+            })
+            .map(|&i| self.entries[i as usize].id)
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
     pub fn memory_bytes(&self) -> usize {
         self.entries.len() * std::mem::size_of::<Entry>()
             + self.paths.len()
@@ -1490,6 +1525,14 @@ fn ci_cmp(a: &[u8], b: &[u8]) -> Ordering {
 
 fn ci_starts_with(hay: &[u8], needle: &[u8]) -> bool {
     hay.len() >= needle.len() && ci_cmp(&hay[..needle.len()], needle) == Ordering::Equal
+}
+
+/// Strip trailing path separators from a byte slice (`D:\` → `D:`).
+fn trim_seps(mut s: &[u8]) -> &[u8] {
+    while matches!(s.last(), Some(b'\\') | Some(b'/')) {
+        s = &s[..s.len() - 1];
+    }
+    s
 }
 
 /// Term-evaluation result: borrowed when the term maps directly onto a
