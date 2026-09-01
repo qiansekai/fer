@@ -8,11 +8,11 @@
 | 项 | 值 |
 |---|---|
 | 文件 | `stable\fer.exe` |
-| SHA256 | `BE3622429C46B593E1824F9055047F17190B6B4D87FCD1242B1F70AACD4153B7` |
-| 备份时间 | 2026-09-01（trigram v5 轮完成后） |
-| 来源 commit | `6c27bd1` 之后（v5 trigram + `fer upgrade`，正式 commit 见 git log） |
+| SHA256 | `EA328CD80C31BCBE0694442FF126CE4A0AA1F5F7CCAA6CF5F8C111BFF912FB88` |
+| 备份时间 | 2026-09-01（构建层优化轮完成后，commit `ae9a33c`） |
+| 来源 commit | `ae9a33c`（bitmap 跳读 + 并行解析 + trigram 三遍构建） |
 | dump 格式 | **FERIDX01 v5**（trigram 倒排段；兼容加载 v3/v4） |
-| 已知性能 | serve 稳态：子串 0-23ms、CJK 2 字 0-1ms、路径子串 90-135ms、正则 4ms、glob 9-134ms |
+| 已知性能 | 查询 serve 稳态子串 0-23ms/CJK 0-1ms；构建 7.9s/峰值 RSS 1.4GB |
 
 ## 回退方法
 
