@@ -64,6 +64,114 @@ pub fn is_elevated() -> bool {
     ok != 0 && elevated.TokenIsElevated != 0
 }
 
+/// Relaunch this process elevated via the UAC consent prompt (ShellExecuteW
+/// "runas", same arguments and working directory). On approval the elevated
+/// child takes over and this call never returns (the original process exits
+/// 0). It returns Ok only when elevation was declined or unavailable, so the
+/// caller can fall back to an instructive error. Requires an interactive
+/// desktop — from a service context (e.g. `fer serve` rescan) this fails and
+/// the caller reports it instead of prompting.
+pub fn try_self_elevate() -> anyhow::Result<()> {
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let wide0 = |s: &str| -> Vec<u16> { s.encode_utf16().chain(Some(0)).collect() };
+    let mut args = std::env::args_os();
+    let exe = args.next().unwrap_or_default();
+    let exe_w = wide0(&exe.to_string_lossy());
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| wide0(&p.to_string_lossy()))
+        .unwrap_or_default();
+    let mut params: Vec<u16> = Vec::new();
+    for (i, a) in args.enumerate() {
+        if i > 0 {
+            params.push(b' ' as u16);
+        }
+        let w: Vec<u16> = a.to_string_lossy().encode_utf16().collect();
+        params.extend(quote_win_arg(&w));
+    }
+    params.push(0);
+    let rc = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            wide0("runas").as_ptr(),
+            exe_w.as_ptr(),
+            if params.len() > 1 { params.as_ptr() } else { std::ptr::null() },
+            if cwd.is_empty() { std::ptr::null() } else { cwd.as_ptr() },
+            SW_SHOWNORMAL,
+        )
+    } as u32;
+    if rc > 32 {
+        // The elevated child re-runs this command line; it is the new owner.
+        std::process::exit(0);
+    }
+    if rc == 1223 {
+        anyhow::bail!(
+            "elevation request cancelled — re-run from an elevated terminal, or pass \
+             --method walk explicitly to accept a degraded index"
+        );
+    }
+    anyhow::bail!(
+        "could not request elevation (ShellExecuteW error {rc}) — re-run from an elevated \
+         terminal, or pass --method walk explicitly to accept a degraded index"
+    );
+}
+
+/// Quote one command-line argument per the Windows C-runtime rules (quote
+/// when it contains spaces/tabs/quotes or is empty; backslashes before a
+/// quote or the closing quote are doubled).
+fn quote_win_arg(arg: &[u16]) -> Vec<u16> {
+    let sp = b' ' as u16;
+    let tab = b'\t' as u16;
+    let q = b'"' as u16;
+    let bs = b'\\' as u16;
+    let needs_quote = arg.is_empty() || arg.iter().any(|c| *c == sp || *c == tab || *c == q);
+    if !needs_quote {
+        return arg.to_vec();
+    }
+    let mut out = Vec::with_capacity(arg.len() + 2);
+    out.push(q);
+    let mut backslashes = 0usize;
+    for &c in arg {
+        if c == bs {
+            backslashes += 1;
+        } else if c == q {
+            out.extend(std::iter::repeat_n(bs, backslashes * 2 + 1));
+            out.push(q);
+            backslashes = 0;
+        } else {
+            out.extend(std::iter::repeat_n(bs, backslashes));
+            out.push(c);
+            backslashes = 0;
+        }
+    }
+    out.extend(std::iter::repeat_n(bs, backslashes * 2));
+    out.push(q);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::quote_win_arg;
+
+    fn u16s(s: &str) -> Vec<u16> {
+        s.encode_utf16().collect()
+    }
+
+    #[test]
+    fn win_arg_quoting() {
+        assert_eq!(quote_win_arg(&u16s("plain")), u16s("plain"));
+        assert_eq!(quote_win_arg(&u16s("has space")), u16s("\"has space\""));
+        assert_eq!(quote_win_arg(&u16s("")), u16s("\"\""));
+        assert_eq!(quote_win_arg(&u16s(r#"a"b"#)), u16s(r#""a\"b""#));
+        // backslashes alone need no quoting…
+        assert_eq!(quote_win_arg(&u16s(r"trail\")), u16s(r"trail\"));
+        // …but when quoting IS needed, a trailing backslash is doubled
+        assert_eq!(quote_win_arg(&u16s(r"sp ace\")), u16s(r#""sp ace\\""#));
+    }
+}
+
 /// Per-entry metadata flowing through the index pipeline.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EntryMeta {
