@@ -5,11 +5,13 @@
 //! * `walk`    — plain directory-walk fallback (no admin required)
 //! * `query`   — filter query language (`ext: size: dm: parent:` …)
 //! * `mem`     — FERIDX01 dump engine: mmap zero-copy, all queries in memory
+//! * `du`      — directory size aggregation (WizTree-style totals from the dump)
 //! * `monitor` — USN journal polling to keep the index live
 //! * `server`  — HTTP API (axum) with a minimal web UI
 //! * `store`   — SQLite + FTS5 (feature `sqlite`, dev/test oracle only —
 //!   production queries never touch it)
 
+pub mod du;
 pub mod dupes;
 pub mod indexer;
 pub mod mem;
