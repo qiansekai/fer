@@ -39,6 +39,7 @@ pub async fn serve(addr: &str, mem: MemIndex, db: &std::path::Path) -> Result<()
         .route("/", get(index_page))
         .route("/api/health", get(health))
         .route("/api/search", get(search))
+        .route("/api/du", get(du))
         .route("/api/stats", get(stats))
         .route("/api/rescan", post(rescan))
         .with_state(state);
@@ -91,6 +92,37 @@ async fn search(State(st): State<AppState>, Query(q): Query<SearchQuery>) -> Jso
             "took_ms": t.elapsed().as_millis(),
             "hits": hits,
         })),
+        Err(e) => Json(json!({ "ok": false, "error": e.to_string() })),
+    }
+}
+
+#[derive(Deserialize)]
+struct DuQuery {
+    path: String,
+    depth: Option<usize>,
+    top: Option<usize>,
+}
+
+/// WizTree-style directory size aggregation from the in-memory index.
+async fn du(State(st): State<AppState>, Query(q): Query<DuQuery>) -> Json<Value> {
+    let t = std::time::Instant::now();
+    // Bind the Arc clone to a local first: the whole-volume scan can take
+    // ~1s, so it runs off the executor via spawn_blocking.
+    let mem = st.mem.read().unwrap().clone();
+    let path = q.path.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        crate::du::scan(&mem, &path, q.depth, q.top.unwrap_or(20))
+    })
+    .await;
+    match outcome {
+        Ok(Ok(report)) => {
+            let mut v = serde_json::to_value(&report).unwrap_or_default();
+            let obj = v.as_object_mut().expect("report serializes to an object");
+            obj.insert("ok".to_string(), json!(true));
+            obj.insert("took_ms".to_string(), json!(t.elapsed().as_millis()));
+            Json(v)
+        }
+        Ok(Err(e)) => Json(json!({ "ok": false, "error": e.to_string() })),
         Err(e) => Json(json!({ "ok": false, "error": e.to_string() })),
     }
 }

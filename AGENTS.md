@@ -128,8 +128,12 @@ cargo test --test live_volume -- --ignored --nocapture       # 真实卷（管�
 - `parent:`/`path:` 是**朴素前缀**（`parent:D:\proj` 会误匹配 `D:\proj2`，README 已明示）；
   **边界感知枚举用 `MemIndex::subtree_ids`**（du.rs 使用；前缀需 caller 折叠小写，
   尾分隔符内部 trim）。改 parent: 语义前先看 README 契约与 du 测试
-- **du 聚合**：FRN 键置顶位（`frn | 1<<63`）与无 FRN 条目的 entry-id 键（<2^32）不冲突；
-  文件计入全部祖先目录（前缀在 dir_map 中命中才归桶，卷根隐式）；逻辑大小不含分配簇
+- **du 聚合（v2 并行版）**：FRN 键置顶位（`frn | 1<<63`）与无 FRN 条目的 entry-id 键（<2^32）
+  不冲突；目录表 = FNV-1a 折叠哈希预筛 + `ci_eq` 精确校验（哈希碰撞零风险）；增量哈希遍历时
+  **目录前缀不含分隔符本身**（查表用 `&raw[..i-1]` 配处理当前字节前的 `before` 哈希——
+  血案：把分隔符算进前缀导致与目录键全部失配、children 全空）；聚合 = 连续均分块 scoped
+  线程 + 稠密 per-dir 原子数组（无 merge；**按一级目录分桶会失效**——单目录占 87% 文件时
+  一个线程单扛全部查找）；逻辑大小不含分配簇
 - 本仓库有 git（commit 节点：基线/测试全绿/真实卷全绿/性能优化/内存引擎/dupes/极致性能），
   改动前先看 `git log`
 

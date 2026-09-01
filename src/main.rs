@@ -294,9 +294,11 @@ fn main() -> Result<()> {
             let took = t.elapsed().as_millis();
             if cli.json {
                 let mut v = serde_json::to_value(&report)?;
-                v.as_object_mut()
-                    .expect("report serializes to an object")
-                    .insert("took_ms".to_string(), json!(took));
+                let obj = v
+                    .as_object_mut()
+                    .expect("report serializes to an object");
+                obj.insert("ok".to_string(), json!(true));
+                obj.insert("took_ms".to_string(), json!(took));
                 print_json(v)?;
             } else {
                 println!(
