@@ -297,8 +297,12 @@ serve 稳态（引擎侧 took_ms，预热线程 + TTL 缓存）：`ext:rs` 0ms�
 
 ## 已知限制 / TODO
 
-- 路径子串仍是最大慢点（serve 稳态 ~92ms @665 万条）：trigram 段只覆盖文件名，
-  路径走整 arena 扫描——待 v7 path trigram（内存代价 ~+500MB 或 posting 压缩）
+- 路径子串是全库唯一「硬扫内存」的查询（serve 稳态 ~92ms @665 万条）：trigram 段
+  只覆盖文件名，路径只能整 arena 单遍 memchr2（~600MB paths arena，实测 ~6.5GB/s，
+  已近单线程内存带宽实用上限；CLI 含 mmap 冷页税 ~280ms）。**低优先级、暂不实施**：
+  单次 92ms 人用无感、路径子串查询频率低；根治需 v7 path trigram（预计 5-15ms，
+  代价 dump +~500MB 或 posting 压缩 +~150MB、构建 +~8s），等出现 agent 高频按路径
+  搜索场景或做 v7 时顺手带上
 - 弱字面量且非锚定结尾的 glob（`a?c*`）仍走 arena seed 扫描 + 逐候选验证
   （~236ms，候选 340 万）
 - 索引 = dump 快照 + monitor 增量；monitor 不在线时文件变动不反映（下次
