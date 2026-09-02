@@ -68,6 +68,11 @@ cargo test --test live_volume -- --ignored --nocapture       # 真实卷（管�
 
 ## 踩过的坑（勿重蹈）
 
+- **写 dump 前必须建父目录**（2026-09-02 修复）：新机器 `%LOCALAPPDATA%\file-engine-rust`
+  不存在时 `File::create` 报「系统找不到指定的路径」——血案是扫完 79 万文件才在 save 时炸。
+  `MemIndex::save` 内置 `create_dir_all(parent)`（覆盖 index/monitor/upgrade/rescan 所有
+  调用点）+ main.rs Index 分支扫描前预建（fail fast 不白扫）；回归测试
+  `save_creates_missing_parent_dirs`
 - `FSCTL_GET_NTFS_VOLUME_DATA` 的 `MftStartLcn` 是**簇号**（×bytes_per_cluster），不是扇区号
 - USN_RECORD_V3 的 FRN 是 16 字节 FILE_ID_128（父 FRN 在偏移 24）；V2 才是 8 字节
 - `$FILE_NAME` 父引用含序列位，统一 `& 0x0000_FFFF_FFFF_FFFF` 归一化为纯记录号

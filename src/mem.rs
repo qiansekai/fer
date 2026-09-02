@@ -26,7 +26,7 @@ use std::fs::File;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 #[cfg(feature = "sqlite")]
 use rusqlite::Connection;
 
@@ -368,10 +368,18 @@ impl MemIndex {
     pub fn save(&self, path: &Path) -> Result<()> {
         let n = self.entries.len();
         anyhow::ensure!(n <= u32::MAX as usize, "too many entries for the dump format");
+        // The default index dir (%LOCALAPPDATA%\file-engine-rust) does not
+        // exist on a fresh machine — create it (and any missing ancestors)
+        // instead of failing "The system cannot find the path specified".
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating index directory {}", parent.display()))?;
+        }
         let mut tmp = std::ffi::OsString::from(path.as_os_str());
         tmp.push(".tmp");
         let tmp = PathBuf::from(tmp);
-        let file = File::create(&tmp)?;
+        let file = File::create(&tmp)
+            .with_context(|| format!("creating temp dump {}", tmp.display()))?;
         let mut w = BufWriter::with_capacity(1 << 21, file);
         let mut offs = [0u64; SEC + 1];
         w.write_all(&[0u8; HDR_LEN])?; // header placeholder, rewritten below
@@ -2153,6 +2161,26 @@ mod tests {
         assert_eq!(loaded.path_at(idx as usize), r"D:\proj\src\main.rs");
         let q = Query::parse("ext:rs").unwrap();
         assert_eq!(loaded.search(&q), mem.search(&q));
+    }
+
+    #[test]
+    fn save_creates_missing_parent_dirs() {
+        // Regression: fresh machines have no %LOCALAPPDATA%\file-engine-rust —
+        // save() must create the (nested) directory instead of failing with
+        // "The system cannot find the path specified" after a full scan.
+        let mem = build_mem();
+        let dir = tempfile::tempdir().unwrap();
+        let deep = dir.path().join("a").join("b").join("c").join("index.db");
+        let dump = dump_path(&deep);
+        mem.save(&dump).unwrap();
+        assert!(dump.exists());
+        // roundtrip still works through the freshly created dir
+        let loaded = MemIndex::load_dump(&dump).unwrap();
+        assert_eq!(loaded.len(), mem.len());
+        // and the stray .tmp file is gone (renamed into place)
+        let mut tmp = std::ffi::OsString::from(dump.as_os_str());
+        tmp.push(".tmp");
+        assert!(!PathBuf::from(tmp).exists());
     }
 
     #[test]
