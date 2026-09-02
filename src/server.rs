@@ -180,7 +180,7 @@ li.dir{color:#8ab4f8}
 </style>
 </head>
 <body>
-<h1>⚡ <span>File-Engine-Rust</span> — 毫秒级全盘文件名搜索</h1>
+<h1><span>File-Engine-Rust</span> — 毫秒级全盘文件名搜索</h1>
 <input id="q" placeholder="输入文件名（支持 * ? 通配符），回车或输入即搜…" autofocus>
 <div class="row"><label><input type="checkbox" id="p"> 全路径匹配</label>
 <span id="meta" style="margin-left:1em"></span></div>
