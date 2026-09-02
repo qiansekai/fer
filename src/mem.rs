@@ -2091,11 +2091,11 @@ mod tests {
     fn glob_scan_prefilter() {
         let mut b = MemBuilder::default();
         let meta = EntryMeta { size: 0, mtime: 0, ctime: 0, flags: 0, ..Default::default() };
-        b.push(r"D:\p\foo_bar.rs", meta.clone()); // id 0: "*foo*bar*" ✓
+        b.push(r"D:\p\foo_bar.rs", meta.clone()); // id 0: "*foo*bar*" match
         b.push(r"D:\p\bar_foo.txt", meta.clone()); // id 1: order wrong
-        b.push(r"D:\p\xabc", meta.clone()); // id 2: "a?c" ✓ (ends abc)
-        b.push(r"D:\p\axc", meta.clone()); // id 3: "a?c" ✓ (ends axc)
-        b.push(r"D:\p\abc.txt", meta.clone()); // id 4: "a?c" ✗ (ends txt)
+        b.push(r"D:\p\xabc", meta.clone()); // id 2: "a?c" match (ends abc)
+        b.push(r"D:\p\axc", meta.clone()); // id 3: "a?c" match (ends axc)
+        b.push(r"D:\p\abc.txt", meta.clone()); // id 4: "a?c" no match (ends txt)
         let mem = b.finish();
 
         let q = Query::parse("*foo*bar*").unwrap();

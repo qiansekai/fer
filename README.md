@@ -6,26 +6,26 @@
 
 ## 特性
 
-- ⚡ **完整 MFT 解析**：直读 NTFS `$MFT`（runlist + USA fixup + `$FILE_NAME` 全属性），
+- **完整 MFT 解析**：直读 NTFS `$MFT`（runlist + USA fixup + `$FILE_NAME` 全属性），
   一次拿到：**全部硬链接别名**（`System32\ntdll.dll` → WinSxS 本体也能搜到）、
   真实大小、修改/创建时间、hidden/system/readonly/reparse 标志；
   **$MFT::$BITMAP 跳读**（已删除记录区段不读不解析，40-55% I/O 削减）+
   **分片并行解析**（scoped 线程池 + 按序提交，构建 12.3s → 7.9s）；
   **降级必须显式**：auto/mft/usn 非提权直接拒绝（`--method walk` 才是显式降级选项）
-- 🧠 **低内存**：紧凑数组 + 流式 DFS 构建，全盘 400 万条峰值内存 ~170 MB
-- 🚀 **毫秒级搜索**：全查询走内存引擎——子串（memchr SIMD 扫描）、`*.rs` 后缀（反向列二分）、
+- **低内存**：紧凑数组 + 流式 DFS 构建，全盘 400 万条峰值内存 ~170 MB
+- **毫秒级搜索**：全查询走内存引擎——子串（memchr SIMD 扫描）、`*.rs` 后缀（反向列二分）、
   通配符、大小写不敏感、CJK
-- 🔍 **过滤查询语言**：`ext: size: dm: dc: type: hidden: parent: path: name:` + 取反（`!`）
-- 🔄 **实时监控**：`fer monitor` 轮询 USN 日志增量更新（删除按 FRN 直删）
-- 🌐 **HTTP API + 网页 UI** + **CLI --json**（稳定 JSON 输出，面向 agent）
-- 🧠 **Everything 架构**：`fer index` 一次性把全盘扫进内存引擎并写成
+- **过滤查询语言**：`ext: size: dm: dc: type: hidden: parent: path: name:` + 取反（`!`）
+- **实时监控**：`fer monitor` 轮询 USN 日志增量更新（删除按 FRN 直删）
+- **HTTP API + 网页 UI** + **CLI --json**（稳定 JSON 输出，面向 agent）
+- **Everything 架构**：`fer index` 一次性把全盘扫进内存引擎并写成
   **FERIDX01 dump**（~1.2GB）；查询全靠内存的排序数组 + **整 arena 单遍 SIMD 扫描**
   （子串/正则走 memchr 大缓冲扫 + `name_offs`/`path_offs` 游标映射）+
   **trigram 倒排段**（≥3 字节子串 O(posting) 候选），dump 用
   **mmap 零拷贝加载**（serve 启动 ~135ms，CLI 全查询 17-336ms）
-- 🔄 **USN 实时监控**（需管理员）：monitor 常驻内存增量追平 + 防抖写回 dump，
+- **USN 实时监控**（需管理员）：monitor 常驻内存增量追平 + 防抖写回 dump，
   崩溃后从 USN 日志回放，无需重建
-- ✅ 测试闭环：单元 + 端到端 + 真实卷（`#[ignore]`）+ SQLite 交叉验证
+- 测试闭环：单元 + 端到端 + 真实卷（`#[ignore]`）+ SQLite 交叉验证
   （store.rs 保留为测试参照 oracle，不进生产路径）
 
 ## 构建
@@ -282,8 +282,8 @@ posting 交集得候选超集，再逐候选 memmem 校验。glob 匹配编译�
 | | File-Engine-Core (Java) | Everything | File-Engine-Rust |
 |---|---|---|---|
 | 索引 | C++ JNI 读 USN | 完整 MFT 解析 | **完整 MFT 解析（mft.rs）** |
-| 硬链接别名 | ❌ | ✅ | ✅ |
-| 大小/时间/属性 | 部分 | ✅ | ✅ |
+| 硬链接别名 | 无 | 有 | 有 |
+| 大小/时间/属性 | 部分 | 有 | 有 |
 | 存储 | SQLite | 内存索引 | **FERIDX01 dump 内存引擎（mmap 零拷贝）** |
 | 搜索 | HTTP API | GUI + IPC | CLI + HTTP + 网页 |
 | 监控 | fileMonitor | USN + RDCW | USN 轮询 |
