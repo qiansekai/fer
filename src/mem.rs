@@ -25,6 +25,7 @@ use std::cmp::Ordering;
 use std::fs::File;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail};
 #[cfg(feature = "sqlite")]
@@ -178,6 +179,16 @@ impl MemBuilder {
 pub struct MemIndex {
     _keep: Keep,
     sec: Sections,
+    /// True when entry ids are exactly 0..n (dump/owned builds): `hits()`
+    /// then indexes entries directly instead of binary-searching per hit.
+    /// False for the SQLite oracle path (1-based rowids, possible gaps).
+    dense: bool,
+    /// Lazily computed byte histograms of the name/path arenas — the glob
+    /// prefilter picks the rarest literal byte as its seed so 1-byte-run
+    /// patterns (`a?c`) scan the fewest candidates. Computed once per process
+    /// on first use.
+    name_freq: OnceLock<[u32; 256]>,
+    path_freq: OnceLock<[u32; 256]>,
 }
 
 /// What keeps the section memory alive. `Owned` holds the Vecs produced by
@@ -254,7 +265,10 @@ unsafe impl<T: Send + Sync> Sync for View<T> {}
 
 impl<T> View<T> {
     fn from_slice(s: &[T]) -> Self {
-        View { ptr: s.as_ptr(), len: s.len() }
+        View {
+            ptr: s.as_ptr(),
+            len: s.len(),
+        }
     }
     fn slice(&self) -> &[T] {
         // SAFETY: the pointer/len were captured from a live allocation (owned
@@ -367,7 +381,10 @@ impl MemIndex {
     /// either leaves the previous dump or no dump at all.
     pub fn save(&self, path: &Path) -> Result<()> {
         let n = self.entries.len();
-        anyhow::ensure!(n <= u32::MAX as usize, "too many entries for the dump format");
+        anyhow::ensure!(
+            n <= u32::MAX as usize,
+            "too many entries for the dump format"
+        );
         // The default index dir (%LOCALAPPDATA%\file-engine-rust) does not
         // exist on a fresh machine — create it (and any missing ancestors)
         // instead of failing "The system cannot find the path specified".
@@ -378,8 +395,8 @@ impl MemIndex {
         let mut tmp = std::ffi::OsString::from(path.as_os_str());
         tmp.push(".tmp");
         let tmp = PathBuf::from(tmp);
-        let file = File::create(&tmp)
-            .with_context(|| format!("creating temp dump {}", tmp.display()))?;
+        let file =
+            File::create(&tmp).with_context(|| format!("creating temp dump {}", tmp.display()))?;
         let mut w = BufWriter::with_capacity(1 << 21, file);
         let mut offs = [0u64; SEC + 1];
         w.write_all(&[0u8; HDR_LEN])?; // header placeholder, rewritten below
@@ -387,9 +404,11 @@ impl MemIndex {
         // Pre-v6 dumps loaded in memory have no alloc section; upgrading them
         // writes the size-fallback approximation (only `fer index` recovers
         // true cluster counts from the $MFT).
-        let alloc_fallback: Option<Vec<u64>> = self.sec.alloc.is_none().then(|| {
-            self.entries.slice().iter().map(|e| e.size).collect()
-        });
+        let alloc_fallback: Option<Vec<u64>> = self
+            .sec
+            .alloc
+            .is_none()
+            .then(|| self.entries.slice().iter().map(|e| e.size).collect());
         let alloc_bytes: &[u64] = match &self.sec.alloc {
             Some(a) => a.slice(),
             None => alloc_fallback.as_deref().expect("fallback built above"),
@@ -520,13 +539,15 @@ impl MemIndex {
             path.display()
         );
         let view = |i: usize| -> &[u8] { &buf[offs[i] as usize..offs[i + 1] as usize] };
-        let view_at = |start: u64, len: usize| -> &[u8] {
-            &buf[start as usize..start as usize + len]
-        };
+        let view_at =
+            |start: u64, len: usize| -> &[u8] { &buf[start as usize..start as usize + len] };
         // SAFETY (view_of): each section starts 8-byte aligned; Entry/u32/u8
         // have no invalid bit patterns.
         fn view_of<T>(b: &[u8]) -> View<T> {
-            View { ptr: b.as_ptr().cast::<T>(), len: b.len() / std::mem::size_of::<T>() }
+            View {
+                ptr: b.as_ptr().cast::<T>(),
+                len: b.len() / std::mem::size_of::<T>(),
+            }
         }
         let entry_bytes = n * std::mem::size_of::<Entry>();
         let perm_bytes = n * 4;
@@ -604,7 +625,14 @@ impl MemIndex {
             trig_posts,
             alloc,
         };
-        Ok(MemIndex { _keep: Keep::Mapped(MappedData { mmap, aux }), sec })
+        let dense = is_dense(sec.entries.slice());
+        Ok(MemIndex {
+            _keep: Keep::Mapped(MappedData { mmap, aux }),
+            sec,
+            dense,
+            name_freq: OnceLock::new(),
+            path_freq: OnceLock::new(),
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -717,7 +745,9 @@ impl MemIndex {
         if frn == 0 {
             return None;
         }
-        let lo = self.by_frn.partition_point(|&i| self.entries[i as usize].frn < frn);
+        let lo = self
+            .by_frn
+            .partition_point(|&i| self.entries[i as usize].frn < frn);
         self.by_frn
             .get(lo)
             .copied()
@@ -809,8 +839,7 @@ impl MemIndex {
         let evals = |terms: &[Term]| -> Vec<IdSet<'_>> {
             if terms.len() > 1 {
                 std::thread::scope(|s| {
-                    let handles: Vec<_> =
-                        terms.iter().map(|t| s.spawn(|| self.eval(t))).collect();
+                    let handles: Vec<_> = terms.iter().map(|t| s.spawn(|| self.eval(t))).collect();
                     handles
                         .into_iter()
                         .map(|h| h.join().expect("query eval thread panicked"))
@@ -820,20 +849,29 @@ impl MemIndex {
                 terms.iter().map(|t| self.eval(t)).collect()
             }
         };
+        // Intersect in ascending cardinality order: the accumulator stays as
+        // small as possible and galloping intersect turns each step into
+        // O(|small| log |large|) instead of O(|small| + |large|). All term
+        // results are already materialized, so this sort is free.
+        let n = self.entries.len() as u32;
+        let mut include = evals(&q.include);
+        include.sort_by_key(IdSet::cardinality);
         let mut acc: Option<IdSet<'_>> = None;
-        for ids in evals(&q.include) {
+        for ids in include {
             acc = Some(match acc {
                 None => ids,
-                Some(a) => IdSet::Owned(intersect(a.as_slice(), ids.as_slice())),
+                Some(a) => combine_and(a, ids, n),
             });
-            if acc.as_ref().is_some_and(|s| s.as_slice().is_empty()) {
+            if acc.as_ref().is_some_and(IdSet::is_empty) {
                 return Vec::new();
             }
         }
-        let mut acc = acc.unwrap_or_else(|| IdSet::Owned(self.all_ids()));
+        // No include terms → start from everything (a full bitmap: complements
+        // and large subtracts are then near-free).
+        let mut acc = acc.unwrap_or_else(|| IdSet::Bits(Bitset::full(n)));
         for ids in evals(&q.exclude) {
-            acc = IdSet::Owned(subtract(acc.as_slice(), ids.as_slice()));
-            if acc.as_slice().is_empty() {
+            acc = combine_subtract(acc, ids);
+            if acc.is_empty() {
                 break;
             }
         }
@@ -843,13 +881,7 @@ impl MemIndex {
     /// Build full hits for ids (order preserved), capped at `limit`.
     pub fn hits(&self, ids: &[u32], limit: usize) -> Vec<Hit> {
         let mut out = Vec::with_capacity(ids.len().min(limit));
-        for &id in ids.iter().take(limit) {
-            // Binary search rather than id-as-index: dump/mem ids are 0..n
-            // sequential, but the SQL-loaded oracle index carries SQLite
-            // rowids (1-based, possibly with gaps).
-            let Ok(idx) = self.entries.binary_search_by_key(&id, |e| e.id) else {
-                continue;
-            };
+        let push = |out: &mut Vec<Hit>, idx: usize| {
             let e = &self.entries[idx];
             let path = String::from_utf8_lossy(
                 &self.paths[e.path_off as usize..(e.path_off as usize + e.path_len as usize)],
@@ -864,12 +896,67 @@ impl MemIndex {
                 ctime: e.ctime,
                 flags: e.flags,
             });
+        };
+        if self.dense {
+            // Dense ids (dump/mem builds: id == index) → direct indexing, no
+            // binary search per hit.
+            for &id in ids.iter().take(limit) {
+                let idx = id as usize;
+                if idx < self.entries.len() {
+                    push(&mut out, idx);
+                }
+            }
+        } else {
+            // The SQL-loaded oracle index carries SQLite rowids (1-based,
+            // possibly with gaps) → binary search per hit.
+            for &id in ids.iter().take(limit) {
+                let Ok(idx) = self.entries.binary_search_by_key(&id, |e| e.id) else {
+                    continue;
+                };
+                push(&mut out, idx);
+            }
         }
         out
     }
 
     fn all_ids(&self) -> Vec<u32> {
         self.entries.iter().map(|e| e.id).collect()
+    }
+
+    /// Touch one byte per page of every large section so the first real query
+    /// does not pay the mmap page-fault tax. Sequential reads (~1s for a 4M
+    /// entry dump); meant for a low-priority background thread in serve mode.
+    /// CLI single-shot runs skip this — warm-up would cost more than the query.
+    pub fn warm(&self) {
+        fn touch(bytes: &[u8]) {
+            let mut off = 0usize;
+            while off < bytes.len() {
+                // SAFETY: off < bytes.len(), read-only; volatile defeats
+                // dead-load elimination so the page is actually faulted in.
+                unsafe { std::ptr::read_volatile(bytes.as_ptr().add(off)) };
+                off += 4096;
+            }
+        }
+        for s in [
+            pod_bytes(self.entries.slice()),
+            self.paths.slice(),
+            self.names.slice(),
+            self.revs.slice(),
+            pod_bytes(self.by_path.slice()),
+            pod_bytes(self.by_name.slice()),
+            pod_bytes(self.by_rev.slice()),
+            pod_bytes(self.by_size.slice()),
+            pod_bytes(self.by_mtime.slice()),
+            pod_bytes(self.by_ctime.slice()),
+            pod_bytes(self.by_frn.slice()),
+            pod_bytes(self.name_offs.slice()),
+            pod_bytes(self.path_offs.slice()),
+            pod_bytes(self.trigrams.slice()),
+            pod_bytes(self.trig_offs.slice()),
+            pod_bytes(self.trig_posts.slice()),
+        ] {
+            touch(s);
+        }
     }
 
     fn eval(&self, t: &Term) -> IdSet<'_> {
@@ -890,19 +977,19 @@ impl MemIndex {
             }
             Term::NameWild(p) => IdSet::Owned(self.scan_glob(&self.names, p, true)),
             Term::PathWild(p) => IdSet::Owned(self.scan_glob(&self.paths, p, false)),
-            Term::Size { min, max } => IdSet::Owned(self.range_u64(
+            Term::Size { min, max } => IdSet::Bits(self.range_bits(
                 &self.by_size,
                 |e| e.size,
                 min.unwrap_or(0),
                 max.unwrap_or(u64::MAX),
             )),
-            Term::Mtime { min, max } => IdSet::Owned(self.range_i64(
+            Term::Mtime { min, max } => IdSet::Bits(self.range_bits_i64(
                 &self.by_mtime,
                 |e| e.mtime,
                 min.unwrap_or(i64::MIN),
                 max.unwrap_or(i64::MAX),
             )),
-            Term::Ctime { min, max } => IdSet::Owned(self.range_i64(
+            Term::Ctime { min, max } => IdSet::Bits(self.range_bits_i64(
                 &self.by_ctime,
                 |e| e.ctime,
                 min.unwrap_or(i64::MIN),
@@ -925,7 +1012,12 @@ impl MemIndex {
                 if *on {
                     IdSet::Borrowed(list.slice())
                 } else {
-                    IdSet::Owned(self.all_minus(list))
+                    // Complement of a (small) flag list: a full bitmap minus
+                    // the flagged ids — ~0.5ms instead of materializing a
+                    // 4M-entry complement Vec.
+                    let mut bits = Bitset::full(self.entries.len() as u32);
+                    bits.clear_ids(list.slice());
+                    IdSet::Bits(bits)
                 }
             }
             Term::PathPrefix(p) => IdSet::Owned(self.range_by_path_prefix(p.as_bytes())),
@@ -958,28 +1050,10 @@ impl MemIndex {
             return out;
         }
         for e in &self.entries {
-            let name =
-                &self.names[e.name_off as usize..e.name_off as usize + e.name_len as usize];
+            let name = &self.names[e.name_off as usize..e.name_off as usize + e.name_len as usize];
             if re.is_match(name) {
                 out.push(e.id);
             }
-        }
-        out
-    }
-
-    /// All ids minus `list` (both sorted) via one two-pointer sweep — avoids
-    /// materializing the full id array for `!flag:` terms.
-    fn all_minus(&self, list: &[u32]) -> Vec<u32> {
-        let mut out = Vec::new();
-        let mut j = 0;
-        for e in &self.entries {
-            while j < list.len() && list[j] < e.id {
-                j += 1;
-            }
-            if j < list.len() && list[j] == e.id {
-                continue;
-            }
-            out.push(e.id);
         }
         out
     }
@@ -1023,8 +1097,7 @@ impl MemIndex {
             let names = self.names.slice();
             for idx in cands {
                 let e = &self.entries[idx as usize];
-                let name =
-                    &names[e.name_off as usize..e.name_off as usize + e.name_len as usize];
+                let name = &names[e.name_off as usize..e.name_off as usize + e.name_len as usize];
                 if memchr::memmem::find(name, needle).is_some() {
                     out.push(idx);
                 }
@@ -1215,26 +1288,34 @@ impl MemIndex {
         out
     }
 
-    fn range_u64(&self, perm: &[u32], key: impl Fn(&Entry) -> u64, lo: u64, hi: u64) -> Vec<u32> {
+    /// Attribute range as a bitmap: two partition points over the key-sorted
+    /// permutation, then one bit-set per entry in the range — no copy of the
+    /// permutation slice and no re-sort (the old path paid both; ~47ms for
+    /// `dm:thisweek` becomes ~10ms).
+    fn range_bits(&self, perm: &[u32], key: impl Fn(&Entry) -> u64, lo: u64, hi: u64) -> Bitset {
+        let mut bits = Bitset::new(self.entries.len() as u32);
         let a = perm.partition_point(|&i| key(&self.entries[i as usize]) < lo);
         let b = perm.partition_point(|&i| key(&self.entries[i as usize]) < hi);
-        let mut out: Vec<u32> = perm[a..b]
-            .iter()
-            .map(|&i| self.entries[i as usize].id)
-            .collect();
-        out.sort_unstable();
-        out
+        for &i in &perm[a..b] {
+            bits.set(self.entries[i as usize].id);
+        }
+        bits
     }
 
-    fn range_i64(&self, perm: &[u32], key: impl Fn(&Entry) -> i64, lo: i64, hi: i64) -> Vec<u32> {
+    fn range_bits_i64(
+        &self,
+        perm: &[u32],
+        key: impl Fn(&Entry) -> i64,
+        lo: i64,
+        hi: i64,
+    ) -> Bitset {
+        let mut bits = Bitset::new(self.entries.len() as u32);
         let a = perm.partition_point(|&i| key(&self.entries[i as usize]) < lo);
         let b = perm.partition_point(|&i| key(&self.entries[i as usize]) < hi);
-        let mut out: Vec<u32> = perm[a..b]
-            .iter()
-            .map(|&i| self.entries[i as usize].id)
-            .collect();
-        out.sort_unstable();
-        out
+        for &i in &perm[a..b] {
+            bits.set(self.entries[i as usize].id);
+        }
+        bits
     }
 
     /// Glob scan. Three layers, in order:
@@ -1277,7 +1358,72 @@ impl MemIndex {
             out.sort_unstable();
             return out;
         }
-        let seed = longest_literal_run(&tokens);
+        // Anchored-end fast path (`*<seg>` / `<seg>` patterns): a suffix
+        // match on the name is a prefix match on the reversed name — the
+        // `*.rs` trick generalized to `?`. `a?c` drops from a whole-arena
+        // seed scan + per-candidate bit-parallel verify (~200ms) to one
+        // binary-search range over `by_rev` plus a short tail compare.
+        if use_names
+            && prog.anchored_end
+            && let Some(seg) = tokens.rsplit(|t| *t == GTok::Star).next()
+            && let Some(GTok::Lit(last)) = seg.last().copied()
+        {
+            // rev_seg = reversed segment; its first byte is the segment's
+            // LAST byte (`last`), which must be a literal for the by_rev
+            // range to be useful.
+            let rev_seg: Vec<GTok> = seg.iter().rev().copied().collect();
+            let key = [last];
+            let lo = self
+                .by_rev
+                .partition_point(|&i| rev_of(&self.entries, &self.revs, i) < key.as_slice());
+            let hi = self.by_rev.partition_point(|&i| {
+                let r = rev_of(&self.entries, &self.revs, i);
+                r < key.as_slice() || (r.len() >= key.len() && r[0] == last)
+            });
+            for &i in &self.by_rev[lo..hi] {
+                let e = &self.entries[i as usize];
+                let rev = &self.revs[e.rev_off as usize..e.rev_off as usize + e.rev_len as usize];
+                if rev.len() >= rev_seg.len()
+                    && rev_seg.iter().enumerate().all(|(j, t)| match t {
+                        GTok::Lit(b) => rev[j] == *b,
+                        GTok::Any => true,
+                        GTok::Star => unreachable!("segments contain no stars"),
+                    })
+                {
+                    out.push(e.id);
+                }
+            }
+            out.sort_unstable();
+            return out;
+        }
+        let run = longest_literal_run(&tokens);
+        let seed: Vec<u8> = if run.len() >= 2 {
+            run
+        } else if !run.is_empty() {
+            // All runs are 1 byte: every literal byte of the pattern must
+            // appear in any match, so any one of them is a sound superset
+            // filter — seed with the globally rarest byte to minimize the
+            // candidate set (`a?c` seeds 'c', not 'a').
+            let freq = if use_names {
+                self.name_freq
+                    .get_or_init(|| arena_byte_freq(self.names.slice()))
+            } else {
+                self.path_freq
+                    .get_or_init(|| arena_byte_freq(self.paths.slice()))
+            };
+            let rarest = tokens
+                .iter()
+                .filter_map(|t| match t {
+                    GTok::Lit(b) => Some(b),
+                    _ => None,
+                })
+                .min_by_key(|b| freq[**b as usize])
+                .copied()
+                .expect("run non-empty implies a literal token");
+            vec![rarest]
+        } else {
+            Vec::new()
+        };
         let cands: Vec<u32> = if seed.is_empty() {
             (0..self.entries.len() as u32).collect()
         } else {
@@ -1333,19 +1479,13 @@ fn finalize(
     let mut trig: Option<(Vec<u32>, Vec<u32>, Vec<u32>)> = None;
     std::thread::scope(|s| {
         s.spawn(|| {
-            by_path.sort_unstable_by(|&a, &b| {
-                ci_cmp(path_of(e, &paths, a), path_of(e, &paths, b))
-            });
+            by_path.sort_unstable_by(|&a, &b| ci_cmp(path_of(e, &paths, a), path_of(e, &paths, b)));
         });
         s.spawn(|| {
-            by_name.sort_unstable_by(|&a, &b| {
-                name_of(e, &names, a).cmp(name_of(e, &names, b))
-            });
+            by_name.sort_unstable_by(|&a, &b| name_of(e, &names, a).cmp(name_of(e, &names, b)));
         });
         s.spawn(|| {
-            by_rev.sort_unstable_by(|&a, &b| {
-                rev_of(e, &revs, a).cmp(rev_of(e, &revs, b))
-            });
+            by_rev.sort_unstable_by(|&a, &b| rev_of(e, &revs, a).cmp(rev_of(e, &revs, b)));
         });
         s.spawn(|| by_size.sort_unstable_by_key(|&i| e[i as usize].size));
         s.spawn(|| {
@@ -1517,8 +1657,20 @@ impl MemIndex {
             trig_posts: View::from_slice(&o.trig_posts),
             alloc: Some(View::from_slice(&o.alloc)),
         };
-        MemIndex { _keep: Keep::Owned(o), sec }
+        let dense = is_dense(&o.entries);
+        MemIndex {
+            _keep: Keep::Owned(o),
+            sec,
+            dense,
+            name_freq: OnceLock::new(),
+            path_freq: OnceLock::new(),
+        }
     }
+}
+
+/// True when entry ids are exactly 0..n (id == index for every entry).
+fn is_dense(entries: &[Entry]) -> bool {
+    entries.iter().enumerate().all(|(i, e)| e.id == i as u32)
 }
 
 /// Byte view of a POD slice — Entry/u32/u8 are plain integers with no invalid
@@ -1553,11 +1705,7 @@ fn path_of<'a>(entries: &'a [Entry], paths: &'a [u8], i: u32) -> &'a [u8] {
 
 #[inline]
 fn fold(b: u8) -> u8 {
-    if b.is_ascii_uppercase() {
-        b + 32
-    } else {
-        b
-    }
+    if b.is_ascii_uppercase() { b + 32 } else { b }
 }
 
 /// Folded comparison of `hay[pos..pos+len]` against the (lowercased) needle.
@@ -1594,43 +1742,268 @@ fn trim_seps(mut s: &[u8]) -> &[u8] {
 }
 
 /// Term-evaluation result: borrowed when the term maps directly onto a
-/// precomputed id list (no copy), owned when computed. Multi-term queries
-/// then pay one intersect allocation instead of a full-list copy per term.
+/// precomputed id list (no copy), owned when computed, or a dense bitmap for
+/// high-cardinality sets (attribute ranges, complements, big intersections).
 enum IdSet<'a> {
     Borrowed(&'a [u32]),
     Owned(Vec<u32>),
+    Bits(Bitset),
 }
 
 impl IdSet<'_> {
-    fn as_slice(&self) -> &[u32] {
+    fn cardinality(&self) -> usize {
         match self {
-            IdSet::Borrowed(s) => s,
-            IdSet::Owned(v) => v,
+            IdSet::Borrowed(s) => s.len(),
+            IdSet::Owned(v) => v.len(),
+            IdSet::Bits(b) => b.ones as usize,
+        }
+    }
+    fn is_empty(&self) -> bool {
+        match self {
+            IdSet::Borrowed(s) => s.is_empty(),
+            IdSet::Owned(v) => v.is_empty(),
+            IdSet::Bits(b) => b.ones == 0,
         }
     }
     fn into_owned(self) -> Vec<u32> {
         match self {
             IdSet::Borrowed(s) => s.to_vec(),
             IdSet::Owned(v) => v,
+            IdSet::Bits(b) => b.to_vec(),
         }
     }
 }
 
-fn intersect(a: &[u32], b: &[u32]) -> Vec<u32> {
-    let mut out = Vec::with_capacity(a.len().min(b.len()));
-    let (mut i, mut j) = (0, 0);
-    while i < a.len() && j < b.len() {
-        match a[i].cmp(&b[j]) {
-            Ordering::Less => i += 1,
-            Ordering::Greater => j += 1,
-            Ordering::Equal => {
-                out.push(a[i]);
-                i += 1;
-                j += 1;
-            }
+/// Dense bitmap over entry ids — 512KB per 4.17M entries. High-cardinality
+/// intermediates live as bitmaps: O(1) set/test, cheap invert/AND/NOT, and
+/// materialization allocates only the survivors.
+struct Bitset {
+    words: Vec<u64>,
+    /// Bit capacity (entry count); the tail word is masked beyond this.
+    cap: u32,
+    ones: u64,
+}
+
+impl Bitset {
+    fn new(cap: u32) -> Self {
+        Bitset {
+            words: vec![0u64; cap.div_ceil(64) as usize],
+            cap,
+            ones: 0,
         }
     }
-    out
+
+    fn full(cap: u32) -> Self {
+        let w = cap.div_ceil(64) as usize;
+        let mut words = vec![u64::MAX; w];
+        let rem = cap as usize % 64;
+        if rem != 0 {
+            words[w - 1] = (1u64 << rem) - 1;
+        }
+        let ones = if rem != 0 {
+            ((w - 1) as u64) * 64 + rem as u64
+        } else {
+            (w as u64) * 64
+        };
+        Bitset { words, cap, ones }
+    }
+
+    #[inline]
+    fn set(&mut self, id: u32) {
+        let w = (id >> 6) as usize;
+        let m = 1u64 << (id & 63);
+        if self.words[w] & m == 0 {
+            self.ones += 1;
+        }
+        self.words[w] |= m;
+    }
+
+    #[inline]
+    fn clear(&mut self, id: u32) {
+        let w = (id >> 6) as usize;
+        let m = 1u64 << (id & 63);
+        if self.words[w] & m != 0 {
+            self.ones -= 1;
+        }
+        self.words[w] &= !m;
+    }
+
+    #[inline]
+    fn test(&self, id: u32) -> bool {
+        let w = (id >> 6) as usize;
+        self.words[w] & (1u64 << (id & 63)) != 0
+    }
+
+    fn and_with(&mut self, other: &Bitset) {
+        debug_assert_eq!(self.cap, other.cap);
+        let mut ones = 0u64;
+        for (a, b) in self.words.iter_mut().zip(other.words.iter()) {
+            *a &= *b;
+            ones += a.count_ones() as u64;
+        }
+        self.ones = ones;
+    }
+
+    fn and_not(&mut self, other: &Bitset) {
+        debug_assert_eq!(self.cap, other.cap);
+        let mut ones = 0u64;
+        for (a, b) in self.words.iter_mut().zip(other.words.iter()) {
+            *a &= !*b;
+            ones += a.count_ones() as u64;
+        }
+        self.ones = ones;
+    }
+
+    /// Keep only ids present in this bitmap; `ids` is already ascending, so
+    /// the result stays ascending with no re-sort.
+    fn filter_sorted(&self, ids: &[u32]) -> Vec<u32> {
+        let mut out = Vec::new();
+        for &id in ids {
+            if self.test(id) {
+                out.push(id);
+            }
+        }
+        out
+    }
+
+    fn clear_ids(&mut self, ids: &[u32]) {
+        for &id in ids {
+            self.clear(id);
+        }
+    }
+
+    fn to_vec(&self) -> Vec<u32> {
+        let mut out = Vec::with_capacity(self.ones as usize);
+        for (wi, &w) in self.words.iter().enumerate() {
+            if w == 0 {
+                continue;
+            }
+            let base = (wi as u32) << 6;
+            let mut bits = w;
+            while bits != 0 {
+                let b = bits.trailing_zeros();
+                out.push(base + b);
+                bits &= bits - 1;
+            }
+        }
+        out
+    }
+}
+
+/// Cardinality above which sorted-list intersection is beaten by bitmap
+/// conversion (promote the smaller side to a bitmap, filter the larger one).
+const BIG_SET: usize = 1 << 19;
+
+/// AND-combine two id sets, choosing the cheapest representation per step.
+/// Results are always ascending.
+fn combine_and(a: IdSet<'_>, b: IdSet<'_>, n: u32) -> IdSet<'static> {
+    use IdSet::*;
+    match (a, b) {
+        (Borrowed(x), Borrowed(y)) => and_sorted(x, y, n),
+        (Owned(x), Borrowed(y)) => and_sorted(&x, y, n),
+        (Borrowed(x), Owned(y)) => and_sorted(x, &y, n),
+        (Owned(x), Owned(y)) => and_sorted(&x, &y, n),
+        (Bits(bits), Borrowed(y)) | (Borrowed(y), Bits(bits)) => Owned(bits.filter_sorted(y)),
+        (Bits(bits), Owned(y)) | (Owned(y), Bits(bits)) => Owned(bits.filter_sorted(&y)),
+        (Bits(mut a), Bits(b)) => {
+            a.and_with(&b);
+            Bits(a)
+        }
+    }
+}
+
+/// Sorted×sorted AND: galloping merge for small sides; for two big sides,
+/// promote the smaller one to a bitmap and filter the larger — no O(n+m)
+/// sweep over multi-million-id arrays.
+fn and_sorted(a: &[u32], b: &[u32], n: u32) -> IdSet<'static> {
+    let (small, large) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    if small.len() >= BIG_SET {
+        let mut bits = Bitset::new(n);
+        for &x in small {
+            bits.set(x);
+        }
+        IdSet::Owned(bits.filter_sorted(large))
+    } else {
+        IdSet::Owned(intersect(a, b))
+    }
+}
+
+/// Subtract `ids` from `acc` in the cheapest representation.
+fn combine_subtract(acc: IdSet<'_>, ids: IdSet<'_>) -> IdSet<'static> {
+    use IdSet::*;
+    match (acc, ids) {
+        (Bits(mut a), Borrowed(b)) => {
+            a.clear_ids(b);
+            Bits(a)
+        }
+        (Bits(mut a), Owned(b)) => {
+            a.clear_ids(&b);
+            Bits(a)
+        }
+        (Bits(mut a), Bits(b)) => {
+            a.and_not(&b);
+            Bits(a)
+        }
+        (Owned(a), Borrowed(b)) => Owned(subtract(&a, b)),
+        (Borrowed(a), Borrowed(b)) => Owned(subtract(a, b)),
+        (Owned(a), Owned(b)) => Owned(subtract(&a, &b)),
+        (Borrowed(a), Owned(b)) => Owned(subtract(a, &b)),
+        (Borrowed(a), Bits(b)) => Owned(a.iter().copied().filter(|id| !b.test(*id)).collect()),
+        (Owned(a), Bits(b)) => Owned(a.iter().copied().filter(|id| !b.test(*id)).collect()),
+    }
+}
+
+/// Sorted-intersection of two ascending id slices. When the size ratio is
+/// large (>= 8x) it iterates the smaller side and gallops (exponential probe
+/// plus binary search) into the larger one — O(|small| · log |large|) instead
+/// of an O(|small| + |large|) sweep over a multi-million-id set. Both inputs
+/// stay untouched; the caller owns the result.
+fn intersect(a: &[u32], b: &[u32]) -> Vec<u32> {
+    let (small, large) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    if large.len() >= small.len().saturating_mul(8) {
+        let mut out = Vec::with_capacity(small.len());
+        let mut base = 0usize;
+        for &x in small {
+            // Exponential probe while large[lo + step] < x; the guard
+            // `step < large.len() - lo` also prevents usize overflow.
+            let mut lo = base;
+            let mut step = 1usize;
+            while step < large.len() - lo && large[lo + step] < x {
+                step <<= 1;
+            }
+            // lower_bound of x in large[lo .. lo+step]
+            let mut hi = (lo + step).min(large.len());
+            while lo < hi {
+                let mid = (lo + hi) >> 1;
+                if large[mid] < x {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            base = lo;
+            if base < large.len() && large[base] == x {
+                out.push(x);
+                base += 1;
+            }
+        }
+        out
+    } else {
+        let mut out = Vec::with_capacity(small.len());
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < small.len() && j < large.len() {
+            match small[i].cmp(&large[j]) {
+                Ordering::Less => i += 1,
+                Ordering::Greater => j += 1,
+                Ordering::Equal => {
+                    out.push(small[i]);
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+        out
+    }
 }
 
 fn union(a: &[u32], b: &[u32]) -> Vec<u32> {
@@ -1725,7 +2098,10 @@ enum GlobSeg {
     /// each literal folded in, so one table serves lowercase names AND
     /// original-case paths). Large-variant lint muted: the Bit variant is the
     /// overwhelmingly common case and lives on the caller's stack, not the heap.
-    Bit { n: u8, masks: [u64; 256] },
+    Bit {
+        n: u8,
+        masks: [u64; 256],
+    },
     Naive(Vec<GTok>),
 }
 
@@ -1756,7 +2132,10 @@ impl GlobProg {
                             GTok::Star => unreachable!("segments contain no stars"),
                         }
                     }
-                    Some(GlobSeg::Bit { n: seg.len() as u8, masks })
+                    Some(GlobSeg::Bit {
+                        n: seg.len() as u8,
+                        masks,
+                    })
                 } else {
                     Some(GlobSeg::Naive(seg.to_vec()))
                 }
@@ -1791,7 +2170,13 @@ impl GlobProg {
 /// segment's literal bytes and `?` wildcards line up; with `anchored`, the
 /// match must end exactly at hay.len() (the scan runs to the end and the
 /// final automaton state answers "some suffix ends here").
-fn bit_seg_match(n: usize, masks: &[u64; 256], hay: &[u8], start: usize, anchored: bool) -> (bool, usize) {
+fn bit_seg_match(
+    n: usize,
+    masks: &[u64; 256],
+    hay: &[u8],
+    start: usize,
+    anchored: bool,
+) -> (bool, usize) {
     if start + n > hay.len() {
         return (false, start);
     }
@@ -1864,6 +2249,16 @@ fn longest_literal_run(tokens: &[GTok]) -> Vec<u8> {
     best
 }
 
+/// Byte histogram of an arena — computed lazily once per process, used by the
+/// glob prefilter to pick the rarest literal byte as its 1-byte seed.
+fn arena_byte_freq(arena: &[u8]) -> [u32; 256] {
+    let mut f = [0u32; 256];
+    for &b in arena {
+        f[b as usize] += 1;
+    }
+    f
+}
+
 /// Bit-parallel glob match over bytes with ASCII case folding (no allocation).
 /// Test-only convenience wrapper (the engine uses `GlobProg` directly).
 #[cfg(test)]
@@ -1906,12 +2301,68 @@ mod tests {
     fn rows() -> Vec<(&'static str, EntryMeta)> {
         let now = 1_700_000_000i64;
         vec![
-            (r"D:\docs\年度报告.md", EntryMeta { size: 100, mtime: now, ctime: now, flags: 0, ..Default::default() }),
-            (r"D:\docs\readme.txt", EntryMeta { size: 500, mtime: now - 10_000_000, ctime: now, flags: 0, ..Default::default() }),
-            (r"D:\proj\src\main.rs", EntryMeta { size: 2 << 20, mtime: now, ctime: now, flags: 0, frn: Some(42), ..Default::default() }),
-            (r"D:\proj\src\lib.rs", EntryMeta { size: 3 << 20, mtime: now - 100, ctime: now, flags: EntryMeta::FLAG_HIDDEN, ..Default::default() }),
-            (r"D:\media\rs.jpg", EntryMeta { size: 9 << 20, mtime: now, ctime: now, flags: 0, ..Default::default() }),
-            (r"D:\media\sub", EntryMeta { is_dir: true, size: 0, mtime: now, ctime: now, flags: 0, ..Default::default() }),
+            (
+                r"D:\docs\年度报告.md",
+                EntryMeta {
+                    size: 100,
+                    mtime: now,
+                    ctime: now,
+                    flags: 0,
+                    ..Default::default()
+                },
+            ),
+            (
+                r"D:\docs\readme.txt",
+                EntryMeta {
+                    size: 500,
+                    mtime: now - 10_000_000,
+                    ctime: now,
+                    flags: 0,
+                    ..Default::default()
+                },
+            ),
+            (
+                r"D:\proj\src\main.rs",
+                EntryMeta {
+                    size: 2 << 20,
+                    mtime: now,
+                    ctime: now,
+                    flags: 0,
+                    frn: Some(42),
+                    ..Default::default()
+                },
+            ),
+            (
+                r"D:\proj\src\lib.rs",
+                EntryMeta {
+                    size: 3 << 20,
+                    mtime: now - 100,
+                    ctime: now,
+                    flags: EntryMeta::FLAG_HIDDEN,
+                    ..Default::default()
+                },
+            ),
+            (
+                r"D:\media\rs.jpg",
+                EntryMeta {
+                    size: 9 << 20,
+                    mtime: now,
+                    ctime: now,
+                    flags: 0,
+                    ..Default::default()
+                },
+            ),
+            (
+                r"D:\media\sub",
+                EntryMeta {
+                    is_dir: true,
+                    size: 0,
+                    mtime: now,
+                    ctime: now,
+                    flags: 0,
+                    ..Default::default()
+                },
+            ),
         ]
     }
 
@@ -1921,6 +2372,66 @@ mod tests {
             b.push(path, meta);
         }
         b.finish()
+    }
+
+    #[test]
+    fn bitset_roundtrip_and_ops() {
+        let n = 130u32; // spans 3 words with a masked tail
+        let mut b = Bitset::new(n);
+        assert_eq!(b.ones, 0);
+        b.set(0);
+        b.set(63);
+        b.set(64);
+        b.set(129);
+        b.set(64); // duplicate set must not double-count
+        assert_eq!(b.ones, 4);
+        assert!(b.test(0) && b.test(63) && b.test(64) && b.test(129));
+        assert!(!b.test(1) && !b.test(65) && !b.test(128));
+        b.clear(63);
+        assert_eq!(b.ones, 3);
+        assert!(!b.test(63));
+        assert_eq!(b.to_vec(), vec![0, 64, 129]);
+
+        let f = Bitset::full(n);
+        assert_eq!(f.ones, n as u64);
+        assert_eq!(f.to_vec().len(), n as usize);
+        // Bit 130 is the first masked bit beyond cap: never set, and its word
+        // exists (130 < 3*64) so test() stays in bounds by the id < cap
+        // contract.
+        assert!(!f.test(130));
+
+        let mut c = Bitset::full(n);
+        c.and_with(&b);
+        assert_eq!(c.to_vec(), vec![0, 64, 129]);
+        c.and_not(&b);
+        assert!(c.ones == 0);
+
+        let mut d = Bitset::new(n);
+        d.clear_ids(&[2, 5, 129]);
+        assert_eq!(d.ones, 0);
+        d.set(129);
+        d.clear_ids(&[129]);
+        assert_eq!(d.ones, 0);
+
+        // filter_sorted preserves ascending order
+        let keep = Bitset::full(n);
+        let ids = vec![1u32, 2, 3, 64, 65, 100];
+        assert_eq!(keep.filter_sorted(&ids), ids);
+    }
+
+    #[test]
+    fn big_set_intersection_matches_sorted_path() {
+        // Two > BIG_SET sides must produce the same result as the small-side
+        // galloping merge — exercises the bitmap promotion branch.
+        let n = 2 * BIG_SET as u32;
+        let a: Vec<u32> = (0..n).step_by(2).collect();
+        let b: Vec<u32> = (0..n).step_by(3).collect();
+        let via_bits = and_sorted(&a, &b, n);
+        let expect = intersect(&a, &b);
+        let IdSet::Owned(got) = via_bits else {
+            panic!("expected Owned result")
+        };
+        assert_eq!(got, expect);
     }
 
     #[cfg(feature = "sqlite")]
@@ -2076,8 +2587,12 @@ mod tests {
         for _ in 0..800 {
             let plen = (rnd() % 8 + 1) as usize;
             let hlen = (rnd() % 14) as usize;
-            let p: String = (0..plen).map(|_| ALPHA[(rnd() % 4) as usize] as char).collect();
-            let h: String = (0..hlen).map(|_| (b'a' + (rnd() % 2) as u8) as char).collect();
+            let p: String = (0..plen)
+                .map(|_| ALPHA[(rnd() % 4) as usize] as char)
+                .collect();
+            let h: String = (0..hlen)
+                .map(|_| (b'a' + (rnd() % 2) as u8) as char)
+                .collect();
             let tokens = glob_tokens(&p);
             assert_eq!(
                 glob_match(&tokens, h.as_bytes()),
@@ -2090,7 +2605,13 @@ mod tests {
     #[test]
     fn glob_scan_prefilter() {
         let mut b = MemBuilder::default();
-        let meta = EntryMeta { size: 0, mtime: 0, ctime: 0, flags: 0, ..Default::default() };
+        let meta = EntryMeta {
+            size: 0,
+            mtime: 0,
+            ctime: 0,
+            flags: 0,
+            ..Default::default()
+        };
         b.push(r"D:\p\foo_bar.rs", meta.clone()); // id 0: "*foo*bar*" match
         b.push(r"D:\p\bar_foo.txt", meta.clone()); // id 1: order wrong
         b.push(r"D:\p\xabc", meta.clone()); // id 2: "a?c" match (ends abc)
@@ -2209,7 +2730,13 @@ mod tests {
         // match that OVERLAPS an earlier artifact must still be found
         // (a non-overlapping iterator would silently drop it).
         let mut b = MemBuilder::default();
-        let meta = EntryMeta { size: 0, mtime: 0, ctime: 0, flags: 0, ..Default::default() };
+        let meta = EntryMeta {
+            size: 0,
+            mtime: 0,
+            ctime: 0,
+            flags: 0,
+            ..Default::default()
+        };
         b.push(r"D:\a\xab", meta.clone()); // id 0
         b.push(r"D:\a\bbc", meta.clone()); // id 1
         b.push(r"D:\a\ab", meta.clone()); // id 2
@@ -2236,7 +2763,13 @@ mod tests {
     #[test]
     fn path_ci_arena_scan() {
         let mut b = MemBuilder::default();
-        let meta = EntryMeta { size: 0, mtime: 0, ctime: 0, flags: 0, ..Default::default() };
+        let meta = EntryMeta {
+            size: 0,
+            mtime: 0,
+            ctime: 0,
+            flags: 0,
+            ..Default::default()
+        };
         b.push(r"D:\KitA\File", meta.clone()); // id 0: path contains "kita\file" (CI)
         b.push(r"D:\Other\kita", meta.clone()); // id 1: path contains "other\kita"
         b.push(r"D:\Other\KITB", meta.clone()); // id 2: "other\kitb", not "kita"
@@ -2255,7 +2788,13 @@ mod tests {
     #[test]
     fn regex_arena_prefilter() {
         let mut b = MemBuilder::default();
-        let meta = EntryMeta { size: 0, mtime: 0, ctime: 0, flags: 0, ..Default::default() };
+        let meta = EntryMeta {
+            size: 0,
+            mtime: 0,
+            ctime: 0,
+            flags: 0,
+            ..Default::default()
+        };
         b.push(r"D:\p\main.rs", meta.clone()); // id 0
         b.push(r"D:\p\lib.rs", meta.clone()); // id 1
         b.push(r"D:\p\README.md", meta.clone()); // id 2
@@ -2282,7 +2821,13 @@ mod tests {
     #[test]
     fn trigram_fast_path_correctness() {
         let mut b = MemBuilder::default();
-        let meta = EntryMeta { size: 0, mtime: 0, ctime: 0, flags: 0, ..Default::default() };
+        let meta = EntryMeta {
+            size: 0,
+            mtime: 0,
+            ctime: 0,
+            flags: 0,
+            ..Default::default()
+        };
         b.push(r"D:\t\aaaa", meta.clone()); // id 0: "aaa" with duplicate trigram
         b.push(r"D:\t\abababa", meta.clone()); // id 1: "aba" twice, non-adjacent
         b.push(r"D:\t\abcabc", meta.clone()); // id 2
@@ -2352,7 +2897,10 @@ mod tests {
 
         let loaded = MemIndex::load_dump(&v4path).unwrap();
         assert_eq!(loaded.len(), mem.len());
-        assert!(loaded.trigrams.is_empty(), "v4 loads without a trigram index");
+        assert!(
+            loaded.trigrams.is_empty(),
+            "v4 loads without a trigram index"
+        );
         // ≥3-byte needles fall back to the arena scan with identical results
         for q in ["report", "rs", "*.rs", "ext:rs", "regex:rs", "!hidden:true"] {
             assert_eq!(
@@ -2369,8 +2917,21 @@ mod tests {
         // roundtrip (mapped views) and serve the fast path identically to
         // the owned index.
         let mut b = MemBuilder::default();
-        let meta = EntryMeta { size: 0, mtime: 0, ctime: 0, flags: 0, ..Default::default() };
-        let big = EntryMeta { size: 100, allocated: 400, mtime: 0, ctime: 0, flags: 0, ..Default::default() };
+        let meta = EntryMeta {
+            size: 0,
+            mtime: 0,
+            ctime: 0,
+            flags: 0,
+            ..Default::default()
+        };
+        let big = EntryMeta {
+            size: 100,
+            allocated: 400,
+            mtime: 0,
+            ctime: 0,
+            flags: 0,
+            ..Default::default()
+        };
         b.push(r"D:\t\report.md", meta.clone());
         b.push(r"D:\t\年度报告.md", meta.clone());
         b.push(r"D:\t\main.rs", big);
@@ -2400,9 +2961,20 @@ mod tests {
         let mut b = MemBuilder::default();
         b.push(
             r"D:\t\big.bin",
-            EntryMeta { size: 100, allocated: 400, frn: Some(1), ..Default::default() },
+            EntryMeta {
+                size: 100,
+                allocated: 400,
+                frn: Some(1),
+                ..Default::default()
+            },
         );
-        b.push(r"D:\t\dir", EntryMeta { is_dir: true, ..Default::default() });
+        b.push(
+            r"D:\t\dir",
+            EntryMeta {
+                is_dir: true,
+                ..Default::default()
+            },
+        );
         let mem = b.finish();
         let dir = tempfile::tempdir().unwrap();
         let v6path = dir.path().join("v6.feridx");
@@ -2506,7 +3078,15 @@ mod tests {
 
         let loaded = MemIndex::load_dump(&v3path).unwrap();
         assert_eq!(loaded.len(), mem.len());
-        for q in ["rs", "report", "*.rs", "ext:rs", "a?c", "regex:rs", "!hidden:true"] {
+        for q in [
+            "rs",
+            "report",
+            "*.rs",
+            "ext:rs",
+            "a?c",
+            "regex:rs",
+            "!hidden:true",
+        ] {
             assert_eq!(
                 loaded.search(&Query::parse(q).unwrap()),
                 mem.search(&Query::parse(q).unwrap()),

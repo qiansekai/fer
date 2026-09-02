@@ -1,3 +1,5 @@
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -11,7 +13,11 @@ use file_engine_rust::query::Query;
 use file_engine_rust::usn;
 
 #[derive(Parser)]
-#[command(name = "fer", version, about = "Everything-grade instant file search, rewritten in Rust")]
+#[command(
+    name = "fer",
+    version,
+    about = "Everything-grade instant file search, rewritten in Rust"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Cmd,
@@ -51,7 +57,10 @@ enum Cmd {
     },
     /// Start the HTTP API + web UI
     Serve {
-        #[arg(long, default_value = "127.0.0.1:9876")]
+        /// Port 9876 sits inside a WinNAT-reserved range on some hosts, so
+        /// the default lives elsewhere; both ends must agree (serve --addr
+        /// and the CLI auto-forward below).
+        #[arg(long, default_value = "127.0.0.1:19876")]
         addr: String,
     },
     /// Watch the USN journal and keep the index live (requires admin — refuses
@@ -125,6 +134,46 @@ fn load_index(db: &Path) -> Result<MemIndex> {
     MemIndex::load_dump(&dump)
 }
 
+/// Percent-encode a query string for a GET request (RFC 3986 unreserved kept
+/// as-is, space as `+` — the form style the web UI already sends).
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Forward a search to a long-running `fer serve` on the default address.
+/// The daemon already has the dump mapped and warm, so this turns a
+/// 17-336ms cold CLI query into a ~2-5ms hop. Any failure (no daemon, stale
+/// response, engine mismatch) returns None and the caller falls back to
+/// loading the dump locally — the fallback is always correct.
+fn try_remote_search(addr: &str, query: &str, limit: usize) -> Option<serde_json::Value> {
+    let sock = addr.to_socket_addrs().ok()?.next()?;
+    let mut stream = TcpStream::connect_timeout(&sock, Duration::from_millis(150)).ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(2500)))
+        .ok()?;
+    let path = format!("/api/search?q={}&limit={}", urlencode(query), limit);
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nAccept: application/json\r\n\r\n"
+    );
+    stream.write_all(req.as_bytes()).ok()?;
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).ok()?;
+    let body = String::from_utf8_lossy(&buf);
+    let json_start = body.find("\r\n\r\n")? + 4;
+    let v: serde_json::Value = serde_json::from_str(&body[json_start..]).ok()?;
+    (v.get("ok") == Some(&serde_json::Value::Bool(true))).then_some(v)
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let db = cli.db.clone().unwrap_or_else(default_db);
@@ -196,7 +245,39 @@ fn main() -> Result<()> {
                 );
             }
         }
-        Cmd::Search { query, limit, count_only } => {
+        Cmd::Search {
+            query,
+            limit,
+            count_only,
+        } => {
+            // Fast path: a long-running `fer serve` on the default port has
+            // the dump mapped and warm — forward the query instead of paying
+            // process startup + mmap page-fault tax again. Only for the
+            // default index base: a custom --db must never hit someone
+            // else's daemon.
+            if cli.db.is_none()
+                && let Some(resp) = try_remote_search("127.0.0.1:19876", &query, limit)
+            {
+                if cli.json {
+                    print_json(resp)?;
+                } else if count_only {
+                    let total = resp.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
+                    println!("{total}");
+                } else {
+                    let count = resp.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let total = resp.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let took = resp.get("took_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+                    if let Some(hits) = resp.get("hits").and_then(|v| v.as_array()) {
+                        for h in hits {
+                            if let Some(p) = h.get("path").and_then(|v| v.as_str()) {
+                                println!("{p}");
+                            }
+                        }
+                    }
+                    eprintln!("{count} results (total {total}) in {took} ms [serve]");
+                }
+                return Ok(());
+            }
             let q = match Query::parse(&query) {
                 Ok(q) => q,
                 Err(e) => {
@@ -230,10 +311,7 @@ fn main() -> Result<()> {
                 for h in &hits {
                     println!("{}", h.path);
                 }
-                eprintln!(
-                    "{} results (total {total}) in {took} ms",
-                    hits.len()
-                );
+                eprintln!("{} results (total {total}) in {took} ms", hits.len());
             }
         }
         Cmd::Serve { addr } => {
@@ -292,7 +370,9 @@ fn main() -> Result<()> {
             let files = mem.file_count() as u64;
             let dirs = mem.dir_count() as u64;
             let dump = dump_path(&db);
-            let dump_mb = std::fs::metadata(&dump).map(|m| m.len() / (1 << 20)).unwrap_or(0);
+            let dump_mb = std::fs::metadata(&dump)
+                .map(|m| m.len() / (1 << 20))
+                .unwrap_or(0);
             if cli.json {
                 print_json(json!({
                     "ok": true,
@@ -310,16 +390,19 @@ fn main() -> Result<()> {
                 println!("size:    {dump_mb} MB");
             }
         }
-        Cmd::Du { path, depth, top, allocated } => {
+        Cmd::Du {
+            path,
+            depth,
+            top,
+            allocated,
+        } => {
             let mem = load_index(&db)?;
             let t = Instant::now();
             let report = file_engine_rust::du::scan(&mem, &path, depth, top, allocated)?;
             let took = t.elapsed().as_millis();
             if cli.json {
                 let mut v = serde_json::to_value(&report)?;
-                let obj = v
-                    .as_object_mut()
-                    .expect("report serializes to an object");
+                let obj = v.as_object_mut().expect("report serializes to an object");
                 obj.insert("ok".to_string(), json!(true));
                 obj.insert("took_ms".to_string(), json!(took));
                 print_json(v)?;
@@ -346,9 +429,7 @@ fn main() -> Result<()> {
                     );
                 }
                 if report.truncated {
-                    eprintln!(
-                        "(more subdirectories hidden — raise --top; --json for machine use)"
-                    );
+                    eprintln!("(more subdirectories hidden — raise --top; --json for machine use)");
                 }
                 eprintln!(
                     "{} files / {} dirs / {} entries in {took} ms",
@@ -356,22 +437,20 @@ fn main() -> Result<()> {
                 );
             }
         }
-        Cmd::Dupes { min_size, name, limit } => {
+        Cmd::Dupes {
+            min_size,
+            name,
+            limit,
+        } => {
             let min = file_engine_rust::query::parse_bytes(&min_size)?;
             let mem = load_index(&db)?;
             let mut last_log = std::time::Instant::now();
-            let report = file_engine_rust::dupes::find(
-                &mem,
-                min,
-                name.as_deref(),
-                limit,
-                |n| {
-                    if last_log.elapsed().as_millis() > 2000 {
-                        eprintln!("[dupes] {n} files hashed ...");
-                        last_log = std::time::Instant::now();
-                    }
-                },
-            )?;
+            let report = file_engine_rust::dupes::find(&mem, min, name.as_deref(), limit, |n| {
+                if last_log.elapsed().as_millis() > 2000 {
+                    eprintln!("[dupes] {n} files hashed ...");
+                    last_log = std::time::Instant::now();
+                }
+            })?;
             if cli.json {
                 print_json(json!({
                     "ok": true,
@@ -422,7 +501,9 @@ fn fmt_bytes(n: u64) -> String {
 
 /// Peak working-set size of the current process (build memory observability).
 fn peak_rss_bytes() -> u64 {
-    use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut pmc: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
     let ok = unsafe {

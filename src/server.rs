@@ -2,8 +2,10 @@
 //! against the in-memory engine; `/api/rescan` rebuilds from the volumes and
 //! refreshes the dump + the live engine.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use axum::{
@@ -23,6 +25,55 @@ use crate::usn;
 struct AppState {
     mem: Arc<RwLock<Arc<MemIndex>>>,
     db: PathBuf,
+    cache: Arc<Mutex<QueryCache>>,
+}
+
+/// Tiny TTL-bounded LRU for identical repeated queries (agents re-issue the
+/// same search constantly). TTL keeps results fresh across external index
+/// refreshes; capacity is small enough that eviction scans are trivial.
+const CACHE_CAP: usize = 256;
+const CACHE_TTL: Duration = Duration::from_secs(3);
+
+#[derive(Default)]
+struct QueryCache {
+    map: HashMap<String, (serde_json::Value, Instant)>,
+}
+
+impl QueryCache {
+    fn get(&mut self, key: &str) -> Option<serde_json::Value> {
+        let fresh = self
+            .map
+            .get(key)
+            .filter(|(_, at)| at.elapsed() < CACHE_TTL)
+            .map(|(v, _)| v.clone());
+        if fresh.is_some() {
+            return fresh;
+        }
+        self.purge_expired();
+        None
+    }
+
+    fn insert(&mut self, key: String, value: serde_json::Value) {
+        self.purge_expired();
+        if self.map.len() >= CACHE_CAP
+            && let Some(oldest) = self
+                .map
+                .iter()
+                .min_by(|(_, (_, a)), (_, (_, b))| a.cmp(b))
+                .map(|(k, _)| k.clone())
+        {
+            self.map.remove(&oldest);
+        }
+        self.map.insert(key, (value, Instant::now()));
+    }
+
+    fn purge_expired(&mut self) {
+        self.map.retain(|_, (_, at)| at.elapsed() < CACHE_TTL);
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+    }
 }
 
 pub async fn serve(addr: &str, mem: MemIndex, db: &std::path::Path) -> Result<()> {
@@ -34,7 +85,14 @@ pub async fn serve(addr: &str, mem: MemIndex, db: &std::path::Path) -> Result<()
     let state = AppState {
         mem: Arc::new(RwLock::new(Arc::new(mem))),
         db: db.to_path_buf(),
+        cache: Arc::new(Mutex::new(QueryCache::default())),
     };
+    // Background warm-up: touch one byte per page of every mapped section so
+    // the first client query doesn't pay the mmap page-fault tax. Sequential
+    // reads over ~1 GB; the OS scheduler deprioritizes naturally. CLI
+    // single-shot runs skip this (warm-up would exceed the query cost).
+    let warm_mem = state.mem.read().unwrap().clone();
+    std::thread::spawn(move || warm_mem.warm());
     let app = Router::new()
         .route("/", get(index_page))
         .route("/api/health", get(health))
@@ -66,6 +124,17 @@ struct SearchQuery {
 async fn search(State(st): State<AppState>, Query(q): Query<SearchQuery>) -> Json<Value> {
     let t = std::time::Instant::now();
     let limit = q.limit.map(|l| l.min(10_000)).unwrap_or(100);
+    // Repeat-query fast path: agents re-issue identical searches constantly;
+    // a fresh TTL entry is served without touching the engine.
+    let cache_key = format!("{}|{}", q.q, limit);
+    if let Some(mut hit) = st.cache.lock().unwrap().get(&cache_key) {
+        // The cached payload carries the ORIGINAL computation's took_ms —
+        // refresh it so the field reflects this request (near-zero on a hit).
+        if let Some(obj) = hit.as_object_mut() {
+            obj.insert("took_ms".to_string(), json!(t.elapsed().as_millis()));
+        }
+        return Json(hit);
+    }
     let parsed = match crate::query::Query::parse(&q.q) {
         Ok(p) => p,
         Err(e) => return Json(json!({ "ok": false, "error": e.to_string() })),
@@ -82,8 +151,8 @@ async fn search(State(st): State<AppState>, Query(q): Query<SearchQuery>) -> Jso
         (total, hits)
     })
     .await;
-    match outcome {
-        Ok((total, hits)) => Json(json!({
+    let resp = match outcome {
+        Ok((total, hits)) => json!({
             "ok": true,
             "query": qq,
             "engine": "mem",
@@ -91,9 +160,11 @@ async fn search(State(st): State<AppState>, Query(q): Query<SearchQuery>) -> Jso
             "total": total,
             "took_ms": t.elapsed().as_millis(),
             "hits": hits,
-        })),
-        Err(e) => Json(json!({ "ok": false, "error": e.to_string() })),
-    }
+        }),
+        Err(e) => json!({ "ok": false, "error": e.to_string() }),
+    };
+    st.cache.lock().unwrap().insert(cache_key, resp.clone());
+    Json(resp)
 }
 
 #[derive(Deserialize)]
@@ -112,7 +183,13 @@ async fn du(State(st): State<AppState>, Query(q): Query<DuQuery>) -> Json<Value>
     let mem = st.mem.read().unwrap().clone();
     let path = q.path.clone();
     let outcome = tokio::task::spawn_blocking(move || {
-        crate::du::scan(&mem, &path, q.depth, q.top.unwrap_or(20), q.allocated.unwrap_or(false))
+        crate::du::scan(
+            &mem,
+            &path,
+            q.depth,
+            q.top.unwrap_or(20),
+            q.allocated.unwrap_or(false),
+        )
     })
     .await;
     match outcome {
@@ -133,7 +210,9 @@ async fn stats(State(st): State<AppState>) -> Json<Value> {
     let files = mem.file_count() as u64;
     let dirs = mem.dir_count() as u64;
     let dump = dump_path(&st.db);
-    let dump_mb = std::fs::metadata(&dump).map(|m| m.len() / (1 << 20)).unwrap_or(0);
+    let dump_mb = std::fs::metadata(&dump)
+        .map(|m| m.len() / (1 << 20))
+        .unwrap_or(0);
     Json(json!({
         "ok": true,
         "files": files,
@@ -157,6 +236,8 @@ async fn rescan(State(st): State<AppState>) -> Json<Value> {
         Ok(json!({ "report": report, "dump": dump.to_string_lossy() }))
     })
     .await;
+    // The index changed under the cache — drop every cached response.
+    st.cache.lock().unwrap().clear();
     match outcome {
         Ok(Ok(v)) => Json(json!({ "ok": true, "result": v })),
         Ok(Err(e)) => Json(json!({ "ok": false, "error": format!("{e:#}") })),
