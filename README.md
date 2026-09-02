@@ -30,11 +30,18 @@
 
 ## 构建
 
+仅支持 Windows（依赖 NTFS `$MFT` / USN 原生 API）。
+
 ```bash
-# 本机（Tairitsu）无 MSVC 链接器，走 rustup GNU 工具链（rust-toolchain.toml 已配置）：
+cargo build --release               # 产物 target-gnu/release/fer.exe（独立 exe，无运行时依赖）
+cargo build --profile min-size      # 精简编译（opt-level="z"；默认构建不编译 SQLite）
+```
+
+没有 MSVC 链接器时可走 GNU 工具链：
+
+```bash
+rustup target add x86_64-pc-windows-gnu
 rustup run stable-x86_64-pc-windows-gnu cargo build --release
-# 产物：target-gnu/release/fer.exe（独立 exe，无运行时依赖）
-# 精简编译：cargo build --profile min-size（opt-level="z"，体积优先；默认构建不编译 SQLite）
 ```
 
 ## CLI 使用
@@ -54,7 +61,7 @@ fer monitor --volume D               # USN 实时增量（需管理员）
 fer stats                            # 索引统计
 fer dupes --min-size 1kb --limit 50  # 找重复文件（同大小分组 + 内容哈希 + 字节校验）
 fer dupes --name adb.exe             # 只看文件名含 adb.exe 的重复组
-fer du "D:\Kita-Tools" --top 20      # 磁盘占用聚合（WizTree 式 du，见下节）
+fer du "D:\proj" --top 20            # 磁盘占用聚合（WizTree 式 du，见下节）
 fer du "D:\" --depth 1 --top 10 --json  # 整卷顶层占用，JSON 输出
 fer --db <path> <cmd>                # 自定义索引库（默认 %LOCALAPPDATA%\file-engine-rust\index.db）
 ```
@@ -201,13 +208,13 @@ CLI 全查询 3 轮取 min/median（每项均含进程启动 + dump mmap 加载�
 | 文件 | `type:file` | 3,595,317 | 6 ms | 6 ms |
 | 隐藏 | `hidden:true` | 583 | **0 ms** | 0 ms |
 | 取反 | `!hidden:true` | 4,167,861 | 63 ms | 73 ms |
-| 父目录 | `parent:D:\Kita-Tools` | 2,546,957 | 72 ms | 81 ms |
+| 父目录 | `parent:D:\proj` | 2,546,957 | 72 ms | 81 ms |
 | 交集 | `ext:rs size:>1mb` | 98 | 9 ms | 10 ms |
 | 混合 | `dm:thisweek type:file` | 1,028,236 | 53 ms | 57 ms |
 | 2 字子串 | `rs` | 183,817 | 158 ms | 168 ms（全名扫描） |
 | 2 字 CJK | `报告` | 40 | 152 ms | 158 ms（全名扫描） |
 | 长子串 | `report` | 7,440 | 167 ms | 171 ms（全名扫描） |
-| 路径子串 | `Kita-Tools\Coding`（含 `\`） | 86,189 | 281 ms | 294 ms |
+| 路径子串 | `projects\src`（含 `\`） | 86,189 | 281 ms | 294 ms |
 | 并行 | `report 报告`（两全扫合取） | 0 | 158 ms | 166 ms（≈单扫描） |
 
 索引构建：全盘 416.8 万条（MFT 路径含硬链接别名），**热缓存 7.9s（含 dump 写出）/ 冷盘 ~30-40s**
@@ -217,7 +224,7 @@ CLI 全查询 3 轮取 min/median（每项均含进程启动 + dump mmap 加载�
   `ext:rs` 2ms、`type:dir` 1ms、`dm:thisweek type:file` 34ms；逻辑内存 1021MB /
   RSS 350MB（mmap 按需缺页，OS 可回收）
 - **CLI**：全查询 **0-294ms**（含进程启动 + dump 加载），无 SQLite、无门控
-- **du**（2026-09 新增，v2 并行化）：子树 `D:\Kita-Tools\Coding`（9.5 万条目/1.8 万目录）
+- **du**（2026-09 新增，v2 并行化）：子树 `D:\proj`（9.5 万条目/1.8 万目录）
   **35ms**；整卷 `D:\`（300 万条目/57 万目录）聚合 **~1.2s**（v1 顺序版 2.9s）。实现 =
   FRN 去重 → 连续均分块 scoped 线程并行 → 稠密 per-dir 原子计数（无 merge 阶段），
   目录查找走 FNV 折叠哈希预筛 + 精确校验，每文件零分配；serve 内热页同查询 ~35ms
@@ -236,7 +243,7 @@ CLI 全查询 3 轮取 min/median（每项均含进程启动 + dump mmap 加载�
 | `报`（单字 CJK = 3 字节 = 单 trigram） | 66 | ~150ms | ~11ms | **1ms** |
 | `report`（长子串） | 7,325 | 167-171ms | 8ms | **0-1ms** |
 | `con`（常见 trigram 压力案例） | 186,357 | ~165ms | ~10ms | **14ms** |
-| `Kita-Tools\Coding`（路径子串） | 88,965 | 281-294ms | 135ms | 90-135ms |
+| `projects\src`（路径子串） | 88,965 | 281-294ms | 135ms | 90-135ms |
 | `regex:\.rs$`（字面量预筛） | 40,211 | ~170ms 档 | 14ms | **4ms** |
 | `a?c`（glob 位并行） | 1,829 | 1,018ms | 118ms | 118-134ms |
 | `zzzzzz`（trigram 缺失 → 空） | 0 | ~165ms | ~10ms | **0ms** |
@@ -250,8 +257,8 @@ posting 交集得候选超集，再逐候选 memmem 校验。glob 匹配编译�
 首次查询含 mmap 缺页税（首轮比稳态高数十 ms）。
 - **monitor**：USN 增量进内存（by_frn 二分 + 删除影子集），默认每 60s 防抖写回 dump
   （`--flush-secs` 可调）；flush 走 arena 直达复用（零 String 分配）
-- **编译**：`cargo check` 6.9s（不编 SQLite）；release 1.81MB / `--profile min-size`
-  1.58MB；clippy 0 警告
+- **编译**：`cargo check` 6.9s（不编 SQLite）；release ~3.3MB / `--profile min-size`
+  （opt-level="z" 体积更小）；clippy 0 警告
 
 ## 已知限制 / TODO
 

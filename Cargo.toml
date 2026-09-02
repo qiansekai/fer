@@ -2,6 +2,10 @@
 name = "file-engine-rust"
 version = "0.1.0"
 edition = "2024"
+description = "Everything-grade instant file search for NTFS: raw $MFT indexing, mmap zero-copy in-memory engine, CLI + HTTP API"
+license = "GPL-3.0"
+repository = "https://github.com/qiansekai/file-engine-rust"
+readme = "README.md"
 
 [[bin]]
 name = "fer"

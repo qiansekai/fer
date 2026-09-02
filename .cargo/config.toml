@@ -1,5 +1,8 @@
-# Keep GNU-toolchain artifacts separate from any MSVC leftovers.
+# Local convention: keep GNU-toolchain artifacts in a separate target dir.
 [build]
 target-dir = "target-gnu"
-# Native-CPU codegen: this machine only (the exe is not redistributable).
+
+# Native-CPU codegen (the exe is not redistributable) applies only when
+# building for the local GNU target; builds for other targets are unaffected.
+[target.x86_64-pc-windows-gnu]
 rustflags = ["-C", "target-cpu=native"]
