@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde_json::json;
 
@@ -158,9 +158,16 @@ fn main() -> Result<()> {
             for v in &vols {
                 eprintln!("target: {}: ({}) [{}]", v.drive, v.label.trim(), v.fs);
             }
+            // Create the index directory before the (long) scan: a missing or
+            // unwritable output dir must fail fast, not after the full volume
+            // walk. save() creates it too, but only at dump time.
+            let dump = dump_path(&db);
+            if let Some(parent) = dump.parent().filter(|p| !p.as_os_str().is_empty()) {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating index directory {}", parent.display()))?;
+            }
             let (report, mem) = indexer::build(&vols, method)?;
             let t_dump = Instant::now();
-            let dump = dump_path(&db);
             mem.save(&dump)?;
             eprintln!(
                 "[dump] {} entries, {} MB written to {} in {} ms (peak RSS {})",
