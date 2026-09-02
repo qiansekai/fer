@@ -14,7 +14,15 @@
   **降级必须显式**：auto/mft/usn 非提权直接拒绝（`--method walk` 才是显式降级选项）
 - **低内存**：紧凑数组 + 流式 DFS 构建，全盘 400 万条峰值内存 ~170 MB
 - **毫秒级搜索**：全查询走内存引擎——子串（memchr SIMD 扫描）、`*.rs` 后缀（反向列二分）、
-  通配符、大小写不敏感、CJK
+  通配符、大小写不敏感、CJK；锚定结尾的 glob（`a?c`、`*a.c`）走反向名二分 + 尾段比对，
+  弱字面量模式不再付全 arena 扫描税
+- **大集合组合器（2026-09-03）**：多 term 求值并行 + 按势升序相交 + galloping
+  intersect（大小比 >= 8x 时指数跳跃二分）；高势结果（`dm:`/`size:`/`!flag:`）用
+  512KB 级 bitset 表示——`dm:thisweek` 47ms→11ms、`!hidden:true` 63ms→5ms
+  （665 万条目实测，旧数字为 416 万条目时代）
+- **serve 常驻加速**：CLI `fer search` 自动探测默认端口上的 `fer serve` 并转发
+  （无 serve 时静默回退本地加载）；serve 带 TTL 查询缓存（重复查询 0ms）与
+  启动后台预热线程（首查不付 mmap 缺页税）
 - **过滤查询语言**：`ext: size: dm: dc: type: hidden: parent: path: name:` + 取反（`!`）
 - **实时监控**：`fer monitor` 轮询 USN 日志增量更新（删除按 FRN 直删）
 - **HTTP API + 网页 UI** + **CLI --json**（稳定 JSON 输出，面向 agent）
@@ -55,7 +63,7 @@ fer search "AGENTS.md"               # 秒搜（子串）
 fer search "*.rs"                    # 通配符
 fer search "ext:mp4 size:>1gb dm:thisweek"   # 过滤查询语言
 fer search "foo" --limit 50 --count-only     # 只看命中数
-fer serve --addr 127.0.0.1:9876      # HTTP API + 网页 UI
+fer serve --addr 127.0.0.1:19876   # HTTP API + 网页 UI（默认端口）
 fer upgrade                          # 格式迁移：老 dump 就地重建 trigram 段并写为最新版（免管理员）
 fer monitor --volume D               # USN 实时增量（需管理员）
 fer stats                            # 索引统计
@@ -144,15 +152,22 @@ GET /                              → 网页搜索 UI
 curl 示例：
 
 ```bash
-curl "http://127.0.0.1:9876/api/search?q=ext%3Ars%20size%3A%3E1mb&limit=10"
-curl -X POST http://127.0.0.1:9876/api/rescan
+curl "http://127.0.0.1:19876/api/search?q=ext%3Ars%20size%3A%3E1mb&limit=10"
+curl -X POST http://127.0.0.1:19876/api/rescan
 ```
+
+> 默认端口 19876：`9876` 在部分主机的 WinNAT 保留段内（`netsh interface ipv4
+> show excludedportrange`），绑定报 WSAEACCES。`fer search` 的自动转发与
+> `serve` 默认地址必须一致。
 
 ## Agent 使用指南
 
 - **CLI**：所有子命令支持 `--json`；错误时退出码非 0。查询语言参数**带引号传入**：
   `fer search "ext:rs dm:thisweek" --json`（注意 shell 里 `!` 需转义或使用单引号）。
+  `fer search` 默认先探测本机常驻 `fer serve`（127.0.0.1:19876）并转发——有 serve 时
+  每次调用只付一次 HTTP 往返（~2-5ms），无 serve 时静默回退本地加载（~17-336ms）。
 - **HTTP**：长驻 `fer serve` 后直接 `GET /api/search?q=...`，URL 编码查询串。
+  重复查询 3 秒 TTL 内由服务端缓存直接应答（took_ms=0）。
 - **稳定契约**：`--json` 输出与 `/api/*` 的字段名视为稳定 API；`took_ms`/`total` 仅供观测。
 - 已知边界：2 字短查询（尤其中文）走全名扫描，~60-150 ms；硬链接别名均已收录。
 
@@ -255,6 +270,26 @@ posting 交集得候选超集，再逐候选 memmem 校验。glob 匹配编译�
 最长字面量 run 预筛。老 dump 兼容加载：v3 自动内存重建加速段，`fer upgrade`
 （免管理员、~6.6s @4.14M 条）就地重建 trigram 段并重写为 v5。
 首次查询含 mmap 缺页税（首轮比稳态高数十 ms）。
+
+### 2026-09-03 组合器 + 常驻优化（KAKAR 本机 8 卷 · 665 万条 · dump v6）
+
+CLI 全查询（含进程启动 + mmap 加载，热页；规模比旧基准大 60%）：
+
+| 查询 | 结果数 | 旧（416 万条） | 新（665 万条） | 手段 |
+|------|-------:|---------------:|--------------:|------|
+| `*.rs` / `ext:rs` | 74,077 | 2ms | 1ms | by_rev 二分 |
+| `报告`（CJK） | 244 | 0-1ms | 0ms | trigram |
+| `con`（trigram 压力） | 280,370 | 14ms | 28-33ms | posting 交集（规模 +60%） |
+| `dm:thisweek` | 1,472,018 | 43-47ms | **11ms** | range 产 bitset，不再 copy+sort |
+| `!hidden:true` | 6,648,138 | 63-73ms | **5ms** | full-bitset 减小列表 |
+| `dm:thisweek type:file` | 1,182,390 | 53-57ms | **20ms** | 势升序 + bitset 过滤 |
+| `ext:rs size:>1mb` | 161 | 9-10ms | 2ms | galloping intersect |
+| `a?c`（弱字面量 glob） | 2,808 | 118-134ms | **19-20ms** | 锚定结尾走 by_rev 反转前缀 |
+| `路径子串` | — | 90-135ms | 280ms（CLI）/ **92ms**（serve 稳态） | 仍为最大慢点，待 path trigram |
+
+serve 稳态（引擎侧 took_ms，预热线程 + TTL 缓存）：`ext:rs` 0ms、`a?c` 6ms、
+`con` 17ms、路径子串 92ms；重复查询缓存命中 0ms。CLI 自动转发 serve 后
+单次调用 ~1-5ms（无 serve 自动回退本地）。
 - **monitor**：USN 增量进内存（by_frn 二分 + 删除影子集），默认每 60s 防抖写回 dump
   （`--flush-secs` 可调）；flush 走 arena 直达复用（零 String 分配）
 - **编译**：`cargo check` 6.9s（不编 SQLite）；release ~3.3MB / `--profile min-size`
@@ -262,6 +297,10 @@ posting 交集得候选超集，再逐候选 memmem 校验。glob 匹配编译�
 
 ## 已知限制 / TODO
 
+- 路径子串仍是最大慢点（serve 稳态 ~92ms @665 万条）：trigram 段只覆盖文件名，
+  路径走整 arena 扫描——待 v7 path trigram（内存代价 ~+500MB 或 posting 压缩）
+- 弱字面量且非锚定结尾的 glob（`a?c*`）仍走 arena seed 扫描 + 逐候选验证
+  （~236ms，候选 340 万）
 - 索引 = dump 快照 + monitor 增量；monitor 不在线时文件变动不反映（下次
   `fer index` 或 monitor 启动回放 USN 日志补齐）
 - v3 dump 兼容加载会在启动时重建加速段（一次性 ~百 ms 级）；`fer upgrade`
