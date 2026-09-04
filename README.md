@@ -1,5 +1,6 @@
-# File-Engine-Rust
+# fer — File Express Retriever
 
+> **fer** = **F**ile **E**xpress **R**etriever（文件极速检索器）。
 > Everything 级「秒定位全局文件」搜索引擎，纯 Rust。
 > 索引走 **原始 $MFT 扫描**（与 Everything 同款内核路径），搜索走 **FERIDX01 dump 内存引擎**
 > （mmap 零拷贝，毫秒级），支持硬链接别名、文件大小/时间/属性过滤，CLI + HTTP API 双通道，agent 友好。
@@ -322,7 +323,7 @@ serve 稳态（引擎侧 took_ms，预热线程 + TTL 缓存）：`ext:rs` 0ms�
 
 ## 与上游对照
 
-| | File-Engine-Core (Java) | Everything | File-Engine-Rust |
+| | File-Engine-Core (Java) | Everything | fer (File Express Retriever) |
 |---|---|---|---|
 | 索引 | C++ JNI 读 USN | 完整 MFT 解析 | **完整 MFT 解析（mft.rs）** |
 | 硬链接别名 | 无 | 有 | 有 |

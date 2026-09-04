@@ -249,7 +249,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
 <html lang="zh">
 <head>
 <meta charset="utf-8">
-<title>File-Engine-Rust</title>
+<title>fer — File Express Retriever</title>
 <style>
 body{font-family:system-ui,Segoe UI,sans-serif;margin:2rem auto;max-width:56rem;padding:0 1rem;background:#0f1115;color:#e8eaed}
 h1{font-size:1.4rem}h1 span{color:#8ab4f8}
@@ -261,7 +261,7 @@ li.dir{color:#8ab4f8}
 </style>
 </head>
 <body>
-<h1><span>File-Engine-Rust</span> — 毫秒级全盘文件名搜索</h1>
+<h1><span>fer</span> — File Express Retriever · 毫秒级全盘文件名搜索</h1>
 <input id="q" placeholder="输入文件名（支持 * ? 通配符），回车或输入即搜…" autofocus>
 <div class="row"><label><input type="checkbox" id="p"> 全路径匹配</label>
 <span id="meta" style="margin-left:1em"></span></div>
