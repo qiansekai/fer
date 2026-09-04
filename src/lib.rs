@@ -1,4 +1,4 @@
-//! File-Engine-Rust: an Everything-grade instant file search engine, rewritten in Rust.
+//! fer — File Express Retriever: an Everything-grade instant file search engine, rewritten in Rust.
 //!
 //! * `mft`     — raw $MFT scanner: hard-link aliases, size, timestamps, flags
 //! * `usn`     — NTFS USN/MFT enumeration (fallback + change journal)
