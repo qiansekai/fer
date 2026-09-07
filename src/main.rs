@@ -118,10 +118,12 @@ enum Cmd {
         /// Output .vhdx path
         #[arg(long)]
         output: PathBuf,
-        /// Payload block size in MiB (power of two, 1..=256)
-        #[arg(long, default_value_t = 32)]
+        /// Payload block size in MiB (power of two, 1..=256; 8 measured best
+        /// for USB-attached sources: finer zero-block skipping)
+        #[arg(long, default_value_t = 8)]
         block_size_mb: u32,
-        /// Reader threads (default: min(cpus, 16))
+        /// Reader threads (default: min(cpus, 4) — measured best for USB
+        /// bridges, which gain nothing beyond a few concurrent readers)
         #[arg(long)]
         threads: Option<usize>,
         /// Re-read the finished image and verify the SHA-256

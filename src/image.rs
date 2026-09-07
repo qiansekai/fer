@@ -649,7 +649,7 @@ pub fn run(opts: &ImageOptions) -> Result<ImageReport> {
     let num_blocks = image_bytes_total.div_ceil(block_size);
     let threads = opts
         .threads
-        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(16));
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(4));
 
     // 4. Writer. The logical sector size follows the source disk (512 or
     //    4096): the partition table inside the image is interpreted in those
