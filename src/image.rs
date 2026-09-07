@@ -15,6 +15,7 @@
 //! padded with zeros), so all sectors are valid by default.
 
 use anyhow::{bail, Context, Result};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
@@ -23,11 +24,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use windows_sys::Win32::Foundation::{
     CloseHandle, GENERIC_READ, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
-};
-use windows_sys::Win32::Security::Cryptography::{
-    BCryptCloseAlgorithmProvider, BCryptCreateHash, BCryptDestroyHash, BCryptFinishHash,
-    BCryptGetProperty, BCryptHashData, BCryptOpenAlgorithmProvider, BCRYPT_ALG_HANDLE,
-    BCRYPT_HASH_HANDLE, BCRYPT_HASH_LENGTH, BCRYPT_OBJECT_LENGTH, BCRYPT_SHA256_ALGORITHM,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile, SetFilePointerEx,
@@ -685,7 +681,7 @@ pub fn run(opts: &ImageOptions) -> Result<ImageReport> {
         }
     }
 
-    let mut hasher = CngSha256::new()?;
+    let mut hasher = Sha256::new();
     let mut pending: BTreeMap<u64, (Vec<u8>, bool)> = BTreeMap::new();
     let mut next_out = 0u64;
     let mut blocks_stored = 0u64;
@@ -775,7 +771,7 @@ pub fn run(opts: &ImageOptions) -> Result<ImageReport> {
                             writer.write_block(i, &data)?;
                             blocks_stored += 1;
                         }
-                        hasher.update(&data[..valid as usize])?;
+                        hasher.update(&data[..valid as usize]);
                         inflight.fetch_sub(1, Ordering::AcqRel);
                         next_out += 1;
                         if next_out.is_multiple_of(32) || next_out == num_blocks {
@@ -816,7 +812,7 @@ pub fn run(opts: &ImageOptions) -> Result<ImageReport> {
     }
     writer.finish()?;
 
-    let sha256 = hex_encode(&hasher.finalize()?);
+    let sha256 = hex_encode(&hasher.finalize());
     let image_bytes = std::fs::metadata(opts.output)?.len();
 
     // 7. Optional self-verification: re-open the finished image, re-read the
@@ -897,7 +893,7 @@ fn verify_image(
     let chunk_ratio = (1u64 << 23) * u64::from(logical_sector_size) / block_size;
     let num_blocks = volume_bytes.div_ceil(block_size);
     let file_end = std::fs::metadata(path)?.len();
-    let mut hasher = CngSha256::new()?;
+    let mut hasher = Sha256::new();
     let mut buf = vec![0u8; block_size as usize];
     let zeros = vec![0u8; block_size as usize];
     for i in 0..num_blocks {
@@ -914,106 +910,12 @@ fn verify_image(
             }
             f.seek(SeekFrom::Start(off))?;
             f.read_exact(&mut buf)?;
-            hasher.update(&buf[..valid as usize])?;
+            hasher.update(&buf[..valid as usize]);
         } else {
-            hasher.update(&zeros[..valid as usize])?;
+            hasher.update(&zeros[..valid as usize]);
         }
     }
-    Ok(hex_encode(&hasher.finalize()?) == expected)
-}
-
-// ---------------------------------------------------------------------------
-// Hardware-accelerated SHA-256 (Windows CNG / bcrypt.dll)
-// ---------------------------------------------------------------------------
-
-/// Streaming SHA-256 backed by the Windows CNG provider (bcrypt.dll), which
-/// uses the SHA-NI instruction set on modern x86_64 CPUs. The RustCrypto
-/// `sha2` crate's `asm` feature does not support Windows (sha2-asm 0.6.4
-/// compile-errors on it), so CNG is the hardware-acceleration path here.
-/// The interface mirrors `sha2::Digest` (new / update / finalize).
-struct CngSha256 {
-    alg: BCRYPT_ALG_HANDLE,
-    hash: BCRYPT_HASH_HANDLE,
-    /// BCrypt hash object buffer (BCRYPT_OBJECT_LENGTH bytes): BCrypt keeps a
-    /// raw pointer to it, so it must stay alive for the hash's whole lifetime.
-    _obj: Vec<u8>,
-    hash_len: u32,
-}
-
-impl CngSha256 {
-    fn new() -> Result<Self> {
-        let mut alg: BCRYPT_ALG_HANDLE = std::ptr::null_mut();
-        let mut status = unsafe {
-            BCryptOpenAlgorithmProvider(&mut alg, BCRYPT_SHA256_ALGORITHM, std::ptr::null(), 0)
-        };
-        if status < 0 {
-            bail!("BCryptOpenAlgorithmProvider(SHA256) failed: {status:#x}");
-        }
-        let close = |a| unsafe { BCryptCloseAlgorithmProvider(a, 0) };
-
-        let mut hash_len = 0u32;
-        let mut cb = 0u32;
-        status = unsafe {
-            BCryptGetProperty(
-                alg,
-                BCRYPT_HASH_LENGTH,
-                (&mut hash_len as *mut u32).cast::<u8>(),
-                4,
-                &mut cb,
-                0,
-            )
-        };
-        if status < 0 {
-            close(alg);
-            bail!("BCryptGetProperty(HashDigestLength) failed: {status:#x}");
-        }
-
-        let mut obj_len = 0u32;
-        status = unsafe {
-            BCryptGetProperty(
-                alg,
-                BCRYPT_OBJECT_LENGTH,
-                (&mut obj_len as *mut u32).cast::<u8>(),
-                4,
-                &mut cb,
-                0,
-            )
-        };
-        if status < 0 {
-            close(alg);
-            bail!("BCryptGetProperty(ObjectLength) failed: {status:#x}");
-        }
-
-        let mut obj = vec![0u8; obj_len as usize];
-        let mut hash: BCRYPT_HASH_HANDLE = std::ptr::null_mut();
-        status = unsafe {
-            BCryptCreateHash(alg, &mut hash, obj.as_mut_ptr(), obj_len, std::ptr::null(), 0, 0)
-        };
-        if status < 0 {
-            close(alg);
-            bail!("BCryptCreateHash failed: {status:#x}");
-        }
-        Ok(Self { alg, hash, _obj: obj, hash_len })
-    }
-
-    fn update(&mut self, data: &[u8]) -> Result<()> {
-        let status = unsafe { BCryptHashData(self.hash, data.as_ptr(), data.len() as u32, 0) };
-        if status < 0 {
-            bail!("BCryptHashData failed: {status:#x}");
-        }
-        Ok(())
-    }
-
-    fn finalize(self) -> Result<[u8; 32]> {
-        let mut out = [0u8; 32];
-        let status = unsafe { BCryptFinishHash(self.hash, out.as_mut_ptr(), self.hash_len, 0) };
-        unsafe { BCryptDestroyHash(self.hash) };
-        unsafe { BCryptCloseAlgorithmProvider(self.alg, 0) };
-        if status < 0 {
-            bail!("BCryptFinishHash failed: {status:#x}");
-        }
-        Ok(out)
-    }
+    Ok(hex_encode(&hasher.finalize()) == expected)
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -1042,74 +944,6 @@ mod tests {
             bytes_per_cluster: 4096,
             total_clusters: 8 * MIB / 4096,
         }
-    }
-
-    // --- CNG SHA-256: correctness + throughput micro-benchmark ---
-
-    #[test]
-    fn cng_sha256_known_vectors() {
-        // Empty input.
-        let h = CngSha256::new().expect("cng new");
-        assert_eq!(
-            hex_encode(&h.finalize().expect("finalize")),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        );
-        // FIPS 180-4 "abc".
-        let mut h = CngSha256::new().expect("cng new");
-        h.update(b"abc").expect("update");
-        assert_eq!(
-            hex_encode(&h.finalize().expect("finalize")),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-        // Streaming updates equal single-shot.
-        let mut a = CngSha256::new().expect("cng new");
-        a.update(b"hello ").expect("u1");
-        a.update(b"world").expect("u2");
-        let mut b = CngSha256::new().expect("cng new");
-        b.update(b"hello world").expect("u");
-        assert_eq!(
-            hex_encode(&a.finalize().expect("fa")),
-            hex_encode(&b.finalize().expect("fb"))
-        );
-    }
-
-    #[test]
-    fn cng_sha256_vs_software_throughput() {
-        use sha2::{Digest, Sha256};
-        use std::time::Instant;
-        // 64 MiB of pseudo-random data (xorshift64; no OS RNG latency).
-        let mut data = vec![0u8; 64 * 1024 * 1024];
-        let mut x = 0x243F_6A88_85A3_08D3u64;
-        for chunk in data.chunks_exact_mut(8) {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            chunk.copy_from_slice(&x.to_le_bytes());
-        }
-        // Old path: pure-software sha2 crate (its `asm` feature is a no-op on
-        // Windows — sha2-asm hard-errors there).
-        let t = Instant::now();
-        let mut soft = Sha256::new();
-        soft.update(&data);
-        let soft_digest = soft.finalize();
-        let soft_ms = t.elapsed().as_millis();
-        // New path: Windows CNG (SHA-NI on modern x86_64 CPUs).
-        let t = Instant::now();
-        let mut cng = CngSha256::new().expect("cng new");
-        cng.update(&data).expect("update");
-        let cng_digest = cng.finalize().expect("finalize");
-        let cng_ms = t.elapsed().as_millis();
-        // Correctness: CNG must agree with the RustCrypto implementation.
-        assert_eq!(hex_encode(&soft_digest), hex_encode(&cng_digest));
-        // 64 MiB hashed in N ms => GiB/s = (64 / 1024) / (N / 1000).
-        let soft_gibs = 64.0 / 1024.0 / (soft_ms as f64 / 1000.0);
-        let cng_gibs = 64.0 / 1024.0 / (cng_ms as f64 / 1000.0);
-        eprintln!("sha2 software: {soft_gibs:.2} GiB/s ({soft_ms} ms)");
-        eprintln!("sha2 CNG:      {cng_gibs:.2} GiB/s ({cng_ms} ms)");
-        assert!(
-            cng_ms < soft_ms,
-            "CNG ({cng_ms} ms) must beat pure software ({soft_ms} ms)"
-        );
     }
 
     #[test]
