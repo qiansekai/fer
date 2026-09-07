@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde_json::json;
 
+use file_engine_rust::image;
 use file_engine_rust::indexer::{self, Method};
 use file_engine_rust::mem::{MemIndex, dump_path};
 use file_engine_rust::query::Query;
@@ -107,6 +108,25 @@ enum Cmd {
         /// Maximum duplicate groups to report
         #[arg(long, default_value_t = 50)]
         limit: usize,
+    },
+    /// Capture an NTFS volume as a dynamic VHDX forensic image (used clusters
+    /// only; multi-threaded raw reads; requires an elevated shell)
+    Image {
+        /// Drive letter of the volume to image (e.g. I)
+        #[arg(long)]
+        volume: char,
+        /// Output .vhdx path
+        #[arg(long)]
+        output: PathBuf,
+        /// Payload block size in MiB (power of two, 1..=256)
+        #[arg(long, default_value_t = 32)]
+        block_size_mb: u32,
+        /// Reader threads (default: min(cpus, 16))
+        #[arg(long)]
+        threads: Option<usize>,
+        /// Re-read the finished image and verify the SHA-256
+        #[arg(long)]
+        verify: bool,
     },
 }
 
@@ -336,6 +356,42 @@ fn main() -> Result<()> {
                 Duration::from_secs(interval_secs),
                 Duration::from_secs(flush_secs),
             )?;
+        }
+        Cmd::Image {
+            volume,
+            output,
+            block_size_mb,
+            threads,
+            verify,
+        } => {
+            if !file_engine_rust::is_elevated() {
+                file_engine_rust::try_self_elevate()?;
+            }
+            let opts = image::ImageOptions {
+                volume,
+                output: &output,
+                block_size_mb,
+                threads,
+                verify,
+            };
+            let report = image::run(&opts)?;
+            if cli.json {
+                print_json(json!({ "ok": true, "report": report }))?;
+            } else {
+                println!(
+                    "volume {}: -> {}\n  volume {} (used {}, {:.1}%)\n  image  {} ({} blocks)\n  sha256 {}\n  elapsed {:.1}s{}",
+                    report.volume,
+                    report.output,
+                    fmt_bytes(report.volume_bytes),
+                    fmt_bytes(report.used_bytes),
+                    report.used_percent,
+                    fmt_bytes(report.image_bytes),
+                    report.blocks,
+                    report.sha256,
+                    report.elapsed_ms as f64 / 1000.0,
+                    if report.verified { ", verified" } else { "" },
+                );
+            }
         }
         Cmd::Upgrade => {
             let dump = dump_path(&db);

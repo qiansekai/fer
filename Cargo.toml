@@ -13,6 +13,12 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.104"
+# VHDX header/region-table CRC32C (SSE4.2-accelerated) for `fer image`.
+crc32c = "0.6"
+# Random bytes for VHDX GUIDs (file/data write, virtual disk id).
+getrandom = "0.3"
+# SHA-256 over the imaged volume contents (`fer image --verify` + hash output).
+sha2 = "0.10"
 # Server only needs http1 + json + query (+ the tokio integration for axum::serve).
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio"] }
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }

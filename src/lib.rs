@@ -6,6 +6,8 @@
 //! * `query`   — filter query language (`ext: size: dm: parent:` …)
 //! * `mem`     — FERIDX01 dump engine: mmap zero-copy, all queries in memory
 //! * `du`      — directory size aggregation (WizTree-style totals from the dump)
+//! * `image`   — volume → dynamic VHDX forensic image (used clusters only,
+//!   multi-threaded raw reads, streaming SHA-256)
 //! * `monitor` — USN journal polling to keep the index live
 //! * `server`  — HTTP API (axum) with a minimal web UI
 //! * `store`   — SQLite + FTS5 (feature `sqlite`, dev/test oracle only —
@@ -13,6 +15,7 @@
 
 pub mod du;
 pub mod dupes;
+pub mod image;
 pub mod indexer;
 pub mod mem;
 pub mod mft;
