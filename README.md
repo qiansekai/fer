@@ -72,8 +72,20 @@ fer dupes --min-size 1kb --limit 50  # 找重复文件（同大小分组 + 内�
 fer dupes --name adb.exe             # 只看文件名含 adb.exe 的重复组
 fer du "D:\proj" --top 20            # 磁盘占用聚合（WizTree 式 du，见下节）
 fer du "D:\" --depth 1 --top 10 --json  # 整卷顶层占用，JSON 输出
+fer image --volume I --output disk.vhdx --verify   # 卷 → 动态 VHDX 取证镜像（已用簇，多线程，SHA-256）
+fer image --volume I --output disk.vhdx --threads 8 --block-size-mb 32  # 控制并行度与块大小
 fer --db <path> <cmd>                # 自定义索引库（默认 %LOCALAPPDATA%\file-engine-rust\index.db）
 ```
+
+## fer image — 卷 → 动态 VHDX 取证镜像
+
+把 NTFS 卷做成**动态 VHDX**（Windows 磁盘管理可直接挂载），只拷贝已用簇：
+
+- `IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS` 定位卷在物理盘上的偏移 → `FSCTL_GET_VOLUME_BITMAP` 直接拿 NTFS 已用簇位图（零 NTFS 结构解析）→ 多线程从 `\\.\PhysicalDriveN` 只读已用扇区
+- 全零块跳过（BAT 保持 NOT_PRESENT），镜像体积 ≈ 已用空间；未用扇区按零参与 SHA-256，**卷哈希与全盘 dd 的修剪卷哈希一致**
+- `--verify` 完成后重开镜像、走 BAT 重读 payload 块比对哈希
+- 需要管理员（物理盘直读），非提权自动弹 UAC 请求提权
+- 限制：单 extent 卷（不支持跨区/带区卷）；NTFS only；扇区位图块不生成（块内全扇区有效语义）
 
 ## 查询语言（CLI 与 HTTP 共用）
 

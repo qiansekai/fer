@@ -48,7 +48,9 @@ const REGION1_OFFSET: u64 = 192 * KIB;
 const REGION2_OFFSET: u64 = 256 * KIB;
 const LOG_OFFSET: u64 = MIB;
 const LOG_LENGTH: u64 = MIB;
-const BAT_REGION_OFFSET: u64 = 2 * MIB;
+/// Metadata region sits directly after the log (2 MiB), BAT after it — the
+/// layout Windows itself writes (Disk2vhd reference image verified byte-wise).
+const METADATA_REGION_OFFSET: u64 = 2 * MIB;
 const METADATA_REGION_SIZE: u64 = MIB;
 const HEADER_SIZE: usize = 4096;
 const REGION_TABLE_SIZE: usize = 64 * KIB as usize;
@@ -112,6 +114,8 @@ struct StartingLcnInput {
     starting_lcn: i64,
 }
 
+/// NTFS_VOLUME_DATA_BUFFER (0x60 = 96 bytes; the truncated 40-byte view made
+/// FSCTL_GET_NTFS_VOLUME_DATA fail with ERROR_INSUFFICIENT_BUFFER).
 #[repr(C)]
 struct NtfsVolumeData {
     _volume_serial: i64,
@@ -125,6 +129,9 @@ struct NtfsVolumeData {
     _clusters_per_file_record: u32,
     _mft_valid_data_length: i64,
     _mft_start_lcn: i64,
+    _mft2_start_lcn: i64,
+    _mft_zone_start: i64,
+    _mft_zone_end: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -154,26 +161,28 @@ fn open_device(path: &str) -> Result<HANDLE> {
     Ok(handle)
 }
 
-fn ioctl_read(handle: HANDLE, code: u32, input: &[u8], out_len: usize) -> Result<Vec<u8>> {
+fn ioctl_read(handle: HANDLE, code: u32, input: &[u8], out_len: usize) -> Result<(Vec<u8>, u32)> {
     let mut out = vec![0u8; out_len];
     let mut returned = 0u32;
+    let (in_ptr, in_len) = if input.is_empty() {
+        (std::ptr::null(), 0u32)
+    } else {
+        (input.as_ptr(), input.len() as u32)
+    };
     let ok = unsafe {
         DeviceIoControl(
             handle,
             code,
-            input.as_ptr() as *const core::ffi::c_void,
-            input.len() as u32,
+            in_ptr as *const core::ffi::c_void,
+            in_len,
             out.as_mut_ptr() as *mut core::ffi::c_void,
             out_len as u32,
             &mut returned,
             std::ptr::null_mut(),
         )
     };
-    if ok == 0 {
-        bail!("DeviceIoControl failed (error {})", unsafe { GetLastError() });
-    }
-    out.truncate(returned as usize);
-    Ok(out)
+    let err = if ok == 0 { unsafe { GetLastError() } } else { 0 };
+    Ok((out, if err != 0 { err } else { 0 }))
 }
 
 /// Synchronous positioned read from a raw device handle (no OVERLAPPED: the
@@ -219,25 +228,24 @@ struct VolumeGeom {
     extent_offset: u64,
     /// Volume length in bytes.
     extent_length: u64,
+    bytes_per_sector: u64,
     bytes_per_cluster: u64,
     total_clusters: u64,
 }
 
 fn query_geometry(vol: HANDLE) -> Result<VolumeGeom> {
-    let ext_raw = ioctl_read(
-        vol,
-        IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
-        &[],
-        std::mem::size_of::<DiskExtents>(),
-    )?;
-    if ext_raw.len() < 8 {
-        bail!("volume extents query returned a truncated buffer");
+    // Single call with room for up to 32 extents (8-byte header + entries);
+    // small probe buffers make the ioctl fail with ERROR_INVALID_PARAMETER.
+    let full_len = 8 + 32 * std::mem::size_of::<DiskExtent>();
+    let (ext_raw, err) = ioctl_read(vol, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, &[], full_len)?;
+    if err != 0 {
+        bail!("volume extents query failed (error {err})");
     }
     let ext = unsafe { &*(ext_raw.as_ptr() as *const DiskExtents) };
     if ext.number_of_extents != 1 {
         bail!(
-            "volume spans {} extents — multi-extent (spanned/striped) volumes are not \
-             supported yet",
+            "volume spans {} extents — multi-extent (spanned/striped) volumes are \
+             not supported yet",
             ext.number_of_extents
         );
     }
@@ -246,12 +254,15 @@ fn query_geometry(vol: HANDLE) -> Result<VolumeGeom> {
         bail!("volume extent has an invalid offset/length");
     }
 
-    let nd_raw = ioctl_read(
+    let (nd_raw, err) = ioctl_read(
         vol,
         FSCTL_GET_NTFS_VOLUME_DATA,
         &[],
         std::mem::size_of::<NtfsVolumeData>(),
     )?;
+    if err != 0 {
+        bail!("NTFS volume data query failed (error {err})");
+    }
     let nd = unsafe { &*(nd_raw.as_ptr() as *const NtfsVolumeData) };
     if nd.bytes_per_cluster == 0 {
         bail!("volume reports zero bytes per cluster (not NTFS?)");
@@ -261,26 +272,40 @@ fn query_geometry(vol: HANDLE) -> Result<VolumeGeom> {
         disk_number: e.disk_number,
         extent_offset: e.starting_offset as u64,
         extent_length: e.extent_length as u64,
+        bytes_per_sector: u64::from(nd.bytes_per_sector),
         bytes_per_cluster: u64::from(nd.bytes_per_cluster),
         total_clusters: nd.total_clusters.max(0) as u64,
     })
 }
 
-/// Query the NTFS used-cluster bitmap starting at cluster 0.
+/// Query the NTFS used-cluster bitmap starting at cluster 0. The output
+/// buffer is sized from `TotalClusters` up front (small probe buffers fail
+/// with ERROR_INSUFFICIENT_BUFFER on this ioctl); ERROR_MORE_DATA is retried
+/// with the exact bitmap_size as a fallback. The fixed header is 16 bytes
+/// (StartingLcn + BitmapSize); the bitmap itself starts at offset 16.
 fn query_bitmap(vol: HANDLE, geom: &VolumeGeom) -> Result<Vec<u8>> {
     let input = StartingLcnInput { starting_lcn: 0 };
     let input_bytes = unsafe {
         std::slice::from_raw_parts((&input as *const StartingLcnInput).cast::<u8>(), 8)
     };
-    // Worst case: 8-byte fixed header + one bit per cluster.
-    let need = 8usize
-        .saturating_add(geom.total_clusters.div_ceil(8) as usize)
-        .max(16);
-    let raw = ioctl_read(vol, FSCTL_GET_VOLUME_BITMAP, input_bytes, need)?;
-    if raw.len() < 8 {
-        bail!("FSCTL_GET_VOLUME_BITMAP returned a truncated buffer");
+    let need = 16usize.saturating_add(geom.total_clusters.div_ceil(8) as usize).max(32);
+    let (raw, err) = ioctl_read(vol, FSCTL_GET_VOLUME_BITMAP, input_bytes, need)?;
+    if err == 234 /* ERROR_MORE_DATA */ {
+        let bitmap_size = i64::from_le_bytes(raw[8..16].try_into().expect("8 bytes"));
+        if bitmap_size <= 0 {
+            bail!("volume bitmap reports a non-positive size ({bitmap_size})");
+        }
+        let (raw2, err2) =
+            ioctl_read(vol, FSCTL_GET_VOLUME_BITMAP, input_bytes, 16 + bitmap_size as usize)?;
+        if err2 != 0 {
+            bail!("volume bitmap fetch failed (error {err2})");
+        }
+        return Ok(raw2[16..].to_vec());
     }
-    Ok(raw[8..].to_vec())
+    if err != 0 {
+        bail!("volume bitmap query failed (error {err})");
+    }
+    Ok(raw[16..].to_vec())
 }
 
 /// Expand the cluster bitmap into merged, sorted `(phys_start, phys_end)` byte
@@ -319,6 +344,8 @@ struct VhdxWriter {
     chunk_ratio: u64,
     /// Total BAT entries (payload + sector-bitmap slots).
     total_entries: u64,
+    /// BAT region file offset.
+    bat_offset: u64,
     /// Next payload block file offset.
     next_payload_offset: u64,
 }
@@ -327,16 +354,26 @@ impl VhdxWriter {
     fn create(
         path: &Path, virtual_size: u64, block_size: u32, logical_sector_size: u32,
     ) -> Result<Self> {
+        // Windows requires the virtual disk size to be 1 MiB-aligned (an
+        // unaligned size makes the image unmountable with
+        // ERROR_FILE_CORRUPT); round up — the trailing bytes beyond the real
+        // volume read as zero and the streaming hash covers only the real
+        // length.
+        let virtual_size = virtual_size.div_ceil(MIB) * MIB;
         let bs = u64::from(block_size);
         let num_payload = virtual_size.div_ceil(bs);
         let chunk_ratio = (1u64 << 23) * u64::from(logical_sector_size) / bs;
         let num_sb = num_payload.div_ceil(chunk_ratio);
         let total_entries = num_payload + num_sb;
         let bat_bytes = (total_entries * 8).div_ceil(MIB).max(1) * MIB;
-        let metadata_offset = BAT_REGION_OFFSET + bat_bytes;
-        let end = metadata_offset + METADATA_REGION_SIZE;
-        // First payload block sits 1 MiB-aligned after the metadata region.
-        let first_payload_offset = end.div_ceil(MIB) * MIB;
+        // Windows-native layout: log (1 MiB) → metadata (2 MiB) → BAT (3 MiB)
+        // → payload. The first payload offset must be aligned to the BLOCK
+        // SIZE (MS-VHDX §2.5.1.1), not just 1 MiB — 32 MiB blocks on a 4 MiB
+        // header make Windows reject the image otherwise.
+        let metadata_offset = METADATA_REGION_OFFSET;
+        let bat_offset = metadata_offset + METADATA_REGION_SIZE;
+        let end = bat_offset + bat_bytes;
+        let first_payload_offset = end.div_ceil(bs) * bs;
 
         let f = File::create(path).with_context(|| format!("cannot create {}", path.display()))?;
         let mut w = BufWriter::new(f);
@@ -348,19 +385,21 @@ impl VhdxWriter {
         buf[8..8 + creator.len()].copy_from_slice(&creator);
         w.write_all(&buf)?;
 
-        // 2. Headers 1 + 2.
+        // 2. Headers 1 + 2 (header 1 carries the higher sequence number, as
+        //    Windows writes it).
         let file_write_guid = guid_v4();
         let data_write_guid = guid_v4();
-        write_all_at(&mut w, HEADER1_OFFSET, &build_header(0, &file_write_guid, &data_write_guid))?;
-        write_all_at(&mut w, HEADER2_OFFSET, &build_header(1, &file_write_guid, &data_write_guid))?;
+        write_all_at(&mut w, HEADER1_OFFSET, &build_header(1, &file_write_guid, &data_write_guid))?;
+        write_all_at(&mut w, HEADER2_OFFSET, &build_header(0, &file_write_guid, &data_write_guid))?;
 
-        // 3. Region tables 1 + 2.
-        let region = build_region_table(bat_bytes, metadata_offset);
+        // 3. Region tables 1 + 2 (metadata entry first, BAT second — Windows
+        //    layout).
+        let region = build_region_table(metadata_offset, bat_offset, bat_bytes);
         write_all_at(&mut w, REGION1_OFFSET, &region)?;
         write_all_at(&mut w, REGION2_OFFSET, &region)?;
 
-        // 4. Log + BAT + metadata region: zero-filled by set_len (dynamic disk
-        //    BAT = all NOT_PRESENT).
+        // 4. Log + metadata + BAT regions: zero-filled by set_len (dynamic
+        //    disk BAT = all NOT_PRESENT).
         w.flush()?;
         w.get_ref().set_len(end)?;
 
@@ -375,6 +414,7 @@ impl VhdxWriter {
             block_size: bs,
             chunk_ratio,
             total_entries,
+            bat_offset,
             next_payload_offset: first_payload_offset,
         })
     }
@@ -398,7 +438,7 @@ impl VhdxWriter {
             bail!("BAT entry {entry_idx} out of range");
         }
         let entry = BAT_STATE_PRESENT | (off_mb << 20);
-        write_all_at(&mut self.file, BAT_REGION_OFFSET + entry_idx * 8, &entry.to_le_bytes())?;
+        write_all_at(&mut self.file, self.bat_offset + entry_idx * 8, &entry.to_le_bytes())?;
 
         self.next_payload_offset += self.block_size;
         Ok(())
@@ -444,19 +484,19 @@ fn build_header(
     buf
 }
 
-fn build_region_table(bat_size: u64, metadata_offset: u64) -> [u8; REGION_TABLE_SIZE] {
+fn build_region_table(metadata_offset: u64, bat_offset: u64, bat_size: u64) -> [u8; REGION_TABLE_SIZE] {
     let mut buf = [0u8; REGION_TABLE_SIZE];
     buf[..4].copy_from_slice(b"regi");
     buf[8..12].copy_from_slice(&2u32.to_le_bytes()); // entry count
-    // Entry 0: BAT region.
-    buf[16..32].copy_from_slice(&BAT_REGION_GUID);
-    buf[32..40].copy_from_slice(&BAT_REGION_OFFSET.to_le_bytes());
-    buf[40..44].copy_from_slice(&(bat_size as u32).to_le_bytes());
+    // Entry 0: metadata region (Windows puts it first).
+    buf[16..32].copy_from_slice(&METADATA_REGION_GUID);
+    buf[32..40].copy_from_slice(&metadata_offset.to_le_bytes());
+    buf[40..44].copy_from_slice(&(METADATA_REGION_SIZE as u32).to_le_bytes());
     buf[44..48].copy_from_slice(&1u32.to_le_bytes()); // Required
-    // Entry 1: metadata region.
-    buf[48..64].copy_from_slice(&METADATA_REGION_GUID);
-    buf[64..72].copy_from_slice(&metadata_offset.to_le_bytes());
-    buf[72..76].copy_from_slice(&(METADATA_REGION_SIZE as u32).to_le_bytes());
+    // Entry 1: BAT region.
+    buf[48..64].copy_from_slice(&BAT_REGION_GUID);
+    buf[64..72].copy_from_slice(&bat_offset.to_le_bytes());
+    buf[72..76].copy_from_slice(&(bat_size as u32).to_le_bytes());
     buf[76..80].copy_from_slice(&1u32.to_le_bytes()); // Required
     let checksum = crc32c::crc32c(&buf);
     buf[4..8].copy_from_slice(&checksum.to_le_bytes());
@@ -479,8 +519,8 @@ fn build_metadata(
     let push = |items: &mut Vec<u8>, entries: &mut Vec<(u16, u32, u32, u32)>, guid_idx: u16, bytes: &[u8], is_virtual_disk: bool| {
         let offset = METADATA_TABLE_SIZE as u32 + items.len() as u32;
         items.extend_from_slice(bytes);
-        // Flags: bit 0 = IsUser, bit 1 = IsVirtualDisk, bit 2 = IsRequired.
-        let flags = 0b101u32 | (u32::from(is_virtual_disk) << 1);
+        // Flags: bit 1 = IsVirtualDisk, bit 2 = IsRequired (IsUser stays 0).
+        let flags = 0b100u32 | (u32::from(is_virtual_disk) << 1);
         entries.push((guid_idx, offset, bytes.len() as u32, flags));
     };
     push(&mut items, &mut entries, 0, &file_params, false);
@@ -497,6 +537,8 @@ fn build_metadata(
         PHYSICAL_SECTOR_SIZE_GUID,
     ];
     let mut table = [0u8; METADATA_TABLE_SIZE];
+    // 8-byte signature "metadata" — MS-VHDX §2.6 has NO checksum field in the
+    // metadata table header (bytes 4..8 are part of the signature).
     table[..8].copy_from_slice(b"metadata");
     table[10..12].copy_from_slice(&(entries.len() as u16).to_le_bytes());
     for (i, (guid_idx, offset, len, flags)) in entries.iter().enumerate() {
@@ -553,20 +595,27 @@ pub fn run(opts: &ImageOptions) -> Result<ImageReport> {
     let bitmap = query_bitmap(vol, &geom)?;
     unsafe { CloseHandle(vol) };
 
-    // 2. Used-sector ranges on the physical disk.
-    let ranges = used_ranges(&bitmap, &geom);
+    // 2. Disk-level image: cover from physical LBA 0 so the GPT header and
+    //    partition table are included and the volume keeps its original
+    //    partition offset. Used-sector ranges = the disk head (0..extent) plus
+    //    the NTFS used clusters.
+    let mut ranges = vec![(0u64, geom.extent_offset)];
+    ranges.extend(used_ranges(&bitmap, &geom));
     let used_bytes: u64 = ranges.iter().map(|(s, e)| e - s).sum();
-    let volume_bytes = geom.extent_length;
+    let image_bytes_total = geom.extent_offset + geom.extent_length;
 
-    // 3. Block grid over the volume.
-    let num_blocks = volume_bytes.div_ceil(block_size);
+    // 3. Block grid over the image.
+    let num_blocks = image_bytes_total.div_ceil(block_size);
     let threads = opts
         .threads
         .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(16));
 
-    // 4. Writer.
-    let mut writer =
-        VhdxWriter::create(opts.output, volume_bytes, block_size as u32, 4096)?;
+    // 4. Writer. The logical sector size follows the source disk (512 or
+    //    4096): the partition table inside the image is interpreted in those
+    //    sectors, so a 512-sector GPT source must not be labeled 4096 or the
+    //    mounter misreads the GPT header location and degrades to MBR.
+    let logical_sector_size = geom.bytes_per_sector as u32;
+    let mut writer = VhdxWriter::create(opts.output, image_bytes_total, block_size as u32, logical_sector_size)?;
 
     // 5. Parallel readers + ordered writer. Readers pull block indices from a
     //    shared counter (out-of-order completion), the main thread re-orders
@@ -590,7 +639,6 @@ pub fn run(opts: &ImageOptions) -> Result<ImageReport> {
             self.0.store(true, Ordering::Release);
         }
     }
-    let _quit_guard = QuitOnDrop(quit.clone());
 
     let mut hasher = Sha256::new();
     let mut pending: BTreeMap<u64, (Vec<u8>, bool)> = BTreeMap::new();
@@ -598,6 +646,10 @@ pub fn run(opts: &ImageOptions) -> Result<ImageReport> {
     let mut blocks_stored = 0u64;
 
     let scope_result: Result<()> = std::thread::scope(|scope| -> Result<()> {
+        // The quit guard lives INSIDE the scope: every exit path (Ok or Err)
+        // flips the flag before scope() joins the readers, so a reader stuck
+        // on the inflight window always wakes up and exits — no deadlock.
+        let _quit_guard = QuitOnDrop(quit.clone());
         // Shared state is borrowed by the reader closures (scoped threads
         // permit borrowing); each reader also owns a private disk handle.
         let disk_path = &disk_path;
@@ -605,19 +657,23 @@ pub fn run(opts: &ImageOptions) -> Result<ImageReport> {
         let inflight = &inflight;
         let ranges = &ranges;
         let geom = &geom;
+        let (err_tx, err_rx) = mpsc::channel::<String>();
         let mut handles = Vec::new();
         for _ in 0..threads {
             let tx = tx.clone();
             let quit = quit.clone();
+            let err_tx = err_tx.clone();
             handles.push(scope.spawn(move || -> Result<()> {
                 let h = open_device(disk_path)?;
                 let mut buf = vec![0u8; block_size as usize];
                 loop {
-                    let idx = next_block.fetch_add(1, Ordering::Relaxed) as u64;
-                    if idx >= num_blocks {
-                        break;
-                    }
-                    // Backpressure: bounded number of blocks in flight.
+                    // Wait for an inflight slot BEFORE claiming a block: a
+                    // claimed block is then always sent (the channel is
+                    // unbounded), so the ordered consumer can never stall on
+                    // a claimed-but-undelivered block while every reader is
+                    // parked on the window (the livelock that burned CPU).
+                    // The window is a soft bound: concurrent wake-ups can
+                    // overshoot by at most the thread count.
                     while inflight.load(Ordering::Acquire) >= max_inflight {
                         if quit.load(Ordering::Acquire) {
                             unsafe { CloseHandle(h) };
@@ -625,11 +681,26 @@ pub fn run(opts: &ImageOptions) -> Result<ImageReport> {
                         }
                         std::thread::yield_now();
                     }
+                    let idx = next_block.fetch_add(1, Ordering::Relaxed) as u64;
+                    if idx >= num_blocks {
+                        break;
+                    }
                     inflight.fetch_add(1, Ordering::AcqRel);
-                    let touched = fill_block(h, ranges, geom, idx, block_size, &mut buf)?;
-                    if tx.send((idx, std::mem::take(&mut buf), touched)).is_err() {
-                        unsafe { CloseHandle(h) };
-                        return Ok(()); // writer bailed: receiver dropped
+                    match fill_block(h, ranges, geom, idx, block_size, &mut buf) {
+                        Ok(touched) => {
+                            if tx.send((idx, std::mem::take(&mut buf), touched)).is_err() {
+                                unsafe { CloseHandle(h) };
+                                return Ok(()); // writer bailed: receiver dropped
+                            }
+                        }
+                        Err(e) => {
+                            // Release the slot before reporting, or the other
+                            // readers deadlock on the inflight window.
+                            inflight.fetch_sub(1, Ordering::AcqRel);
+                            let _ = err_tx.send(format!("block {idx}: {e:#}"));
+                            unsafe { CloseHandle(h) };
+                            return Ok(());
+                        }
                     }
                     buf = vec![0u8; block_size as usize];
                 }
@@ -638,33 +709,46 @@ pub fn run(opts: &ImageOptions) -> Result<ImageReport> {
             }));
         }
         drop(tx);
+        drop(err_tx);
 
         // Ordered consume + write + hash (the scope's main thread). All-zero
         // blocks feed the hash but are skipped on disk (BAT stays
-        // NOT_PRESENT), keeping the dynamic image at used-cluster size.
-        for (idx, buf, touched) in rx {
-            pending.insert(idx, (buf, touched));
-            while let Some((&i, _)) = pending.first_key_value() {
-                if i != next_out {
-                    break;
+        // NOT_PRESENT), keeping the dynamic image at used-cluster size. The
+        // loop polls with a timeout so a reader error (delivered on err_rx
+        // while a block slot is lost) is observed instead of deadlocking.
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_millis(250)) {
+                Ok((idx, buf, touched)) => {
+                    pending.insert(idx, (buf, touched));
+                    while let Some((&i, _)) = pending.first_key_value() {
+                        if i != next_out {
+                            break;
+                        }
+                        let (data, touched) = pending.remove(&i).expect("first key present");
+                        let valid = (image_bytes_total.saturating_sub(i * block_size)).min(block_size);
+                        if touched {
+                            writer.write_block(i, &data)?;
+                            blocks_stored += 1;
+                        }
+                        hasher.update(&data[..valid as usize]);
+                        inflight.fetch_sub(1, Ordering::AcqRel);
+                        next_out += 1;
+                        if next_out.is_multiple_of(32) || next_out == num_blocks {
+                            eprintln!(
+                                "\r[{}/{} blocks] {:.1}%",
+                                next_out,
+                                num_blocks,
+                                next_out as f64 / num_blocks as f64 * 100.0
+                            );
+                        }
+                    }
                 }
-                let (data, touched) = pending.remove(&i).expect("first key present");
-                let valid = (volume_bytes.saturating_sub(i * block_size)).min(block_size);
-                if touched {
-                    writer.write_block(i, &data)?;
-                    blocks_stored += 1;
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if let Ok(e) = err_rx.try_recv() {
+                        bail!("reader failure: {e}");
+                    }
                 }
-                hasher.update(&data[..valid as usize]);
-                inflight.fetch_sub(1, Ordering::AcqRel);
-                next_out += 1;
-                if next_out.is_multiple_of(32) || next_out == num_blocks {
-                    eprintln!(
-                        "\r[{}/{} blocks] {:.1}%",
-                        next_out,
-                        num_blocks,
-                        next_out as f64 / num_blocks as f64 * 100.0
-                    );
-                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
         // Scope exit drops quit_tx -> readers waiting on backpressure see the
@@ -674,6 +758,9 @@ pub fn run(opts: &ImageOptions) -> Result<ImageReport> {
                 Ok(r) => r?,
                 Err(_) => bail!("a reader thread panicked"),
             }
+        }
+        if let Ok(e) = err_rx.try_recv() {
+            bail!("reader failure: {e}");
         }
         Ok(())
     });
@@ -690,7 +777,7 @@ pub fn run(opts: &ImageOptions) -> Result<ImageReport> {
     // 7. Optional self-verification: re-open the finished image, re-read the
     //    payload blocks, and compare the recomputed hash.
     let verified = if opts.verify {
-        verify_image(opts.output, volume_bytes, block_size, &sha256)?
+        verify_image(opts.output, image_bytes_total, block_size, logical_sector_size, &sha256)?
     } else {
         false
     };
@@ -698,9 +785,9 @@ pub fn run(opts: &ImageOptions) -> Result<ImageReport> {
     Ok(ImageReport {
         volume: format!("{}:", opts.volume.to_ascii_uppercase()),
         output: opts.output.display().to_string(),
-        volume_bytes,
+        volume_bytes: image_bytes_total,
         used_bytes,
-        used_percent: used_bytes as f64 / volume_bytes.max(1) as f64 * 100.0,
+        used_percent: used_bytes as f64 / image_bytes_total.max(1) as f64 * 100.0,
         image_bytes,
         sha256,
         blocks: blocks_stored,
@@ -710,16 +797,17 @@ pub fn run(opts: &ImageOptions) -> Result<ImageReport> {
 }
 
 /// Fill one block buffer: zeros everywhere, real data where the block overlaps
-/// used cluster ranges on the physical disk. Ranges are looked up by binary
-/// search (blocks arrive in arbitrary order across threads). Returns whether
-/// any used sector touched the block (all-zero blocks are skipped entirely and
-/// their BAT entries stay NOT_PRESENT).
+/// used ranges on the physical disk (disk-level coordinates — block 0 starts
+/// at physical LBA 0 so GPT headers come along). Ranges are looked up by
+/// binary search (blocks arrive in arbitrary order across threads). Returns
+/// whether any used sector touched the block (all-zero blocks are skipped
+/// entirely and their BAT entries stay NOT_PRESENT).
 fn fill_block(
-    h: HANDLE, ranges: &[(u64, u64)], geom: &VolumeGeom, idx: u64, block_size: u64,
+    h: HANDLE, ranges: &[(u64, u64)], _geom: &VolumeGeom, idx: u64, block_size: u64,
     buf: &mut [u8],
 ) -> Result<bool> {
     buf.fill(0);
-    let b_start = geom.extent_offset + idx * block_size;
+    let b_start = idx * block_size;
     let b_end = b_start + block_size;
     let mut ri = ranges.partition_point(|&(_, e)| e <= b_start);
     let mut touched = false;
@@ -742,7 +830,9 @@ fn fill_block(
 /// Re-open the finished VHDX, walk its BAT, re-read the stored payload blocks
 /// (NOT_PRESENT blocks hash as zero), and compare the recomputed volume hash
 /// with `expected`.
-fn verify_image(path: &Path, volume_bytes: u64, block_size: u64, expected: &str) -> Result<bool> {
+fn verify_image(
+    path: &Path, volume_bytes: u64, block_size: u64, logical_sector_size: u32, expected: &str,
+) -> Result<bool> {
     use std::io::Read;
     let mut f = File::open(path)?;
     let mut sig = [0u8; 8];
@@ -757,11 +847,9 @@ fn verify_image(path: &Path, volume_bytes: u64, block_size: u64, expected: &str)
     if &region[..4] != b"regi" {
         bail!("verify: bad region table");
     }
-    let bat_region_offset =
-        u64::from_le_bytes(region[32..40].try_into().expect("8 bytes"));
+    let bat_region_offset = u64::from_le_bytes(region[64..72].try_into().expect("8 bytes"));
 
-    // Logical sector size is fixed at 4096 by the writer.
-    let chunk_ratio = (1u64 << 23) * 4096 / block_size;
+    let chunk_ratio = (1u64 << 23) * u64::from(logical_sector_size) / block_size;
     let num_blocks = volume_bytes.div_ceil(block_size);
     let file_end = std::fs::metadata(path)?.len();
     let mut hasher = Sha256::new();
@@ -811,6 +899,7 @@ mod tests {
             disk_number: 0,
             extent_offset: 1024 * 1024,
             extent_length: 8 * MIB,
+            bytes_per_sector: 512,
             bytes_per_cluster: 4096,
             total_clusters: 8 * MIB / 4096,
         }
@@ -873,20 +962,21 @@ mod tests {
         // Region table.
         let region = &bytes[REGION1_OFFSET as usize..REGION1_OFFSET as usize + REGION_TABLE_SIZE];
         assert_eq!(&region[..4], b"regi");
-        assert_eq!(&region[16..32], &BAT_REGION_GUID);
-        // Metadata table: signature + 5 entries.
+        assert_eq!(&region[16..32], &METADATA_REGION_GUID);
+        assert_eq!(&region[48..64], &BAT_REGION_GUID);
+        // Metadata table: 8-byte signature "metadata" + 5 entries, at 2 MiB.
         let bat_bytes = (bat_entries(virtual_size, block_size as u64, 4096) * 8).div_ceil(MIB).max(1) * MIB;
-        let meta_off = (BAT_REGION_OFFSET + bat_bytes) as usize;
+        let meta_off = METADATA_REGION_OFFSET as usize;
         assert_eq!(&bytes[meta_off..meta_off + 8], b"metadata");
         let cnt = u16::from_le_bytes(bytes[meta_off + 10..meta_off + 12].try_into().expect("cnt"));
         assert_eq!(cnt, 5);
-        // BAT: chunk_ratio for 1 MiB blocks @4096 is 32768, so the first 8
-        // payload entries sit at BAT indexes 0..8.
-        let first_payload =
-            (meta_off + METADATA_REGION_SIZE as usize).div_ceil(MIB as usize) * MIB as usize;
+        // BAT sits at 3 MiB; chunk_ratio for 1 MiB blocks @4096 is 32768, so
+        // the first 8 payload entries sit at BAT indexes 0..8.
+        let bat_off = (METADATA_REGION_OFFSET + METADATA_REGION_SIZE) as usize;
+        let first_payload = (bat_off + bat_bytes as usize).div_ceil(MIB as usize) * MIB as usize;
         for i in 0..8usize {
             let e = u64::from_le_bytes(
-                bytes[BAT_REGION_OFFSET as usize + i * 8..BAT_REGION_OFFSET as usize + (i + 1) * 8]
+                bytes[bat_off + i * 8..bat_off + (i + 1) * 8]
                     .try_into()
                     .expect("bat entry"),
             );
@@ -912,15 +1002,16 @@ mod tests {
         let bytes = std::fs::read(&path).expect("read");
         let bat_bytes =
             (bat_entries(virtual_size, block_size as u64, 512) * 8).div_ceil(MIB).max(1) * MIB;
+        let bat_off = (METADATA_REGION_OFFSET + METADATA_REGION_SIZE) as usize;
         let e4096 = u64::from_le_bytes(
-            bytes[BAT_REGION_OFFSET as usize + 4097 * 8..BAT_REGION_OFFSET as usize + 4098 * 8]
+            bytes[bat_off + 4097 * 8..bat_off + 4098 * 8]
                 .try_into()
                 .expect("bat entry"),
         );
         assert_eq!(e4096 & 0b111, BAT_STATE_PRESENT);
         // The SB slot at index 4096 stays NOT_PRESENT.
         let sb = u64::from_le_bytes(
-            bytes[BAT_REGION_OFFSET as usize + 4096 * 8..BAT_REGION_OFFSET as usize + 4097 * 8]
+            bytes[bat_off + 4096 * 8..bat_off + 4097 * 8]
                 .try_into()
                 .expect("sb entry"),
         );
@@ -945,33 +1036,49 @@ mod tests {
         let bytes = std::fs::read(&path).expect("read");
         let bat_bytes =
             (bat_entries(virtual_size, block_size as u64, 4096) * 8).div_ceil(MIB).max(1) * MIB;
-        let meta_off = BAT_REGION_OFFSET + bat_bytes;
-        let first_payload =
-            (meta_off + METADATA_REGION_SIZE).div_ceil(MIB) * MIB;
+        let bat_off = (METADATA_REGION_OFFSET + METADATA_REGION_SIZE) as usize;
+        let first_payload = (bat_off + bat_bytes as usize).div_ceil(MIB as usize) * MIB as usize;
         let e0 = u64::from_le_bytes(
-            bytes[BAT_REGION_OFFSET as usize..BAT_REGION_OFFSET as usize + 8]
-                .try_into()
-                .expect("e0"),
+            bytes[bat_off..bat_off + 8].try_into().expect("e0"),
         );
         let e1 = u64::from_le_bytes(
-            bytes[BAT_REGION_OFFSET as usize + 8..BAT_REGION_OFFSET as usize + 16]
-                .try_into()
-                .expect("e1"),
+            bytes[bat_off + 8..bat_off + 16].try_into().expect("e1"),
         );
         let e2 = u64::from_le_bytes(
-            bytes[BAT_REGION_OFFSET as usize + 16..BAT_REGION_OFFSET as usize + 24]
-                .try_into()
-                .expect("e2"),
+            bytes[bat_off + 16..bat_off + 24].try_into().expect("e2"),
         );
         assert_eq!(e0 & 0b111, BAT_STATE_PRESENT);
         assert_eq!(e1, 0, "skipped block must stay NOT_PRESENT");
         assert_eq!(e2 & 0b111, BAT_STATE_PRESENT);
-        assert_eq!((e0 >> 20) * MIB, first_payload);
-        assert_eq!((e2 >> 20) * MIB, first_payload + MIB);
+        assert_eq!((e0 >> 20) * MIB, first_payload as u64);
+        assert_eq!((e2 >> 20) * MIB, first_payload as u64 + MIB);
         // File size = metadata end + 2 stored blocks (the skipped block costs
         // nothing).
-        let expected_len = first_payload + 2 * MIB;
+        let expected_len = first_payload as u64 + 2 * MIB;
         assert_eq!(bytes.len() as u64, expected_len);
+    }
+
+    #[test]
+    #[ignore = "emits %TEMP%\\fer-test.vhdx for external mount validation"]
+    fn emit_small_image_for_mount_check() {
+        let path = std::env::temp_dir().join("fer-test.vhdx");
+        // Controlled experiment: only the virtual size varies.
+        let virtual_size = std::env::var("FER_EMIT_VSIZE").ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(256_060_476_928);
+        let block_size = 32 * MIB as u32;
+        let mut w = VhdxWriter::create(&path, virtual_size, block_size, 4096).expect("create");
+        let mut data = vec![0u8; block_size as usize];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        // Chunk boundary probe: exactly chunk_ratio (1024) blocks vs one more.
+        let n = std::env::var("FER_EMIT_BLOCKS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(1023);
+        for i in 0..n {
+            w.write_block(i, &data).expect("write block");
+        }
+        w.finish().expect("finish");
+        eprintln!("emitted {}", path.display());
     }
 
     fn bat_entries(virtual_size: u64, block_size: u64, logical: u32) -> u64 {
