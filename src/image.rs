@@ -337,7 +337,15 @@ fn used_ranges(bitmap: &[u8], geom: &VolumeGeom) -> Vec<(u64, u64)> {
 
 /// Minimal dynamic-VHDX writer: headers + region tables + dormant log + BAT +
 /// metadata, then sequentially appended payload blocks.
+///
+/// Payload blocks are appended strictly sequentially (only the first append
+/// seeks onto the payload tail); BAT entries are deferred to `finish()`, which
+/// writes them all in one pass. The old design sought payload → BAT → payload
+/// per block, i.e. two file-position jumps for every written block.
 struct VhdxWriter {
+    /// 64 MiB buffer: a 32 MiB block write stays inside the buffer and the
+    /// user→kernel boundary is crossed once per 64 MiB of payload instead of
+    /// once per 8 KiB (the default `BufWriter` capacity).
     file: BufWriter<File>,
     block_size: u64,
     /// Payload blocks per sector-bitmap block (MS-VHDX §2.5.1.1).
@@ -348,6 +356,12 @@ struct VhdxWriter {
     bat_offset: u64,
     /// Next payload block file offset.
     next_payload_offset: u64,
+    /// True when the buffered writer's logical position equals
+    /// `next_payload_offset` (payload tail), so `write_block` appends
+    /// without seeking.
+    at_payload_tail: bool,
+    /// Deferred BAT writes: `(entry index, entry value)` in write order.
+    bat_entries: Vec<(u64, u64)>,
 }
 
 impl VhdxWriter {
@@ -376,7 +390,7 @@ impl VhdxWriter {
         let first_payload_offset = end.div_ceil(bs) * bs;
 
         let f = File::create(path).with_context(|| format!("cannot create {}", path.display()))?;
-        let mut w = BufWriter::new(f);
+        let mut w = BufWriter::with_capacity(64 * MIB as usize, f);
 
         // 1. File type identifier.
         let mut buf = [0u8; 64 * KIB as usize];
@@ -416,13 +430,15 @@ impl VhdxWriter {
             total_entries,
             bat_offset,
             next_payload_offset: first_payload_offset,
+            at_payload_tail: false,
+            bat_entries: Vec::new(),
         })
     }
 
     /// Append one full payload block (must be exactly `block_size` bytes) and
-    /// update its BAT entry. `idx` is the payload block index (skipped
-    /// all-zero blocks leave their BAT entries NOT_PRESENT, so `idx` is not
-    /// the number of written blocks).
+    /// record its BAT entry for `finish()`. `idx` is the payload block index
+    /// (skipped all-zero blocks leave their BAT entries NOT_PRESENT, so `idx`
+    /// is not the number of written blocks).
     fn write_block(&mut self, idx: u64, data: &[u8]) -> Result<()> {
         if data.len() as u64 != self.block_size {
             bail!("payload block must be exactly {} bytes", self.block_size);
@@ -431,20 +447,45 @@ impl VhdxWriter {
         if off_mb >= (1u64 << 44) {
             bail!("payload offset exceeds BAT FileOffsetMB range");
         }
-        write_all_at(&mut self.file, self.next_payload_offset, data)?;
+        // Append the payload sequentially: seek only when the writer is not
+        // already sitting at the payload tail (the first block, or a block
+        // after any intervening seek). No per-block BAT write here — the
+        // entry is deferred so the payload stream stays a single sequential
+        // write.
+        if !self.at_payload_tail {
+            self.file.seek(SeekFrom::Start(self.next_payload_offset))?;
+            self.at_payload_tail = true;
+        }
+        self.file.write_all(data)?;
 
         let entry_idx = idx + idx / self.chunk_ratio;
         if entry_idx >= self.total_entries {
             bail!("BAT entry {entry_idx} out of range");
         }
         let entry = BAT_STATE_PRESENT | (off_mb << 20);
-        write_all_at(&mut self.file, self.bat_offset + entry_idx * 8, &entry.to_le_bytes())?;
+        self.bat_entries.push((entry_idx, entry));
 
         self.next_payload_offset += self.block_size;
         Ok(())
     }
 
+    /// Flush the payload tail, write every deferred BAT entry in one pass,
+    /// then flush and sync. Blocks arrive in increasing index order, so
+    /// consecutive entries are contiguous on disk and only the occasional
+    /// sector-bitmap slot gap (one per `chunk_ratio` blocks) plus the initial
+    /// jump off the metadata area need a seek — versus two seeks per block in
+    /// the old design.
     fn finish(&mut self) -> Result<()> {
+        self.file.flush()?;
+        let mut pos: Option<u64> = None;
+        for &(entry_idx, entry) in &self.bat_entries {
+            let off = self.bat_offset + entry_idx * 8;
+            if pos != Some(off) {
+                self.file.seek(SeekFrom::Start(off))?;
+            }
+            self.file.write_all(&entry.to_le_bytes())?;
+            pos = Some(off + 8);
+        }
         self.file.flush()?;
         self.file.get_ref().sync_all()?;
         Ok(())
