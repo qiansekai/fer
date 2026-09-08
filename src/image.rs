@@ -596,6 +596,17 @@ fn build_metadata(
 // Imaging pipeline
 // ---------------------------------------------------------------------------
 
+/// Where payload data is read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ReadMode {
+    /// Raw physical-disk reads (default; includes the disk head/GPT).
+    Physical,
+    /// Volume-handle reads for the volume body (filesystem-driver path, can
+    /// be faster on some USB bridges); the disk head still comes from the
+    /// physical disk.
+    Volume,
+}
+
 /// Options for one `fer image` run.
 pub struct ImageOptions<'a> {
     pub volume: char,
@@ -603,6 +614,7 @@ pub struct ImageOptions<'a> {
     pub block_size_mb: u32,
     pub threads: Option<usize>,
     pub verify: bool,
+    pub read_mode: ReadMode,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -629,12 +641,16 @@ pub fn run(opts: &ImageOptions) -> Result<ImageReport> {
         bail!("--block-size-mb must be a power of two between 1 and 256");
     }
 
-    // 1. Volume handle + geometry + bitmap.
+    // 1. Volume handle + geometry + bitmap. In `Volume` read mode the volume
+    //    handle also feeds the payload reads (filesystem-driver path).
     let vol_path = format!(r"\\.\{}:", opts.volume.to_ascii_uppercase());
     let vol = open_device(&vol_path)?;
     let geom = query_geometry(vol)?;
     let bitmap = query_bitmap(vol, &geom)?;
-    unsafe { CloseHandle(vol) };
+    let keep_vol = opts.read_mode == ReadMode::Volume;
+    if !keep_vol {
+        unsafe { CloseHandle(vol) };
+    }
 
     // 2. Disk-level image: cover from physical LBA 0 so the GPT header and
     //    partition table are included and the volume keeps its original
@@ -694,10 +710,11 @@ pub fn run(opts: &ImageOptions) -> Result<ImageReport> {
         // Shared state is borrowed by the reader closures (scoped threads
         // permit borrowing); each reader also owns a private disk handle.
         let disk_path = &disk_path;
+        let vol_path = &vol_path;
         let next_block = &next_block;
         let inflight = &inflight;
         let ranges = &ranges;
-        let geom = &geom;
+        let extent_offset = geom.extent_offset;
         let (err_tx, err_rx) = mpsc::channel::<String>();
         let mut handles = Vec::new();
         for _ in 0..threads {
@@ -706,6 +723,7 @@ pub fn run(opts: &ImageOptions) -> Result<ImageReport> {
             let err_tx = err_tx.clone();
             handles.push(scope.spawn(move || -> Result<()> {
                 let h = open_device(disk_path)?;
+                let vol_h = if keep_vol { Some(open_device(vol_path)?) } else { None };
                 let mut buf = vec![0u8; block_size as usize];
                 loop {
                     // Wait for an inflight slot BEFORE claiming a block: a
@@ -717,6 +735,9 @@ pub fn run(opts: &ImageOptions) -> Result<ImageReport> {
                     // overshoot by at most the thread count.
                     while inflight.load(Ordering::Acquire) >= max_inflight {
                         if quit.load(Ordering::Acquire) {
+                            if let Some(vh) = vol_h {
+                                unsafe { CloseHandle(vh) };
+                            }
                             unsafe { CloseHandle(h) };
                             return Ok(()); // writer bailed
                         }
@@ -727,9 +748,12 @@ pub fn run(opts: &ImageOptions) -> Result<ImageReport> {
                         break;
                     }
                     inflight.fetch_add(1, Ordering::AcqRel);
-                    match fill_block(h, ranges, geom, idx, block_size, &mut buf) {
+                    match fill_block(h, vol_h, extent_offset, ranges, idx, block_size, &mut buf) {
                         Ok(touched) => {
                             if tx.send((idx, std::mem::take(&mut buf), touched)).is_err() {
+                                if let Some(vh) = vol_h {
+                                    unsafe { CloseHandle(vh) };
+                                }
                                 unsafe { CloseHandle(h) };
                                 return Ok(()); // writer bailed: receiver dropped
                             }
@@ -739,11 +763,17 @@ pub fn run(opts: &ImageOptions) -> Result<ImageReport> {
                             // readers deadlock on the inflight window.
                             inflight.fetch_sub(1, Ordering::AcqRel);
                             let _ = err_tx.send(format!("block {idx}: {e:#}"));
+                            if let Some(vh) = vol_h {
+                                unsafe { CloseHandle(vh) };
+                            }
                             unsafe { CloseHandle(h) };
                             return Ok(());
                         }
                     }
                     buf = vec![0u8; block_size as usize];
+                }
+                if let Some(vh) = vol_h {
+                    unsafe { CloseHandle(vh) };
                 }
                 unsafe { CloseHandle(h) };
                 Ok(())
@@ -806,6 +836,9 @@ pub fn run(opts: &ImageOptions) -> Result<ImageReport> {
         Ok(())
     });
     scope_result?;
+    if keep_vol {
+        unsafe { CloseHandle(vol) };
+    }
 
     if next_out != num_blocks {
         bail!("internal error: {next_out}/{num_blocks} blocks consumed");
@@ -838,14 +871,16 @@ pub fn run(opts: &ImageOptions) -> Result<ImageReport> {
 }
 
 /// Fill one block buffer: zeros everywhere, real data where the block overlaps
-/// used ranges on the physical disk (disk-level coordinates — block 0 starts
-/// at physical LBA 0 so GPT headers come along). Ranges are looked up by
+/// used ranges (disk-level coordinates — block 0 starts at physical LBA 0 so
+/// GPT headers come along). In `Volume` read mode the volume body is read from
+/// the volume handle (volume-relative offsets) and only the disk head
+/// (0..extent_offset) comes from the physical disk. Ranges are looked up by
 /// binary search (blocks arrive in arbitrary order across threads). Returns
 /// whether any used sector touched the block (all-zero blocks are skipped
 /// entirely and their BAT entries stay NOT_PRESENT).
 fn fill_block(
-    h: HANDLE, ranges: &[(u64, u64)], _geom: &VolumeGeom, idx: u64, block_size: u64,
-    buf: &mut [u8],
+    h: HANDLE, vol_h: Option<HANDLE>, extent_offset: u64, ranges: &[(u64, u64)], idx: u64,
+    block_size: u64, buf: &mut [u8],
 ) -> Result<bool> {
     buf.fill(0);
     let b_start = idx * block_size;
@@ -861,7 +896,18 @@ fn fill_block(
         let e = re.min(b_end);
         let off = (s - b_start) as usize;
         let len = (e - s) as usize;
-        read_device(h, s, &mut buf[off..off + len])?;
+        let dst = &mut buf[off..off + len];
+        if let Some(vh) = vol_h {
+            if s >= extent_offset {
+                // Volume body: volume-relative read through the volume handle.
+                read_device(vh, s - extent_offset, dst)?;
+            } else {
+                // Disk head (protective MBR + GPT): physical read.
+                read_device(h, s, dst)?;
+            }
+        } else {
+            read_device(h, s, dst)?;
+        }
         touched = true;
         ri += 1;
     }

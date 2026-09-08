@@ -126,6 +126,10 @@ enum Cmd {
         /// bridges, which gain nothing beyond a few concurrent readers)
         #[arg(long)]
         threads: Option<usize>,
+        /// Data read path: physical (raw disk, default) or volume
+        /// (filesystem-driver path; may be faster on some USB bridges)
+        #[arg(long, value_enum, default_value_t = image::ReadMode::Physical)]
+        read_mode: image::ReadMode,
         /// Re-read the finished image and verify the SHA-256
         #[arg(long)]
         verify: bool,
@@ -364,6 +368,7 @@ fn main() -> Result<()> {
             output,
             block_size_mb,
             threads,
+            read_mode,
             verify,
         } => {
             if !file_engine_rust::is_elevated() {
@@ -375,6 +380,7 @@ fn main() -> Result<()> {
                 block_size_mb,
                 threads,
                 verify,
+                read_mode,
             };
             let report = image::run(&opts)?;
             if cli.json {
