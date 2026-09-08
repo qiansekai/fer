@@ -391,7 +391,7 @@ fn main() -> Result<()> {
                     print_json(json!({ "ok": true, "estimate": est }))?;
                 } else {
                     println!(
-                        "volume {}: estimate\n  volume {} (used {}, {:.1}%)\n  image  {} ({} of {} blocks stored)\n  read   {:.0} MB/s (cold sample)\n  ETA    {:.0}s total (read {:.0}s{})",
+                        "volume {}: estimate\n  volume {} (used {}, {:.1}%)\n  image  {} ({} of {} blocks stored)\n  read   {:.0} MB/s (cold sample)\n  ETA    {:.0}s total (read {:.0}s{})\n  note   sample is pure-read; a busy system volume can be 2-3x slower (measured C: 159s vs 67s)",
                         est.volume,
                         fmt_bytes(est.volume_bytes),
                         fmt_bytes(est.used_bytes),

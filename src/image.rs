@@ -708,53 +708,104 @@ pub fn estimate(opts: &EstimateOptions) -> Result<EstimateReport> {
         }
     }
 
-    // Cold-sample read throughput: walk the used ranges from the tail
-    // backwards until 64 MiB is collected, so the sample spans several
-    // scattered ranges (a single contiguous range would over-estimate).
-    let sample_target = 64 * MIB;
+    // Cold-sample read throughput in the SAME shape as a real run: segments
+    // spread evenly across the used ranges, read concurrently from a few
+    // threads. A single-threaded contiguous sample over-estimates badly on
+    // busy volumes (measured: C: sampled 3117 MB/s single-threaded, far above
+    // what a real 4-thread scattered run sustains).
+    let seg_size = 8 * MIB;
     let mut segments: Vec<(u64, u64)> = Vec::new();
-    let mut need = sample_target;
-    for &(rs, re) in ranges.iter().rev() {
-        if need == 0 {
-            break;
+    if !ranges.is_empty() {
+        // Real runs walk blocks in ascending order, so sample the same way:
+        // read contiguously from the middle of the LARGEST used range (256 MiB
+        // or as much as fits). Sampling scattered points across the disk
+        // under-measures badly — each jump costs more than the sequential
+        // stream a real run produces (measured: 175 MB/s scattered vs 364 MB/s
+        // sequential on the same USB volume).
+        let (rs, re) = *ranges
+            .iter()
+            .max_by_key(|(s, e)| e - s)
+            .expect("ranges is non-empty");
+        let len = re - rs;
+        let want = (seg_size * 32).min(len);
+        let start = rs + (len - want) / 2;
+        let mut off = 0u64;
+        while off < want {
+            let take = seg_size.min(want - off);
+            segments.push((start + off, take));
+            off += take;
         }
-        let len = (re - rs).min(need);
-        segments.push((re - len, len));
-        need -= len;
     }
-    let sample_len: u64 = segments.iter().map(|&(_, l)| l).sum();
     let disk_path = format!(r"\\.\PhysicalDrive{}", geom.disk_number);
     let mut read_mbps = 300.0; // fallback if the sample is too small to time
-    if sample_len >= MIB {
-        let h = open_device(&disk_path, false)?;
-        let vh = if keep_vol { Some(vol) } else { None };
-        let mut buf = vec![0u8; (8 * MIB as usize).min(sample_len as usize)];
-        let t0 = std::time::Instant::now();
-        let mut done = 0u64;
-        for &(start, len) in &segments {
-            let mut off = 0u64;
-            while off < len {
-                let chunk = buf.len().min((len - off) as usize);
-                let phys = start + off;
-                let dst = &mut buf[..chunk];
-                if let Some(v) = vh {
-                    if phys >= geom.extent_offset {
-                        read_device(v, phys - geom.extent_offset, dst)?;
-                    } else {
-                        read_device(h, phys, dst)?;
-                    }
-                } else {
-                    read_device(h, phys, dst)?;
+    // Two passes, keep the faster one: USB volumes swing 3x between samples
+    // (measured 97..347 MB/s on the same idle disk), and the peak is what a
+    // sustained run actually achieves.
+    if !segments.is_empty() {
+        let mut best = 0.0f64;
+        for _ in 0..2 {
+            let seg_idx = AtomicUsize::new(0);
+            let bytes = AtomicU64::new(0);
+            let sample_threads = 4.min(segments.len());
+            let wall = std::time::Instant::now();
+            std::thread::scope(|scope| {
+                for _ in 0..sample_threads {
+                    let seg_idx = &seg_idx;
+                    let bytes = &bytes;
+                    let segments = &segments;
+                    let disk_path = &disk_path;
+                    let vol_path = &vol_path;
+                    let extent_offset = geom.extent_offset;
+                    scope.spawn(move || {
+                        let Ok(h) = open_device(disk_path, false) else { return };
+                        let vh = if keep_vol { open_device(vol_path, false).ok() } else { None };
+                        let mut buf = vec![0u8; seg_size as usize];
+                        loop {
+                            let i = seg_idx.fetch_add(1, Ordering::Relaxed);
+                            if i >= segments.len() {
+                                break;
+                            }
+                            let (start, len) = segments[i];
+                            let mut off = 0u64;
+                            while off < len {
+                                let chunk = buf.len().min((len - off) as usize);
+                                let phys = start + off;
+                                let dst = &mut buf[..chunk];
+                                let r = if let Some(v) = vh {
+                                    if phys >= extent_offset {
+                                        read_device(v, phys - extent_offset, dst)
+                                    } else {
+                                        read_device(h, phys, dst)
+                                    }
+                                } else {
+                                    read_device(h, phys, dst)
+                                };
+                                if r.is_err() {
+                                    break;
+                                }
+                                off += chunk as u64;
+                            }
+                            bytes.fetch_add(off, Ordering::Relaxed);
+                        }
+                        unsafe { CloseHandle(h) };
+                        if let Some(v) = vh {
+                            unsafe { CloseHandle(v) };
+                        }
+                    });
                 }
-                off += chunk as u64;
-                done += chunk as u64;
+            });
+            let secs = wall.elapsed().as_secs_f64();
+            let done = bytes.load(Ordering::Relaxed);
+            if secs > 0.01 && done >= MIB {
+                let mbps = (done as f64 / 1_048_576.0) / secs;
+                if mbps > best {
+                    best = mbps;
+                }
             }
         }
-        let secs = t0.elapsed().as_secs_f64();
-        if secs > 0.01 {
-            read_mbps = (done as f64 / 1_048_576.0) / secs;
+        if best > 0.0 {
+            read_mbps = best;
         }
-        unsafe { CloseHandle(h) };
     }
     unsafe { CloseHandle(vol) };
 
