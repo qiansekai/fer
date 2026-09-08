@@ -651,6 +651,135 @@ pub struct ImageReport {
     pub verified: bool,
 }
 
+/// Options for `fer image --estimate` (dry-run: no image is written).
+pub struct EstimateOptions {
+    pub volume: char,
+    pub block_size_mb: u32,
+    pub no_hash: bool,
+    pub read_mode: ReadMode,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct EstimateReport {
+    pub volume: String,
+    pub volume_bytes: u64,
+    pub used_bytes: u64,
+    /// Estimated image size (stored blocks x block_size + VHDX header area).
+    pub image_bytes: u64,
+    pub blocks_total: u64,
+    pub blocks_stored: u64,
+    /// Measured read throughput from a cold 64 MiB sample.
+    pub read_mbps: f64,
+    pub est_read_seconds: f64,
+    pub est_hash_seconds: f64,
+    pub est_total_seconds: f64,
+}
+
+/// Dry-run estimate: bitmap + block grid give exact sizes, a short cold read
+/// sample gives the throughput, and a measured-calibrated pipeline model
+/// combines them. No output file is created and the source is only read.
+pub fn estimate(opts: &EstimateOptions) -> Result<EstimateReport> {
+    let block_size = u64::from(opts.block_size_mb) * MIB;
+    if !(MIB..=256 * MIB).contains(&block_size) || !opts.block_size_mb.is_power_of_two() {
+        bail!("--block-size-mb must be a power of two between 1 and 256");
+    }
+
+    let vol_path = format!(r"\\.\{}:", opts.volume.to_ascii_uppercase());
+    let vol = open_device(&vol_path, true)?;
+    flush_volume(vol)?;
+    let geom = query_geometry(vol)?;
+    let bitmap = query_bitmap(vol, &geom)?;
+    let keep_vol = opts.read_mode == ReadMode::Volume;
+
+    let mut ranges = vec![(0u64, geom.extent_offset)];
+    ranges.extend(used_ranges(&bitmap, &geom));
+    let used_bytes: u64 = ranges.iter().map(|(s, e)| e - s).sum();
+    let image_bytes_total = geom.extent_offset + geom.extent_length;
+    let num_blocks = image_bytes_total.div_ceil(block_size);
+
+    // Exact stored-block count: a block is stored iff it overlaps a used range.
+    let mut blocks_stored = 0u64;
+    for idx in 0..num_blocks {
+        let b_start = idx * block_size;
+        let b_end = b_start + block_size;
+        let ri = ranges.partition_point(|&(_, e)| e <= b_start);
+        if ri < ranges.len() && ranges[ri].0 < b_end {
+            blocks_stored += 1;
+        }
+    }
+
+    // Cold-sample read throughput: walk the used ranges from the tail
+    // backwards until 64 MiB is collected, so the sample spans several
+    // scattered ranges (a single contiguous range would over-estimate).
+    let sample_target = 64 * MIB;
+    let mut segments: Vec<(u64, u64)> = Vec::new();
+    let mut need = sample_target;
+    for &(rs, re) in ranges.iter().rev() {
+        if need == 0 {
+            break;
+        }
+        let len = (re - rs).min(need);
+        segments.push((re - len, len));
+        need -= len;
+    }
+    let sample_len: u64 = segments.iter().map(|&(_, l)| l).sum();
+    let disk_path = format!(r"\\.\PhysicalDrive{}", geom.disk_number);
+    let mut read_mbps = 300.0; // fallback if the sample is too small to time
+    if sample_len >= MIB {
+        let h = open_device(&disk_path, false)?;
+        let vh = if keep_vol { Some(vol) } else { None };
+        let mut buf = vec![0u8; (8 * MIB as usize).min(sample_len as usize)];
+        let t0 = std::time::Instant::now();
+        let mut done = 0u64;
+        for &(start, len) in &segments {
+            let mut off = 0u64;
+            while off < len {
+                let chunk = buf.len().min((len - off) as usize);
+                let phys = start + off;
+                let dst = &mut buf[..chunk];
+                if let Some(v) = vh {
+                    if phys >= geom.extent_offset {
+                        read_device(v, phys - geom.extent_offset, dst)?;
+                    } else {
+                        read_device(h, phys, dst)?;
+                    }
+                } else {
+                    read_device(h, phys, dst)?;
+                }
+                off += chunk as u64;
+                done += chunk as u64;
+            }
+        }
+        let secs = t0.elapsed().as_secs_f64();
+        if secs > 0.01 {
+            read_mbps = (done as f64 / 1_048_576.0) / secs;
+        }
+        unsafe { CloseHandle(h) };
+    }
+    unsafe { CloseHandle(vol) };
+
+    // Pipeline model calibrated against real runs (I: 47.7 GiB USB):
+    //   no-hash  : read + ~30 s tail        (161.5 s total vs 131 s read)
+    //   with-hash: read + 0.95 x hash + 30  (249.4 s total vs 131 s read + 127.7 s hash)
+    let est_read = used_bytes as f64 / 1_048_576.0 / read_mbps;
+    let hash_mb = (num_blocks * block_size) as f64 / 1_048_576.0;
+    let est_hash = if opts.no_hash { 0.0 } else { hash_mb / 1900.0 };
+    let est_total = est_read + est_hash * 0.95 + 30.0;
+
+    Ok(EstimateReport {
+        volume: format!("{}:", opts.volume.to_ascii_uppercase()),
+        volume_bytes: image_bytes_total,
+        used_bytes,
+        image_bytes: blocks_stored * block_size + 4 * MIB,
+        blocks_total: num_blocks,
+        blocks_stored,
+        read_mbps,
+        est_read_seconds: est_read,
+        est_hash_seconds: est_hash,
+        est_total_seconds: est_total,
+    })
+}
+
 /// Run the full imaging pipeline.
 pub fn run(opts: &ImageOptions) -> Result<ImageReport> {
     use std::time::Instant;

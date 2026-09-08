@@ -115,9 +115,9 @@ enum Cmd {
         /// Drive letter of the volume to image (e.g. I)
         #[arg(long)]
         volume: char,
-        /// Output .vhdx path
+        /// Output .vhdx path (required unless --estimate)
         #[arg(long)]
-        output: PathBuf,
+        output: Option<PathBuf>,
         /// Payload block size in MiB (power of two, 1..=256; 8 measured best
         /// for USB-attached sources: finer zero-block skipping)
         #[arg(long, default_value_t = 8)]
@@ -137,6 +137,10 @@ enum Cmd {
         /// with --verify)
         #[arg(long)]
         no_hash: bool,
+        /// Dry run: measure a short cold read sample and report the estimated
+        /// image size and duration without writing anything
+        #[arg(long)]
+        estimate: bool,
     },
 }
 
@@ -375,13 +379,44 @@ fn main() -> Result<()> {
             read_mode,
             verify,
             no_hash,
+            estimate,
         } => {
             if !file_engine_rust::is_elevated() {
                 file_engine_rust::try_self_elevate()?;
             }
+            if estimate {
+                let eopts = image::EstimateOptions { volume, block_size_mb, no_hash, read_mode };
+                let est = image::estimate(&eopts)?;
+                if cli.json {
+                    print_json(json!({ "ok": true, "estimate": est }))?;
+                } else {
+                    println!(
+                        "volume {}: estimate\n  volume {} (used {}, {:.1}%)\n  image  {} ({} of {} blocks stored)\n  read   {:.0} MB/s (cold sample)\n  ETA    {:.0}s total (read {:.0}s{})",
+                        est.volume,
+                        fmt_bytes(est.volume_bytes),
+                        fmt_bytes(est.used_bytes),
+                        est.used_bytes as f64 / est.volume_bytes.max(1) as f64 * 100.0,
+                        fmt_bytes(est.image_bytes),
+                        est.blocks_stored,
+                        est.blocks_total,
+                        est.read_mbps,
+                        est.est_total_seconds,
+                        est.est_read_seconds,
+                        if est.est_hash_seconds > 0.0 {
+                            format!(", hash {:.0}s", est.est_hash_seconds)
+                        } else {
+                            String::new()
+                        },
+                    );
+                }
+                return Ok(());
+            }
+            let output = output
+                .as_deref()
+                .context("--output is required unless --estimate is given")?;
             let opts = image::ImageOptions {
                 volume,
-                output: &output,
+                output,
                 block_size_mb,
                 threads,
                 verify,
