@@ -73,23 +73,6 @@ pub fn resolve_volumes(volumes: &str) -> Vec<VolumeInfo> {
     all.into_iter().filter(|v| wanted.contains(&v.drive)).collect()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn elevation_gate() {
-        // auto/mft/usn refuse without an elevated token; walk is the explicit
-        // degraded escape hatch and stays allowed.
-        for m in [Method::Auto, Method::Mft, Method::Usn] {
-            let err = ensure_elevated(m, false).unwrap_err();
-            assert!(err.to_string().contains("--method walk"), "{m}: {err}");
-            assert!(ensure_elevated(m, true).is_ok());
-        }
-        assert!(ensure_elevated(Method::Walk, false).is_ok());
-    }
-}
-
 /// Full rebuild: streams every volume straight into the in-memory engine and
 /// returns it (the caller saves the dump).
 pub fn build(volumes: &[VolumeInfo], method: Method) -> Result<(BuildReport, MemIndex)> {
@@ -259,4 +242,21 @@ fn index_walk(vol: &VolumeInfo, mb: &mut MemBuilder) -> Result<VolStats> {
         mb.push(path, meta);
     });
     Ok(stats)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn elevation_gate() {
+        // auto/mft/usn refuse without an elevated token; walk is the explicit
+        // degraded escape hatch and stays allowed.
+        for m in [Method::Auto, Method::Mft, Method::Usn] {
+            let err = ensure_elevated(m, false).unwrap_err();
+            assert!(err.to_string().contains("--method walk"), "{m}: {err}");
+            assert!(ensure_elevated(m, true).is_ok());
+        }
+        assert!(ensure_elevated(Method::Walk, false).is_ok());
+    }
 }

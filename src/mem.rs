@@ -2612,11 +2612,11 @@ mod tests {
             flags: 0,
             ..Default::default()
         };
-        b.push(r"D:\p\foo_bar.rs", meta.clone()); // id 0: "*foo*bar*" match
-        b.push(r"D:\p\bar_foo.txt", meta.clone()); // id 1: order wrong
-        b.push(r"D:\p\xabc", meta.clone()); // id 2: "a?c" match (ends abc)
-        b.push(r"D:\p\axc", meta.clone()); // id 3: "a?c" match (ends axc)
-        b.push(r"D:\p\abc.txt", meta.clone()); // id 4: "a?c" no match (ends txt)
+        b.push(r"D:\p\foo_bar.rs", meta); // id 0: "*foo*bar*" match
+        b.push(r"D:\p\bar_foo.txt", meta); // id 1: order wrong
+        b.push(r"D:\p\xabc", meta); // id 2: "a?c" match (ends abc)
+        b.push(r"D:\p\axc", meta); // id 3: "a?c" match (ends axc)
+        b.push(r"D:\p\abc.txt", meta); // id 4: "a?c" no match (ends txt)
         let mem = b.finish();
 
         let q = Query::parse("*foo*bar*").unwrap();
@@ -2737,9 +2737,9 @@ mod tests {
             flags: 0,
             ..Default::default()
         };
-        b.push(r"D:\a\xab", meta.clone()); // id 0
-        b.push(r"D:\a\bbc", meta.clone()); // id 1
-        b.push(r"D:\a\ab", meta.clone()); // id 2
+        b.push(r"D:\a\xab", meta); // id 0
+        b.push(r"D:\a\bbc", meta); // id 1
+        b.push(r"D:\a\ab", meta); // id 2
         let mem = b.finish();
 
         // "bb": first hit at abs=2 straddles entry0/entry1 (artifact), the
@@ -2770,9 +2770,9 @@ mod tests {
             flags: 0,
             ..Default::default()
         };
-        b.push(r"D:\KitA\File", meta.clone()); // id 0: path contains "kita\file" (CI)
-        b.push(r"D:\Other\kita", meta.clone()); // id 1: path contains "other\kita"
-        b.push(r"D:\Other\KITB", meta.clone()); // id 2: "other\kitb", not "kita"
+        b.push(r"D:\KitA\File", meta); // id 0: path contains "kita\file" (CI)
+        b.push(r"D:\Other\kita", meta); // id 1: path contains "other\kita"
+        b.push(r"D:\Other\KITB", meta); // id 2: "other\kitb", not "kita"
         let mem = b.finish();
 
         let q = Query::parse(r"kita\file").unwrap();
@@ -2795,10 +2795,10 @@ mod tests {
             flags: 0,
             ..Default::default()
         };
-        b.push(r"D:\p\main.rs", meta.clone()); // id 0
-        b.push(r"D:\p\lib.rs", meta.clone()); // id 1
-        b.push(r"D:\p\README.md", meta.clone()); // id 2
-        b.push(r"D:\p\m.rs", meta.clone()); // id 3
+        b.push(r"D:\p\main.rs", meta); // id 0
+        b.push(r"D:\p\lib.rs", meta); // id 1
+        b.push(r"D:\p\README.md", meta); // id 2
+        b.push(r"D:\p\m.rs", meta); // id 3
         let mem = b.finish();
 
         // literal prefilter: ".rs" candidates {0,1,3} → anchored ^m narrows to 0,3
@@ -2828,11 +2828,11 @@ mod tests {
             flags: 0,
             ..Default::default()
         };
-        b.push(r"D:\t\aaaa", meta.clone()); // id 0: "aaa" with duplicate trigram
-        b.push(r"D:\t\abababa", meta.clone()); // id 1: "aba" twice, non-adjacent
-        b.push(r"D:\t\abcabc", meta.clone()); // id 2
-        b.push(r"D:\t\x", meta.clone()); // id 3: name < 3 bytes, no trigrams
-        b.push(r"D:\t\bca", meta.clone()); // id 4: shares "bca" with id 2
+        b.push(r"D:\t\aaaa", meta); // id 0: "aaa" with duplicate trigram
+        b.push(r"D:\t\abababa", meta); // id 1: "aba" twice, non-adjacent
+        b.push(r"D:\t\abcabc", meta); // id 2
+        b.push(r"D:\t\x", meta); // id 3: name < 3 bytes, no trigrams
+        b.push(r"D:\t\bca", meta); // id 4: shares "bca" with id 2
         let mem = b.finish();
 
         // ≥3-byte needles take the trigram fast path (owned index has it)
@@ -2932,8 +2932,8 @@ mod tests {
             flags: 0,
             ..Default::default()
         };
-        b.push(r"D:\t\report.md", meta.clone());
-        b.push(r"D:\t\年度报告.md", meta.clone());
+        b.push(r"D:\t\report.md", meta);
+        b.push(r"D:\t\年度报告.md", meta);
         b.push(r"D:\t\main.rs", big);
         let mem = b.finish();
         let dir = tempfile::tempdir().unwrap();

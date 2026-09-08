@@ -1087,7 +1087,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("t.vhdx");
         let virtual_size = 8 * MIB;
-        let block_size = 1 * MIB as u32;
+        let block_size = MIB as u32;
         let mut w = VhdxWriter::create(&path, virtual_size, block_size, 4096).expect("create");
         let zeros = vec![0u8; block_size as usize];
         for i in 0..8u64 {
@@ -1138,7 +1138,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("t2.vhdx");
         let virtual_size = 4097 * MIB;
-        let block_size = 1 * MIB as u32;
+        let block_size = MIB as u32;
         let mut w = VhdxWriter::create(&path, virtual_size, block_size, 512).expect("create");
         let zeros = vec![0u8; block_size as usize];
         for i in 0..4097u64 {
@@ -1172,7 +1172,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("t3.vhdx");
         let virtual_size = 8 * MIB;
-        let block_size = 1 * MIB as u32;
+        let block_size = MIB as u32;
         let mut w = VhdxWriter::create(&path, virtual_size, block_size, 4096).expect("create");
         let zeros = vec![0u8; block_size as usize];
         w.write_block(0, &zeros).expect("write 0");

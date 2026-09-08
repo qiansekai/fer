@@ -193,7 +193,7 @@ mod tests {
     fn matches_sha2_crate_randomized() {
         let mut seed = 12345u64;
         for len in [0usize, 1, 2, 3, 55, 56, 63, 64, 65, 127, 128, 129, 1000, 4096] {
-            let data: Vec<u8> = (0..len).map(|i| {
+            let data: Vec<u8> = (0..len).map(|_i| {
                 seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
                 (seed >> 33) as u8
             }).collect();
