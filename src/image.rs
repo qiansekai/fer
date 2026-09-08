@@ -138,13 +138,30 @@ struct NtfsVolumeData {
 // Raw device helpers
 // ---------------------------------------------------------------------------
 
+/// Flush a volume's write cache to the underlying storage so raw-disk reads
+/// observe the filesystem's current state.
+fn flush_volume(h: HANDLE) -> Result<()> {
+    let ok = unsafe { windows_sys::Win32::Storage::FileSystem::FlushFileBuffers(h) };
+    if ok == 0 {
+        bail!("FlushFileBuffers failed (error {})", unsafe { GetLastError() });
+    }
+    Ok(())
+}
+
 /// Open a raw device (`\\.\X:` or `\\.\PhysicalDriveN`) for reading.
-fn open_device(path: &str) -> Result<HANDLE> {
+/// `writable` adds GENERIC_WRITE (required for FlushFileBuffers on a volume
+/// handle; keep physical-disk handles read-only).
+fn open_device(path: &str, writable: bool) -> Result<HANDLE> {
+    let access = if writable {
+        GENERIC_READ | windows_sys::Win32::Foundation::GENERIC_WRITE
+    } else {
+        GENERIC_READ
+    };
     let wide: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
     let handle = unsafe {
         CreateFileW(
             wide.as_ptr(),
-            GENERIC_READ,
+            access,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             std::ptr::null_mut(),
             OPEN_EXISTING,
@@ -641,10 +658,14 @@ pub fn run(opts: &ImageOptions) -> Result<ImageReport> {
         bail!("--block-size-mb must be a power of two between 1 and 256");
     }
 
-    // 1. Volume handle + geometry + bitmap. In `Volume` read mode the volume
-    //    handle also feeds the payload reads (filesystem-driver path).
+    // 1. Volume handle + geometry + bitmap. Flush the volume's write cache
+    //    first: the used-cluster bitmap reflects the filesystem view, while
+    //    payload reads go to the raw disk — unflushed writes would be
+    //    invisible to them (observed: freshly written files missing from the
+    //    image until the cache aged out).
     let vol_path = format!(r"\\.\{}:", opts.volume.to_ascii_uppercase());
-    let vol = open_device(&vol_path)?;
+    let vol = open_device(&vol_path, true)?;
+    flush_volume(vol)?;
     let geom = query_geometry(vol)?;
     let bitmap = query_bitmap(vol, &geom)?;
     let keep_vol = opts.read_mode == ReadMode::Volume;
@@ -722,8 +743,8 @@ pub fn run(opts: &ImageOptions) -> Result<ImageReport> {
             let quit = quit.clone();
             let err_tx = err_tx.clone();
             handles.push(scope.spawn(move || -> Result<()> {
-                let h = open_device(disk_path)?;
-                let vol_h = if keep_vol { Some(open_device(vol_path)?) } else { None };
+                let h = open_device(disk_path, false)?;
+                let vol_h = if keep_vol { Some(open_device(vol_path, false)?) } else { None };
                 let mut buf = vec![0u8; block_size as usize];
                 loop {
                     // Wait for an inflight slot BEFORE claiming a block: a
