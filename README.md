@@ -77,6 +77,8 @@ fer image --volume I --output disk.vhdx --verify   # 卷 → 动态 VHDX 取证�
 fer image --volume I --output disk.vhdx --threads 8 --block-size-mb 32  # 控制并行度与块大小
 fer image --volume I --estimate                     # 干跑预估：镜像大小 + ETA（冷样本实测吞吐，误差 <7%）
 fer image --volume I --output disk.vhdx --no-hash   # 纯拷贝（跳过 SHA-256，最快）
+fer image --volume I --output disk.vhdx --all-partitions  # 整盘：所有分区 + 分区表进一个 VHDX
+fer image --volume I --output disk.vhdx --bad-sector-zero # 抢救模式：坏扇区填零继续
 fer --db <path> <cmd>                # 自定义索引库（默认 %LOCALAPPDATA%\file-engine-rust\index.db）
 ```
 
@@ -86,6 +88,8 @@ fer --db <path> <cmd>                # 自定义索引库（默认 %LOCALAPPDATA
 
 - `IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS` 定位卷在物理盘上的偏移 → `FSCTL_GET_VOLUME_BITMAP` 直接拿 NTFS 已用簇位图（零 NTFS 结构解析）→ 多线程从 `\\.\PhysicalDriveN` 只读已用扇区
 - 全零块跳过（BAT 保持 NOT_PRESENT），镜像体积 ≈ 已用空间；未用扇区按零参与 SHA-256，**卷哈希与全盘 dd 的修剪卷哈希一致**
+- `--all-partitions` 整盘镜像：`IOCTL_DISK_GET_DRIVE_LAYOUT_EX` 枚举分区，每个 NTFS 分区拿自己的位图，ESP/恢复分区等无位图分区全量拷贝，虚拟大小 = 整盘 → 挂载后所有分区都在（实测 8GB 三分区盘：3 个分区卷标/文件数全部一致）
+- `--bad-sector-zero` 抢救模式：读失败时逐扇区重试、坏扇区填零继续（学 Disk2vhd 的 ERROR_CRC 处理），坏块位置进报告；不加则直接报错退出
 - `--verify` 完成后重开镜像、走 BAT 重读 payload 块比对哈希；`--no-hash` 跳过流式
   SHA-256（纯拷贝模式，最快）
 - `--estimate` 干跑预估：位图精确算出存储块数（镜像大小误差 <0.1%）+ 跨 range 冷样本

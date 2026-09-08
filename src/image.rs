@@ -234,6 +234,38 @@ fn read_device(h: HANDLE, offset: u64, buf: &mut [u8]) -> Result<()> {
     Ok(())
 }
 
+/// Lenient read: when a range read fails (bad sector / CRC error), retry
+/// sector by sector and zero-fill the sectors that still fail, recording them
+/// in `bad`. Disk2vhd does the same (zero-fill on ERROR_CRC) — the point is to
+/// salvage as much as possible from a damaged disk instead of aborting the
+/// whole image.
+fn read_device_lenient(
+    h: HANDLE, offset: u64, buf: &mut [u8], sector_size: u64, bad: &mut Vec<(u64, u64)>,
+) -> Result<()> {
+    match read_device(h, offset, buf) {
+        Ok(()) => Ok(()),
+        Err(first) => {
+            // Retry per sector so only the truly bad parts get zeroed.
+            let sec = sector_size.max(512) as usize;
+            let mut any_ok = false;
+            for (i, chunk) in buf.chunks_mut(sec).enumerate() {
+                let off = offset + (i * sec) as u64;
+                if read_device(h, off, chunk).is_ok() {
+                    any_ok = true;
+                } else {
+                    chunk.fill(0);
+                    bad.push((off, chunk.len() as u64));
+                }
+            }
+            if !any_ok {
+                // Every sector failed: a seek/handle error, not media damage.
+                return Err(first);
+            }
+            Ok(())
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Volume geometry + used-cluster bitmap
 // ---------------------------------------------------------------------------
@@ -346,6 +378,147 @@ fn used_ranges(bitmap: &[u8], geom: &VolumeGeom) -> Vec<(u64, u64)> {
         out.push((geom.extent_offset + s * bpc, geom.extent_offset + clusters * bpc));
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Partition enumeration (for --all-partitions disk-level images)
+// ---------------------------------------------------------------------------
+
+const IOCTL_DISK_GET_LENGTH_INFO: u32 = 0x0007_405C;
+const IOCTL_DISK_GET_DRIVE_LAYOUT_EX: u32 = 0x0007_0050;
+/// sizeof(PARTITION_INFORMATION_EX) on x64 (MSDN): the union is sized for GPT.
+const PARTITION_ENTRY_SIZE: usize = 144;
+
+fn query_disk_length(disk: HANDLE) -> Result<u64> {
+    let (raw, err) = ioctl_read(disk, IOCTL_DISK_GET_LENGTH_INFO, &[], 8)?;
+    if err != 0 {
+        bail!("disk length query failed (error {err})");
+    }
+    Ok(i64::from_le_bytes(raw[0..8].try_into().expect("8 bytes")).max(0) as u64)
+}
+
+/// All partitions on a physical disk as (start_byte, end_byte) pairs.
+fn query_partitions(disk: HANDLE) -> Result<Vec<(u64, u64)>> {
+    // Header (8) + GPT layout info (40) + up to 128 entries.
+    let need = 48 + 128 * PARTITION_ENTRY_SIZE;
+    let (raw, err) = ioctl_read(disk, IOCTL_DISK_GET_DRIVE_LAYOUT_EX, &[], need)?;
+    if err != 0 {
+        bail!("partition layout query failed (error {err})");
+    }
+    let style = u32::from_le_bytes(raw[0..4].try_into().expect("4 bytes"));
+    let count = u32::from_le_bytes(raw[4..8].try_into().expect("4 bytes")) as usize;
+    // GPT layout info is 40 bytes, MBR is 8 — entries start after it.
+    let base = if style == 1 { 48 } else { 16 };
+    let mut out = Vec::new();
+    for i in 0..count {
+        let off = base + i * PARTITION_ENTRY_SIZE;
+        if off + 24 > raw.len() {
+            break;
+        }
+        let start = i64::from_le_bytes(raw[off + 8..off + 16].try_into().expect("8 bytes"));
+        let len = i64::from_le_bytes(raw[off + 16..off + 24].try_into().expect("8 bytes"));
+        if start >= 0 && len > 0 {
+            out.push((start as u64, start as u64 + len as u64));
+        }
+    }
+    Ok(out)
+}
+
+/// Enumerate volume GUID paths (`\\?\Volume{...}\`) known to the mount manager.
+fn enumerate_volumes() -> Vec<String> {
+    use windows_sys::Win32::Storage::FileSystem::{FindFirstVolumeW, FindNextVolumeW, FindVolumeClose};
+    let mut out = Vec::new();
+    let mut buf = [0u16; 260];
+    let h = unsafe { FindFirstVolumeW(buf.as_mut_ptr(), buf.len() as u32) };
+    if h.is_null() || h as isize == -1 {
+        return out;
+    }
+    loop {
+        let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        let s = String::from_utf16_lossy(&buf[..end]);
+        if !s.is_empty() {
+            out.push(s);
+        }
+        if unsafe { FindNextVolumeW(h, buf.as_mut_ptr(), buf.len() as u32) } == 0 {
+            break;
+        }
+    }
+    unsafe { FindVolumeClose(h) };
+    out
+}
+
+/// Find the volume (if any) whose extent starts inside the given partition.
+fn volume_for_partition(vols: &[String], disk_number: u32, start: u64, end: u64) -> Option<String> {
+    for v in vols {
+        let path = v.trim_end_matches('\\');
+        let Ok(h) = open_device(path, false) else { continue };
+        let geom = query_geometry(h);
+        unsafe { CloseHandle(h) };
+        if let Ok(g) = geom
+            && g.disk_number == disk_number
+            && g.extent_offset >= start
+            && g.extent_offset < end
+        {
+            return Some(path.to_string());
+        }
+    }
+    None
+}
+
+/// Disk-level layout: (used ranges in disk coordinates, total disk bytes,
+/// logical sector size).
+type DiskLayout = (Vec<(u64, u64)>, u64, u64);
+
+/// Disk-level layout covering every partition: the disk head (partition table)
+/// plus each partition's used clusters (NTFS volumes) or its full extent
+/// (volumes we cannot read a bitmap from — ESP, recovery, non-NTFS).
+fn all_partition_ranges(volume: char) -> Result<DiskLayout> {
+    let vol_path = format!(r"\\.\{}:", volume.to_ascii_uppercase());
+    let vh = open_device(&vol_path, true)?;
+    flush_volume(vh)?;
+    let geom = query_geometry(vh)?;
+    unsafe { CloseHandle(vh) };
+    let disk_number = geom.disk_number;
+    let sector = geom.bytes_per_sector;
+
+    let disk_path = format!(r"\\.\PhysicalDrive{}", disk_number);
+    let dh = open_device(&disk_path, false)?;
+    let disk_len = query_disk_length(dh)?;
+    let parts = query_partitions(dh)?;
+    unsafe { CloseHandle(dh) };
+    if parts.is_empty() {
+        bail!("no partitions found on disk {disk_number}");
+    }
+
+    let vols = enumerate_volumes();
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
+    // Disk head up to the first partition (protective MBR + GPT).
+    let first = parts.iter().map(|&(s, _)| s).min().unwrap_or(0);
+    if first > 0 {
+        ranges.push((0, first));
+    }
+    for &(start, end) in &parts {
+        match volume_for_partition(&vols, disk_number, start, end) {
+            Some(path) => {
+                let vh = open_device(&path, true)?;
+                flush_volume(vh)?;
+                let g = query_geometry(vh)?;
+                let bmp = query_bitmap(vh, &g)?;
+                unsafe { CloseHandle(vh) };
+                ranges.extend(used_ranges(&bmp, &g));
+            }
+            None => ranges.push((start, end)),
+        }
+    }
+    ranges.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::new();
+    for (s, e) in ranges {
+        match merged.last_mut() {
+            Some(last) if s <= last.1 => last.1 = last.1.max(e),
+            _ => merged.push((s, e)),
+        }
+    }
+    Ok((merged, disk_len, sector))
 }
 
 // ---------------------------------------------------------------------------
@@ -639,6 +812,13 @@ pub struct ImageOptions<'a> {
     /// (geometry/bitmap still come from the live volume, the disk head from
     /// the physical disk). Gives a point-in-time-consistent image.
     pub snapshot_device: Option<&'a str>,
+    /// Zero-fill unreadable sectors instead of aborting (salvage mode for
+    /// damaged disks; bad sectors are reported in the run report).
+    pub bad_sector_zero: bool,
+    /// Image the whole disk (all partitions + partition table) into one VHDX
+    /// instead of just the selected volume. Payload is read from the physical
+    /// disk; partitions whose volume cannot be opened are copied in full.
+    pub all_partitions: bool,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -653,6 +833,11 @@ pub struct ImageReport {
     pub blocks: u64,
     pub elapsed_ms: u128,
     pub verified: bool,
+    /// Bytes zero-filled because the source sector was unreadable (0 unless
+    /// --bad-sector-zero was used and the disk had damage).
+    pub bad_sector_bytes: u64,
+    /// First bad sector ranges as [offset, len] (capped at 1000 entries).
+    pub bad_sectors: Vec<[u64; 2]>,
 }
 
 /// Options for `fer image --estimate` (dry-run: no image is written).
@@ -860,21 +1045,34 @@ pub fn run(opts: &ImageOptions) -> Result<ImageReport> {
     // Geometry and the bitmap always come from the LIVE volume; the disk head
     // (partition table) always comes from the physical disk. Readers open
     // their own handles, so the main-thread handle is closed here.
-    let payload_path: Option<String> = match opts.snapshot_device {
-        Some(dev) => Some(dev.to_string()),
-        None if opts.read_mode == ReadMode::Volume => Some(vol_path.clone()),
-        None => None,
+    let payload_path: Option<String> = if opts.all_partitions {
+        // Whole-disk mode reads every partition from the physical disk.
+        None
+    } else {
+        match opts.snapshot_device {
+            Some(dev) => Some(dev.to_string()),
+            None if opts.read_mode == ReadMode::Volume => Some(vol_path.clone()),
+            None => None,
+        }
     };
     unsafe { CloseHandle(vol) };
 
-    // 2. Disk-level image: cover from physical LBA 0 so the GPT header and
-    //    partition table are included and the volume keeps its original
-    //    partition offset. Used-sector ranges = the disk head (0..extent) plus
-    //    the NTFS used clusters.
-    let mut ranges = vec![(0u64, geom.extent_offset)];
-    ranges.extend(used_ranges(&bitmap, &geom));
+    // 2. Layout: single-volume (disk head + that volume's used clusters) or
+    //    whole-disk (all partitions). Ranges are in physical-disk coordinates.
+    let (ranges, image_bytes_total, disk_number, bytes_per_sector) = if opts.all_partitions {
+        let (r, total, sector) = all_partition_ranges(opts.volume)?;
+        (r, total, geom.disk_number, sector)
+    } else {
+        let mut r = vec![(0u64, geom.extent_offset)];
+        r.extend(used_ranges(&bitmap, &geom));
+        (
+            r,
+            geom.extent_offset + geom.extent_length,
+            geom.disk_number,
+            geom.bytes_per_sector,
+        )
+    };
     let used_bytes: u64 = ranges.iter().map(|(s, e)| e - s).sum();
-    let image_bytes_total = geom.extent_offset + geom.extent_length;
 
     // 3. Block grid over the image.
     let num_blocks = image_bytes_total.div_ceil(block_size);
@@ -886,7 +1084,7 @@ pub fn run(opts: &ImageOptions) -> Result<ImageReport> {
     //    4096): the partition table inside the image is interpreted in those
     //    sectors, so a 512-sector GPT source must not be labeled 4096 or the
     //    mounter misreads the GPT header location and degrades to MBR.
-    let logical_sector_size = geom.bytes_per_sector as u32;
+    let logical_sector_size = bytes_per_sector as u32;
     let mut writer = VhdxWriter::create(opts.output, image_bytes_total, block_size as u32, logical_sector_size)?;
 
     // 5. Parallel readers + ordered writer. Readers pull block indices from a
@@ -895,7 +1093,7 @@ pub fn run(opts: &ImageOptions) -> Result<ImageReport> {
     //    the inflight window can never deadlock (the consumer is the scope's
     //    main thread); a writer failure drops the sender side, readers observe
     //    the closed channel and exit before the scope joins them.
-    let disk_path = format!(r"\\.\PhysicalDrive{}", geom.disk_number);
+    let disk_path = format!(r"\\.\PhysicalDrive{}", disk_number);
     let next_block = AtomicUsize::new(0);
     let inflight = AtomicUsize::new(0);
     // FER_DEBUG_TIMING=1: per-stage wall-clock accounting (read/write/hash).
@@ -918,6 +1116,7 @@ pub fn run(opts: &ImageOptions) -> Result<ImageReport> {
     }
 
     let mut hasher = (!opts.no_hash).then(Sha256::new);
+    let bad_all: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
     let mut pending: BTreeMap<u64, (Vec<u8>, bool)> = BTreeMap::new();
     let mut next_out = 0u64;
     let mut blocks_stored = 0u64;
@@ -931,6 +1130,7 @@ pub fn run(opts: &ImageOptions) -> Result<ImageReport> {
         // permit borrowing); each reader also owns a private disk handle.
         let disk_path = &disk_path;
         let payload_path = &payload_path;
+        let bad_all = &bad_all;
         let next_block = &next_block;
         let inflight = &inflight;
         let ranges = &ranges;
@@ -950,6 +1150,7 @@ pub fn run(opts: &ImageOptions) -> Result<ImageReport> {
                     Some(p) => Some(open_device(p, false)?),
                     None => None,
                 };
+                let mut bad_local: Vec<(u64, u64)> = Vec::new();
                 let mut buf = vec![0u8; block_size as usize];
                 loop {
                     // Wait for an inflight slot BEFORE claiming a block: a
@@ -974,7 +1175,10 @@ pub fn run(opts: &ImageOptions) -> Result<ImageReport> {
                         break;
                     }
                     inflight.fetch_add(1, Ordering::AcqRel);
-                    match fill_block(h, vol_h, extent_offset, ranges, idx, block_size, &mut buf, read_ns) {
+                    match fill_block(
+                        h, vol_h, extent_offset, ranges, idx, block_size, &mut buf, read_ns,
+                        opts.bad_sector_zero, bytes_per_sector, &mut bad_local,
+                    ) {
                         Ok(touched) => {
                             if tx.send((idx, std::mem::take(&mut buf), touched)).is_err() {
                                 if let Some(vh) = vol_h {
@@ -997,6 +1201,11 @@ pub fn run(opts: &ImageOptions) -> Result<ImageReport> {
                         }
                     }
                     buf = vec![0u8; block_size as usize];
+                }
+                if !bad_local.is_empty()
+                    && let Ok(mut all) = bad_all.lock()
+                {
+                    all.append(&mut bad_local);
                 }
                 if let Some(vh) = vol_h {
                     unsafe { CloseHandle(vh) };
@@ -1101,6 +1310,11 @@ pub fn run(opts: &ImageOptions) -> Result<ImageReport> {
         false
     };
 
+    let mut bad_ranges = bad_all.into_inner().unwrap_or_default();
+    bad_ranges.sort_unstable();
+    let bad_sector_bytes: u64 = bad_ranges.iter().map(|&(_, l)| l).sum();
+    bad_ranges.truncate(1000);
+
     Ok(ImageReport {
         volume: format!("{}:", opts.volume.to_ascii_uppercase()),
         output: opts.output.display().to_string(),
@@ -1112,6 +1326,8 @@ pub fn run(opts: &ImageOptions) -> Result<ImageReport> {
         blocks: blocks_stored,
         elapsed_ms: start.elapsed().as_millis(),
         verified,
+        bad_sector_bytes,
+        bad_sectors: bad_ranges.iter().map(|&(o, l)| [o, l]).collect(),
     })
 }
 
@@ -1126,7 +1342,8 @@ pub fn run(opts: &ImageOptions) -> Result<ImageReport> {
 #[allow(clippy::too_many_arguments)]
 fn fill_block(
     h: HANDLE, vol_h: Option<HANDLE>, extent_offset: u64, ranges: &[(u64, u64)], idx: u64,
-    block_size: u64, buf: &mut [u8], read_ns: Option<&AtomicU64>,
+    block_size: u64, buf: &mut [u8], read_ns: Option<&AtomicU64>, lenient: bool,
+    sector_size: u64, bad: &mut Vec<(u64, u64)>,
 ) -> Result<bool> {
     buf.fill(0);
     let b_start = idx * block_size;
@@ -1144,16 +1361,18 @@ fn fill_block(
         let len = (e - s) as usize;
         let dst = &mut buf[off..off + len];
         let t0 = std::time::Instant::now();
-        if let Some(vh) = vol_h {
-            if s >= extent_offset {
-                // Volume body: volume-relative read through the volume handle.
-                read_device(vh, s - extent_offset, dst)?;
-            } else {
-                // Disk head (protective MBR + GPT): physical read.
-                read_device(h, s, dst)?;
-            }
+        // Volume body reads are volume-relative through the payload handle;
+        // the disk head (protective MBR + GPT) always comes from the physical
+        // disk.
+        let vol_relative = vol_h.is_some() && s >= extent_offset;
+        let (hh, roff) = match vol_h {
+            Some(vh) if vol_relative => (vh, s - extent_offset),
+            _ => (h, s),
+        };
+        if lenient {
+            read_device_lenient(hh, roff, dst, sector_size, bad)?;
         } else {
-            read_device(h, s, dst)?;
+            read_device(hh, roff, dst)?;
         }
         if let Some(c) = read_ns {
             c.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);

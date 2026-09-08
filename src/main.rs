@@ -147,6 +147,15 @@ enum Cmd {
         /// from the live volume, the partition table from the physical disk
         #[arg(long)]
         snapshot_device: Option<String>,
+        /// Salvage mode: zero-fill unreadable sectors instead of aborting
+        /// (for damaged disks; bad ranges are reported)
+        #[arg(long)]
+        bad_sector_zero: bool,
+        /// Image the whole disk (all partitions + partition table) into one
+        /// VHDX instead of just the selected volume; unreadable partitions
+        /// are copied in full
+        #[arg(long, conflicts_with = "snapshot_device")]
+        all_partitions: bool,
     },
 }
 
@@ -387,6 +396,8 @@ fn main() -> Result<()> {
             no_hash,
             estimate,
             snapshot_device,
+            bad_sector_zero,
+            all_partitions,
         } => {
             if !file_engine_rust::is_elevated() {
                 file_engine_rust::try_self_elevate()?;
@@ -430,13 +441,15 @@ fn main() -> Result<()> {
                 read_mode,
                 no_hash,
                 snapshot_device: snapshot_device.as_deref(),
+                bad_sector_zero,
+                all_partitions,
             };
             let report = image::run(&opts)?;
             if cli.json {
                 print_json(json!({ "ok": true, "report": report }))?;
             } else {
                 println!(
-                    "volume {}: -> {}\n  volume {} (used {}, {:.1}%)\n  image  {} ({} blocks)\n  sha256 {}\n  elapsed {:.1}s{}",
+                    "volume {}: -> {}\n  volume {} (used {}, {:.1}%)\n  image  {} ({} blocks)\n  sha256 {}\n  elapsed {:.1}s{}{}",
                     report.volume,
                     report.output,
                     fmt_bytes(report.volume_bytes),
@@ -447,6 +460,15 @@ fn main() -> Result<()> {
                     report.sha256,
                     report.elapsed_ms as f64 / 1000.0,
                     if report.verified { ", verified" } else { "" },
+                    if report.bad_sector_bytes > 0 {
+                        format!(
+                            ", {} bad sector bytes zero-filled ({} ranges)",
+                            report.bad_sector_bytes,
+                            report.bad_sectors.len()
+                        )
+                    } else {
+                        String::new()
+                    },
                 );
             }
         }
