@@ -22,8 +22,9 @@
   512KB 级 bitset 表示——`dm:thisweek` 47ms→11ms、`!hidden:true` 63ms→5ms
   （665 万条目实测，旧数字为 416 万条目时代）
 - **serve 常驻加速**：CLI `fer search` 自动探测默认端口上的 `fer serve` 并转发
-  （无 serve 时静默回退本地加载）；serve 带 TTL 查询缓存（重复查询 0ms）与
-  启动后台预热线程（首查不付 mmap 缺页税）
+  （无 serve 时静默回退本地加载）；serve 带 TTL 查询缓存（重复查询 0ms）、
+  启动后台预热线程（首查不付 mmap 缺页税）与 **dump 热重载**——`fer monitor` /
+  `fer index` 重写 dump 后 2 秒内自动换引擎，常驻进程无需重启
 - **过滤查询语言**：`ext: size: dm: dc: type: hidden: parent: path: name:` + 取反（`!`）
 - **实时监控**：`fer monitor` 轮询 USN 日志增量更新（删除按 FRN 直删）
 - **HTTP API + 网页 UI** + **CLI --json**（稳定 JSON 输出，面向 agent）
@@ -83,7 +84,13 @@ fer --db <path> <cmd>                # 自定义索引库（默认 %LOCALAPPDATA
 
 - `IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS` 定位卷在物理盘上的偏移 → `FSCTL_GET_VOLUME_BITMAP` 直接拿 NTFS 已用簇位图（零 NTFS 结构解析）→ 多线程从 `\\.\PhysicalDriveN` 只读已用扇区
 - 全零块跳过（BAT 保持 NOT_PRESENT），镜像体积 ≈ 已用空间；未用扇区按零参与 SHA-256，**卷哈希与全盘 dd 的修剪卷哈希一致**
-- `--verify` 完成后重开镜像、走 BAT 重读 payload 块比对哈希
+- `--verify` 完成后重开镜像、走 BAT 重读 payload 块比对哈希；`--no-hash` 跳过流式
+  SHA-256（纯拷贝模式，最快）
+- 读路径 `--read-mode physical|volume`（默认 physical 从裸盘读；volume 走文件系统
+  驱动路径，个别 USB 桥更快）；镜像在线卷前先 `FlushFileBuffers` 刷卷缓存，保证
+  「刚写入的文件」也在镜像里（位图是缓存视角、payload 读裸盘，不刷会漏）
+- 实测（USB 盘 238.5 GB / 已用 47.7 GB，2026-09-08）：`--no-hash` 161.5 s
+  （约 300 MB/s，与 Disk2vhd 同速）；默认带 SHA-256 249.4 s
 - 需要管理员（物理盘直读），非提权自动弹 UAC 请求提权
 - 限制：单 extent 卷（不支持跨区/带区卷）；NTFS only；扇区位图块不生成（块内全扇区有效语义）
 
@@ -306,7 +313,34 @@ serve 稳态（引擎侧 took_ms，预热线程 + TTL 缓存）：`ext:rs` 0ms�
 - **monitor**：USN 增量进内存（by_frn 二分 + 删除影子集），默认每 60s 防抖写回 dump
   （`--flush-secs` 可调）；flush 走 arena 直达复用（零 String 分配）
 - **编译**：`cargo check` 6.9s（不编 SQLite）；release ~3.3MB / `--profile min-size`
-  （opt-level="z" 体积更小）；clippy 0 警告
+  （opt-level="z" 体积更小）；clippy 0 警告（含 `--all-targets`）
+
+### 2026-09-08 本机复测（7 卷 · 457.8 万条 · dump v6 · serve 常驻）
+
+`fer index` 全卷 MFT 重扫 11.8 s + dump 写出 0.9 s（热缓存；394.4 万文件 +
+63.4 万目录，峰值 RSS 1.56 GB）。同一 dump 双通道实测——serve 列为引擎侧
+`took_ms`（稳态），CLI 列为含进程启动的墙钟：
+
+| 查询 | 结果数 | CLI 无 serve（冷页） | CLI 转发 serve | serve 引擎 |
+|------|-------:|---------------------:|---------------:|-----------:|
+| `ext:rs size:>1mb` | 112 | 354 ms | 26 ms | 1 ms |
+| `dm:thisweek` | 529,420 | 325 ms | 26 ms | 5 ms |
+| `a?c` | 1,995 | 595 ms | 28 ms | 7 ms |
+| `report` | 7,885 | 418 ms | 22 ms | 1 ms |
+| `!hidden:true ext:log` | 11,512 | 261 ms | 21 ms | 0 ms |
+| `报告`（CJK） | 46 | — | — | 0 ms |
+| 路径子串（真实子树，12 万条命中） | 120,431 | — | — | 211 ms |
+
+- 「冷页」= dump 22 小时未被读过；页热之后 CLI 本地加载同查询降到 88-243 ms，
+  但 serve 常驻仍快一个数量级（22-28 ms 墙钟，含 HTTP 往返）
+- 重复查询缓存命中 0 ms；`/api/du` 整卷工作区子树 1.67 s（255.3 万文件 /
+  478.6 GB 逻辑 · 454.3 GB 分配），CLI `du` 同查询 1.27 s
+- serve 常驻 RSS 251-884 MB（mmap 按需缺页，OS 可回收）
+- **转发结果与本地加载逐条一致**：`--db` 强制绕过转发对照三组查询，total 完全相同
+- 索引重建不中断查询：`fer index` 原子替换 dump，serve 的 mtime 轮询 2 s 内热重载
+  新引擎（实测日志 `dump changed on disk — reloaded 4577969 entries`），无需重启
+- 测试/静态检查：`cargo test` 57 passed / 0 failed（+3 ignored 需管理员），
+  `cargo clippy --all-targets -- -D warnings` 0 警告
 
 ## 已知限制 / TODO
 

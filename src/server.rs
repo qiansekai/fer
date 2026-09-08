@@ -93,6 +93,39 @@ pub async fn serve(addr: &str, mem: MemIndex, db: &std::path::Path) -> Result<()
     // single-shot runs skip this (warm-up would exceed the query cost).
     let warm_mem = state.mem.read().unwrap().clone();
     std::thread::spawn(move || warm_mem.warm());
+    // Background dump hot-reload: `fer monitor` and external `fer index` runs
+    // rewrite the dump while this server is up. Poll its mtime and swap the
+    // engine, so a long-lived serve never answers from a stale snapshot. The
+    // dump is written to a temp file and then renamed (MemIndex::save), so a
+    // poll can never catch a half-written file; a reload is a ~1ms mmap whose
+    // pages come straight from the page cache the writer just populated.
+    let reload_slot = state.mem.clone();
+    let reload_cache = state.cache.clone();
+    let reload_dump = dump_path(db);
+    std::thread::spawn(move || {
+        let mut stamp = std::fs::metadata(&reload_dump)
+            .and_then(|m| m.modified())
+            .ok();
+        loop {
+            std::thread::sleep(Duration::from_secs(2));
+            let now = std::fs::metadata(&reload_dump)
+                .and_then(|m| m.modified())
+                .ok();
+            if now.is_none() || now == stamp {
+                continue;
+            }
+            stamp = now;
+            match MemIndex::load_dump(&reload_dump) {
+                Ok(fresh) => {
+                    let n = fresh.len();
+                    *reload_slot.write().unwrap() = Arc::new(fresh);
+                    reload_cache.lock().unwrap().clear();
+                    eprintln!("[server] dump changed on disk — reloaded {n} entries");
+                }
+                Err(e) => eprintln!("[server] dump reload failed (keeping old engine): {e:#}"),
+            }
+        }
+    });
     let app = Router::new()
         .route("/", get(index_page))
         .route("/api/health", get(health))
