@@ -90,6 +90,17 @@ fer --db <path> <cmd>                # 自定义索引库（默认 %LOCALAPPDATA
   SHA-256（纯拷贝模式，最快）
 - `--estimate` 干跑预估：位图精确算出存储块数（镜像大小误差 <0.1%）+ 跨 range 冷样本
   实测读吞吐 → ETA（实测误差 <7%），不写任何文件
+- `--snapshot-device <path>` 从 VSS 快照读 payload（时间点一致的系统盘镜像）：几何与
+  位图仍取自活卷、分区表取自物理盘。快照设备本身不支持 extents/bitmap 查询（实测
+  err 1/234），所以几何必须来自活卷：
+  ```powershell
+  $id  = (Invoke-CimMethod Win32_ShadowCopy -MethodName Create -Arguments @{Volume='C:\'}).ShadowID
+  $dev = (vssadmin list shadows /for=C: | Select-String 'Shadow Copy Volume:').ToString().Split(':')[-1].Trim()
+  fer image --volume C --snapshot-device $dev --output C-consistent.vhdx --no-hash
+  vssadmin delete shadows /shadow=$id /quiet
+  ```
+  实测（C: 128 GB / 已用 115 GB）：181.9 s / 124.52 GB，挂载后 GPT + 根目录 23 条目
+  与源卷一致
 - 读路径 `--read-mode physical|volume`（默认 physical 从裸盘读；volume 走文件系统
   驱动路径，个别 USB 桥更快）；镜像在线卷前先 `FlushFileBuffers` 刷卷缓存，保证
   「刚写入的文件」也在镜像里（位图是缓存视角、payload 读裸盘，不刷会漏）
