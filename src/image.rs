@@ -1349,38 +1349,50 @@ fn fill_block(
     let b_start = idx * block_size;
     let b_end = b_start + block_size;
     let mut ri = ranges.partition_point(|&(_, e)| e <= b_start);
-    let mut touched = false;
+    // Read the whole covered span in one shot. Issuing one seek+read per used
+    // range collapses on a fragmented volume over USB (measured 183 MB/s on an
+    // 89%-full M2 vs 512 MB/s contiguous sampling); the gaps inside the span
+    // are unused clusters whose bytes ride along into the image block — the
+    // block is stored either way, so the only cost is a few extra MB read.
+    let mut lo = u64::MAX;
+    let mut hi = 0u64;
     while ri < ranges.len() {
         let (rs, re) = ranges[ri];
         if rs >= b_end {
             break;
         }
-        let s = rs.max(b_start);
-        let e = re.min(b_end);
-        let off = (s - b_start) as usize;
-        let len = (e - s) as usize;
-        let dst = &mut buf[off..off + len];
-        let t0 = std::time::Instant::now();
-        // Volume body reads are volume-relative through the payload handle;
-        // the disk head (protective MBR + GPT) always comes from the physical
-        // disk.
-        let vol_relative = vol_h.is_some() && s >= extent_offset;
-        let (hh, roff) = match vol_h {
-            Some(vh) if vol_relative => (vh, s - extent_offset),
-            _ => (h, s),
+        lo = lo.min(rs.max(b_start));
+        hi = hi.max(re.min(b_end));
+        ri += 1;
+    }
+    if lo >= hi {
+        return Ok(false);
+    }
+    let t0 = std::time::Instant::now();
+    let mut pos = lo;
+    while pos < hi {
+        // Volume-body reads go through the payload handle (volume-relative);
+        // the disk head always comes from the physical disk. Only block 0
+        // straddles the boundary, and it splits into at most two reads.
+        let (hh, roff, seg_end) = match vol_h {
+            Some(vh) if pos >= extent_offset => (vh, pos - extent_offset, hi),
+            Some(_) if hi > extent_offset => (h, pos, extent_offset),
+            _ => (h, pos, hi),
         };
+        let off = (pos - b_start) as usize;
+        let len = (seg_end - pos) as usize;
+        let dst = &mut buf[off..off + len];
         if lenient {
             read_device_lenient(hh, roff, dst, sector_size, bad)?;
         } else {
             read_device(hh, roff, dst)?;
         }
-        if let Some(c) = read_ns {
-            c.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        }
-        touched = true;
-        ri += 1;
+        pos = seg_end;
     }
-    Ok(touched)
+    if let Some(c) = read_ns {
+        c.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+    Ok(true)
 }
 
 /// Re-open the finished VHDX, walk its BAT, re-read the stored payload blocks
