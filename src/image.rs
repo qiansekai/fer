@@ -635,6 +635,10 @@ pub struct ImageOptions<'a> {
     /// Skip the streaming SHA-256 (pure copy, ~2x faster hash phase; the
     /// report's sha256 field becomes "skipped" and --verify is unavailable).
     pub no_hash: bool,
+    /// Read volume data from a VSS snapshot device instead of the live volume
+    /// (geometry/bitmap still come from the live volume, the disk head from
+    /// the physical disk). Gives a point-in-time-consistent image.
+    pub snapshot_device: Option<&'a str>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -851,10 +855,17 @@ pub fn run(opts: &ImageOptions) -> Result<ImageReport> {
     flush_volume(vol)?;
     let geom = query_geometry(vol)?;
     let bitmap = query_bitmap(vol, &geom)?;
-    let keep_vol = opts.read_mode == ReadMode::Volume;
-    if !keep_vol {
-        unsafe { CloseHandle(vol) };
-    }
+    // Payload source: a VSS snapshot device when given (point-in-time data),
+    // else the volume handle in Volume read mode, else the physical disk.
+    // Geometry and the bitmap always come from the LIVE volume; the disk head
+    // (partition table) always comes from the physical disk. Readers open
+    // their own handles, so the main-thread handle is closed here.
+    let payload_path: Option<String> = match opts.snapshot_device {
+        Some(dev) => Some(dev.to_string()),
+        None if opts.read_mode == ReadMode::Volume => Some(vol_path.clone()),
+        None => None,
+    };
+    unsafe { CloseHandle(vol) };
 
     // 2. Disk-level image: cover from physical LBA 0 so the GPT header and
     //    partition table are included and the volume keeps its original
@@ -919,7 +930,7 @@ pub fn run(opts: &ImageOptions) -> Result<ImageReport> {
         // Shared state is borrowed by the reader closures (scoped threads
         // permit borrowing); each reader also owns a private disk handle.
         let disk_path = &disk_path;
-        let vol_path = &vol_path;
+        let payload_path = &payload_path;
         let next_block = &next_block;
         let inflight = &inflight;
         let ranges = &ranges;
@@ -935,7 +946,10 @@ pub fn run(opts: &ImageOptions) -> Result<ImageReport> {
             let err_tx = err_tx.clone();
             handles.push(scope.spawn(move || -> Result<()> {
                 let h = open_device(disk_path, false)?;
-                let vol_h = if keep_vol { Some(open_device(vol_path, false)?) } else { None };
+                let vol_h = match payload_path {
+                    Some(p) => Some(open_device(p, false)?),
+                    None => None,
+                };
                 let mut buf = vec![0u8; block_size as usize];
                 loop {
                     // Wait for an inflight slot BEFORE claiming a block: a
@@ -1066,9 +1080,6 @@ pub fn run(opts: &ImageOptions) -> Result<ImageReport> {
             f(write_ns.as_ref()),
             f(hash_ns.as_ref())
         );
-    }
-    if keep_vol {
-        unsafe { CloseHandle(vol) };
     }
 
     if next_out != num_blocks {

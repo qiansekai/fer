@@ -141,6 +141,12 @@ enum Cmd {
         /// image size and duration without writing anything
         #[arg(long)]
         estimate: bool,
+        /// Read payload from a VSS snapshot device (e.g.
+        /// "\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy2") for a
+        /// point-in-time-consistent image; geometry and bitmap still come
+        /// from the live volume, the partition table from the physical disk
+        #[arg(long)]
+        snapshot_device: Option<String>,
     },
 }
 
@@ -380,6 +386,7 @@ fn main() -> Result<()> {
             verify,
             no_hash,
             estimate,
+            snapshot_device,
         } => {
             if !file_engine_rust::is_elevated() {
                 file_engine_rust::try_self_elevate()?;
@@ -422,6 +429,7 @@ fn main() -> Result<()> {
                 verify,
                 read_mode,
                 no_hash,
+                snapshot_device: snapshot_device.as_deref(),
             };
             let report = image::run(&opts)?;
             if cli.json {
