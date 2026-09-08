@@ -22,6 +22,7 @@ pub mod mft;
 pub mod monitor;
 pub mod query;
 pub mod server;
+pub mod sha256;
 #[cfg(feature = "sqlite")]
 pub mod store;
 pub mod usn;

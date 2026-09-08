@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use windows_sys::Win32::Foundation::{
     CloseHandle, GENERIC_READ, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
@@ -632,6 +632,9 @@ pub struct ImageOptions<'a> {
     pub threads: Option<usize>,
     pub verify: bool,
     pub read_mode: ReadMode,
+    /// Skip the streaming SHA-256 (pure copy, ~2x faster hash phase; the
+    /// report's sha256 field becomes "skipped" and --verify is unavailable).
+    pub no_hash: bool,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -704,6 +707,11 @@ pub fn run(opts: &ImageOptions) -> Result<ImageReport> {
     let disk_path = format!(r"\\.\PhysicalDrive{}", geom.disk_number);
     let next_block = AtomicUsize::new(0);
     let inflight = AtomicUsize::new(0);
+    // FER_DEBUG_TIMING=1: per-stage wall-clock accounting (read/write/hash).
+    let timing_on = std::env::var("FER_DEBUG_TIMING").as_deref() == Ok("1");
+    let read_ns = timing_on.then(|| AtomicU64::new(0));
+    let write_ns = timing_on.then(|| AtomicU64::new(0));
+    let hash_ns = timing_on.then(|| AtomicU64::new(0));
     let max_inflight = threads * 2;
     let (tx, rx) = mpsc::channel::<(u64, Vec<u8>, bool)>();
     // `mpsc::Receiver` is !Sync, so the quit signal is an atomic flag instead.
@@ -718,7 +726,7 @@ pub fn run(opts: &ImageOptions) -> Result<ImageReport> {
         }
     }
 
-    let mut hasher = Sha256::new();
+    let mut hasher = (!opts.no_hash).then(Sha256::new);
     let mut pending: BTreeMap<u64, (Vec<u8>, bool)> = BTreeMap::new();
     let mut next_out = 0u64;
     let mut blocks_stored = 0u64;
@@ -735,6 +743,9 @@ pub fn run(opts: &ImageOptions) -> Result<ImageReport> {
         let next_block = &next_block;
         let inflight = &inflight;
         let ranges = &ranges;
+        let read_ns = read_ns.as_ref();
+        let write_ns = write_ns.as_ref();
+        let hash_ns = hash_ns.as_ref();
         let extent_offset = geom.extent_offset;
         let (err_tx, err_rx) = mpsc::channel::<String>();
         let mut handles = Vec::new();
@@ -769,7 +780,7 @@ pub fn run(opts: &ImageOptions) -> Result<ImageReport> {
                         break;
                     }
                     inflight.fetch_add(1, Ordering::AcqRel);
-                    match fill_block(h, vol_h, extent_offset, ranges, idx, block_size, &mut buf) {
+                    match fill_block(h, vol_h, extent_offset, ranges, idx, block_size, &mut buf, read_ns) {
                         Ok(touched) => {
                             if tx.send((idx, std::mem::take(&mut buf), touched)).is_err() {
                                 if let Some(vh) = vol_h {
@@ -819,10 +830,20 @@ pub fn run(opts: &ImageOptions) -> Result<ImageReport> {
                         let (data, touched) = pending.remove(&i).expect("first key present");
                         let valid = (image_bytes_total.saturating_sub(i * block_size)).min(block_size);
                         if touched {
+                            let t0 = std::time::Instant::now();
                             writer.write_block(i, &data)?;
+                            if let Some(c) = write_ns {
+                                c.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                            }
                             blocks_stored += 1;
                         }
-                        hasher.update(&data[..valid as usize]);
+                        if let Some(h) = &mut hasher {
+                            let t0 = std::time::Instant::now();
+                            h.update(&data[..valid as usize]);
+                            if let Some(c) = hash_ns {
+                                c.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                            }
+                        }
                         inflight.fetch_sub(1, Ordering::AcqRel);
                         next_out += 1;
                         if next_out.is_multiple_of(32) || next_out == num_blocks {
@@ -857,6 +878,15 @@ pub fn run(opts: &ImageOptions) -> Result<ImageReport> {
         Ok(())
     });
     scope_result?;
+    if timing_on {
+        let f = |c: Option<&AtomicU64>| c.map_or(0, |x| x.load(Ordering::Relaxed)) as f64 / 1e9;
+        eprintln!(
+            "[timing] read={:.1}s write={:.1}s hash={:.1}s",
+            f(read_ns.as_ref()),
+            f(write_ns.as_ref()),
+            f(hash_ns.as_ref())
+        );
+    }
     if keep_vol {
         unsafe { CloseHandle(vol) };
     }
@@ -866,7 +896,10 @@ pub fn run(opts: &ImageOptions) -> Result<ImageReport> {
     }
     writer.finish()?;
 
-    let sha256 = hex_encode(&hasher.finalize());
+    let sha256 = match hasher {
+        Some(h) => hex_encode(&h.finalize()),
+        None => "skipped".to_string(),
+    };
     let image_bytes = std::fs::metadata(opts.output)?.len();
 
     // 7. Optional self-verification: re-open the finished image, re-read the
@@ -899,9 +932,10 @@ pub fn run(opts: &ImageOptions) -> Result<ImageReport> {
 /// binary search (blocks arrive in arbitrary order across threads). Returns
 /// whether any used sector touched the block (all-zero blocks are skipped
 /// entirely and their BAT entries stay NOT_PRESENT).
+#[allow(clippy::too_many_arguments)]
 fn fill_block(
     h: HANDLE, vol_h: Option<HANDLE>, extent_offset: u64, ranges: &[(u64, u64)], idx: u64,
-    block_size: u64, buf: &mut [u8],
+    block_size: u64, buf: &mut [u8], read_ns: Option<&AtomicU64>,
 ) -> Result<bool> {
     buf.fill(0);
     let b_start = idx * block_size;
@@ -918,6 +952,7 @@ fn fill_block(
         let off = (s - b_start) as usize;
         let len = (e - s) as usize;
         let dst = &mut buf[off..off + len];
+        let t0 = std::time::Instant::now();
         if let Some(vh) = vol_h {
             if s >= extent_offset {
                 // Volume body: volume-relative read through the volume handle.
@@ -928,6 +963,9 @@ fn fill_block(
             }
         } else {
             read_device(h, s, dst)?;
+        }
+        if let Some(c) = read_ns {
+            c.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
         touched = true;
         ri += 1;

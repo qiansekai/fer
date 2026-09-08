@@ -131,8 +131,12 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = image::ReadMode::Physical)]
         read_mode: image::ReadMode,
         /// Re-read the finished image and verify the SHA-256
-        #[arg(long)]
+        #[arg(long, conflicts_with = "no_hash")]
         verify: bool,
+        /// Skip the streaming SHA-256 (pure copy, fastest; incompatible
+        /// with --verify)
+        #[arg(long)]
+        no_hash: bool,
     },
 }
 
@@ -370,6 +374,7 @@ fn main() -> Result<()> {
             threads,
             read_mode,
             verify,
+            no_hash,
         } => {
             if !file_engine_rust::is_elevated() {
                 file_engine_rust::try_self_elevate()?;
@@ -381,6 +386,7 @@ fn main() -> Result<()> {
                 threads,
                 verify,
                 read_mode,
+                no_hash,
             };
             let report = image::run(&opts)?;
             if cli.json {
