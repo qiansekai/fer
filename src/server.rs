@@ -118,6 +118,12 @@ pub async fn serve(addr: &str, mem: MemIndex, db: &std::path::Path) -> Result<()
             match MemIndex::load_dump(&reload_dump) {
                 Ok(fresh) => {
                     let n = fresh.len();
+                    // Warm BEFORE the swap, not after: the freshly mapped dump
+                    // is all page faults, and the old engine keeps serving
+                    // during this ~1s sequential touch, so no client ever pays
+                    // the cold-page tax on the new snapshot (measured 631ms
+                    // cold vs 22ms warm for `a?c`).
+                    fresh.warm();
                     *reload_slot.write().unwrap() = Arc::new(fresh);
                     reload_cache.lock().unwrap().clear();
                     eprintln!("[server] dump changed on disk — reloaded {n} entries");
