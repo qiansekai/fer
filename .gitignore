@@ -4,8 +4,8 @@
 *.db-wal
 *.db-shm
 *.log
-# 稳定版二进制备份不入库（说明见 stable/README.md）
-/stable/fer.exe
-# Agent 内部速查卡与本机锚点记录：本地保留，不进公开仓库
+# 稳定版二进制备份与来源记录：本地回退锚点，一律不进公开仓库
+# （整目录忽略——旧的 /stable/fer.exe 规则漏掉了 *.bak-* 备份，2026-09-08 修正）
+/stable/
+# Agent 内部速查卡：本地保留，不进公开仓库
 /AGENTS.md
-/stable/README.md
