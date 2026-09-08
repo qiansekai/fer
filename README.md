@@ -75,6 +75,8 @@ fer du "D:\proj" --top 20            # 磁盘占用聚合（WizTree 式 du，见
 fer du "D:\" --depth 1 --top 10 --json  # 整卷顶层占用，JSON 输出
 fer image --volume I --output disk.vhdx --verify   # 卷 → 动态 VHDX 取证镜像（已用簇，多线程，SHA-256）
 fer image --volume I --output disk.vhdx --threads 8 --block-size-mb 32  # 控制并行度与块大小
+fer image --volume I --estimate                     # 干跑预估：镜像大小 + ETA（冷样本实测吞吐，误差 <7%）
+fer image --volume I --output disk.vhdx --no-hash   # 纯拷贝（跳过 SHA-256，最快）
 fer --db <path> <cmd>                # 自定义索引库（默认 %LOCALAPPDATA%\file-engine-rust\index.db）
 ```
 
@@ -86,6 +88,8 @@ fer --db <path> <cmd>                # 自定义索引库（默认 %LOCALAPPDATA
 - 全零块跳过（BAT 保持 NOT_PRESENT），镜像体积 ≈ 已用空间；未用扇区按零参与 SHA-256，**卷哈希与全盘 dd 的修剪卷哈希一致**
 - `--verify` 完成后重开镜像、走 BAT 重读 payload 块比对哈希；`--no-hash` 跳过流式
   SHA-256（纯拷贝模式，最快）
+- `--estimate` 干跑预估：位图精确算出存储块数（镜像大小误差 <0.1%）+ 跨 range 冷样本
+  实测读吞吐 → ETA（实测误差 <7%），不写任何文件
 - 读路径 `--read-mode physical|volume`（默认 physical 从裸盘读；volume 走文件系统
   驱动路径，个别 USB 桥更快）；镜像在线卷前先 `FlushFileBuffers` 刷卷缓存，保证
   「刚写入的文件」也在镜像里（位图是缓存视角、payload 读裸盘，不刷会漏）
