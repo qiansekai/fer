@@ -551,6 +551,27 @@ impl MemIndex {
         }
         let entry_bytes = n * std::mem::size_of::<Entry>();
         let perm_bytes = n * 4;
+        // Arena-span sanity. The layout check above only proves the sections
+        // are where the header says; a corrupt path/name length would still
+        // make every consumer walk a bogus (up to 64 KB) slice per entry —
+        // the monitor's flush then copies that into a fresh arena and dies on
+        // a tens-of-GB allocation. Cheap O(n) check, run on every load.
+        {
+            let entries_view: View<Entry> = view_of(view_at(offs[0], entry_bytes));
+            let entries = entries_view.slice();
+            let paths_len = (offs[2] - offs[1]) as usize;
+            let names_len = (offs[3] - offs[2]) as usize;
+            let revs_len = (offs[4] - offs[3]) as usize;
+            anyhow::ensure!(
+                entries.iter().all(|e| {
+                    e.path_off as usize + e.path_len as usize <= paths_len
+                        && e.name_off as usize + e.name_len as usize <= names_len
+                        && e.rev_off as usize + e.rev_len as usize <= revs_len
+                }),
+                "dump arena spans corrupt (entry offsets/lengths out of range): {}",
+                path.display()
+            );
+        }
         // v3 dumps predate the accelerator arrays: rebuild them in memory from
         // the id-ordered entries section (arena offsets are monotone there).
         let aux = if version == 3 {
@@ -2682,6 +2703,31 @@ mod tests {
         assert_eq!(loaded.path_at(idx as usize), r"D:\proj\src\main.rs");
         let q = Query::parse("ext:rs").unwrap();
         assert_eq!(loaded.search(&q), mem.search(&q));
+    }
+
+    #[test]
+    fn corrupt_arena_spans_rejected() {
+        // A dump whose entry arena offsets/lengths point outside their arena
+        // must be refused at load: the monitor's flush would otherwise copy
+        // tens of GB into a fresh arena and abort on allocation failure.
+        let mut b = MemBuilder::default();
+        b.push(r"D:\a.txt", EntryMeta { size: 1, frn: Some(1), ..Default::default() });
+        let idx = b.finish();
+        let dir = std::env::temp_dir().join(format!("fer-corrupt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dump = dir.join("index.db.feridx");
+        idx.save(&dump).unwrap();
+        let mut bytes = std::fs::read(&dump).unwrap();
+        // Entry layout: path_len at +48 (u16). Blow it past the paths arena.
+        bytes[HDR_LEN + 48] = 0xFF;
+        bytes[HDR_LEN + 49] = 0xFF;
+        std::fs::write(&dump, &bytes).unwrap();
+        let err = match MemIndex::load_dump(&dump) {
+            Ok(_) => panic!("corrupt dump was accepted"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("arena spans corrupt"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

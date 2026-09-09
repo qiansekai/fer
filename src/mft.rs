@@ -11,6 +11,7 @@
 //! walks FILE records. If anything looks unsupported (e.g. a fragmented $MFT
 //! behind an attribute list), [`crate::indexer`] falls back to the USN path.
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::ptr::null_mut;
@@ -64,10 +65,19 @@ pub struct MftEntry {
     pub system: bool,
     pub readonly: bool,
     pub reparse: bool,
+    /// Set when this file's default `$DATA` stream lives in a **different**
+    /// MFT record (spilled via `$ATTRIBUTE_LIST` — common for heavily
+    /// fragmented large files). Holds that record's number; the scanner
+    /// resolves size/allocated from it after the main sweep.
+    pub fixup_record: Option<u64>,
+    /// The `$ATTRIBUTE_LIST` itself is non-resident (very fragmented file, e.g.
+    /// tens of thousands of extents): its data runs + logical size, resolved
+    /// by the scanner after the sweep.
+    pub(crate) fixup_list: Option<(Vec<Run>, u64)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Run {
+pub(crate) struct Run {
     vcn: u64,
     lcn: i64,
     len: u64, // clusters
@@ -143,6 +153,7 @@ impl MftScanner {
         for attr in iterate_attributes(&rec0, hdr.attr_off, hdr.bytes_in_use) {
             match attr.attr_type {
                 0x20 => has_attr_list = true,
+                0x80 if attr.name_len != 0 => {} // named stream, not $MFT's data
                 0x80 if !attr.non_resident => {}
                 0x80 => {
                     data_size = attr.real_size;
@@ -242,6 +253,7 @@ impl MftScanner {
             .unwrap_or(4)
             .min(8);
         let mut records = 0u64;
+        let mut pending: Vec<MftEntry> = Vec::new();
         let mut buf: Vec<u8> = Vec::with_capacity(BATCH);
         let mut r = 0u64; // record cursor over the whole $MFT
         while r < file_records {
@@ -308,11 +320,101 @@ impl MftScanner {
             for (entries, recs) in parsed {
                 records += recs;
                 for entry in entries {
-                    on_entry(&entry);
+                    // Entries whose default $DATA was spilled to another record
+                    // are held back until the extra records have been read.
+                    if entry.fixup_record.is_some() || entry.fixup_list.is_some() {
+                        pending.push(entry);
+                    } else {
+                        on_entry(&entry);
+                    }
                 }
             }
         }
+        if !pending.is_empty() {
+            // Non-resident $ATTRIBUTE_LIST: read each list once to learn the
+            // record that owns the stream's first segment.
+            for e in pending.iter_mut() {
+                if e.fixup_record.is_none()
+                    && let Some((runs, size)) = e.fixup_list.take()
+                {
+                    e.fixup_record = self.read_attr_list_target(&runs, size);
+                }
+            }
+            let sizes = self.read_spilled_data_sizes(&pending);
+            let patched = pending
+                .iter()
+                .filter(|e| e.fixup_record.is_some_and(|t| sizes.contains_key(&t)))
+                .count();
+            eprintln!(
+                "[mft] patched {patched}/{} entries whose $DATA was spilled via $ATTRIBUTE_LIST",
+                pending.len()
+            );
+            for mut entry in pending {
+                if let Some(target) = entry.fixup_record
+                    && let Some(&(size, allocated)) = sizes.get(&target)
+                {
+                    entry.size = size;
+                    entry.allocated = allocated;
+                }
+                on_entry(&entry);
+            }
+        }
         Ok(records)
+    }
+
+    /// Read a non-resident `$ATTRIBUTE_LIST` and return the MFT record holding
+    /// the default `$DATA` stream's first segment (`lowest_vcn == 0`).
+    fn read_attr_list_target(&self, runs: &[Run], size: u64) -> Option<u64> {
+        // A 50k-extent file's list is ~1.5 MB; anything past 64 MB is a
+        // corrupt/absurd list and not worth an allocation.
+        const MAX_LIST: u64 = 64 << 20;
+        if size == 0 || size > MAX_LIST {
+            return None;
+        }
+        // Raw volume reads must be sector-aligned in *length* too, and an
+        // attribute list's logical size rarely is (640 B, 1056 B, ...): round
+        // the read up and truncate afterwards. `cap` keeps the rounded read
+        // inside the stream's allocated clusters.
+        let want = size as usize;
+        let sec = self.sector_size.max(512) as usize;
+        let cap = runs.iter().map(|r| r.len).sum::<u64>() * self.bytes_per_cluster.max(512) as u64;
+        let read_len = ((want.div_ceil(sec) * sec) as u64).min(cap) as usize;
+        if read_len < want {
+            return None; // stream shorter than its declared size
+        }
+        let mut buf = vec![0u8; read_len];
+        if let Err(e) = self.read_runs(runs, 0, read_len, &mut buf) {
+            eprintln!(
+                "[mft] attribute list unreadable ({} runs, {size} B): {e}",
+                runs.len()
+            );
+            return None;
+        }
+        buf.truncate(want);
+        attr_list_data_record(&buf)
+    }
+
+    /// Read the extra MFT records referenced by held-back entries and return
+    /// `target record -> (real_size, allocated)` for the ones carrying a usable
+    /// unnamed `$DATA` segment. Unreadable records are simply left out (the
+    /// entry keeps its `$FILE_NAME` fallback rather than failing the scan).
+    fn read_spilled_data_sizes(&self, pending: &[MftEntry]) -> HashMap<u64, (u64, u64)> {
+        let mut targets: Vec<u64> = pending.iter().filter_map(|e| e.fixup_record).collect();
+        targets.sort_unstable();
+        targets.dedup();
+        let mut out: HashMap<u64, (u64, u64)> = HashMap::with_capacity(targets.len());
+        let mut rec = vec![0u8; self.record_size as usize];
+        for t in targets {
+            let off = t * self.record_size as u64;
+            if self.read_runs(&self.runs, off, rec.len(), &mut rec).is_err() {
+                continue;
+            }
+            apply_fixups_inplace(&mut rec, self.sector_size);
+            if let Some(pair) = record_default_data_size(&rec) {
+                out.insert(t, pair);
+            }
+        }
+        out
     }
 
     /// Read `len` bytes at `offset` within a set of data runs, crossing run
@@ -378,6 +480,8 @@ fn parse_record(rec: &mut [u8], sector_size: u32) -> Option<Vec<MftEntry>> {
     let mut std_ctime = 0i64;
     let mut data_size: Option<u64> = None;
     let mut data_allocated: Option<u64> = None;
+    let mut attr_list: Option<(usize, usize)> = None;
+    let mut attr_list_runs: Option<(Vec<Run>, u64)> = None;
     let mut names: Vec<(u64, String, bool, bool, bool, bool)> = Vec::new();
     let mut max_size = 0u64;
     for attr in iterate_attributes(rec, hdr.attr_off, hdr.bytes_in_use) {
@@ -387,14 +491,41 @@ fn parse_record(rec: &mut [u8], sector_size: u32) -> Option<Vec<MftEntry>> {
                 std_ctime = filetime_to_unix(u64::from_le_bytes(v[0..8].try_into().unwrap()));
                 std_mtime = filetime_to_unix(u64::from_le_bytes(v[8..16].try_into().unwrap()));
             }
-            0x80 => {
+            // Only the *unnamed* $DATA stream is the file's content. Named
+            // streams ($BadClus:$Bad spans the whole volume, file:Zone.Identifier,
+            // ...) would otherwise be reported as the file's size.
+            0x80 if attr.name_len == 0 => {
                 if attr.non_resident {
-                    data_size = Some(attr.real_size);
-                    // 0 clusters for resident streams (stored in the record)
-                    data_allocated = Some(attr.allocated);
+                    // A stream split across records by $ATTRIBUTE_LIST carries
+                    // its authoritative size only in the lowest_vcn == 0 segment.
+                    if attr.lowest_vcn == 0 {
+                        data_size = Some(attr.real_size);
+                        // 0 clusters for resident streams (stored in the record)
+                        data_allocated = Some(attr.allocated);
+                    }
                 } else {
                     data_size = Some(attr.value_len as u64);
                     data_allocated = Some(0);
+                }
+            }
+            // Resident $ATTRIBUTE_LIST: keep its bytes so the spilled $DATA
+            // record can be located after the attribute sweep.
+            0x20 if !attr.non_resident => {
+                let end = attr.value_off.saturating_add(attr.value_len as usize);
+                if attr.value_off >= hdr.attr_off && end <= rec.len() {
+                    attr_list = Some((attr.value_off, end));
+                }
+            }
+            // Non-resident $ATTRIBUTE_LIST (the list outgrew the record — very
+            // fragmented files): keep its runs, resolved after the sweep.
+            0x20 => {
+                if attr.mapping_pairs_off < attr.end
+                    && attr.end <= rec.len()
+                    && let Ok(runs) = parse_runlist(&rec[attr.mapping_pairs_off..attr.end])
+                    && !runs.is_empty()
+                    && attr.real_size > 0
+                {
+                    attr_list_runs = Some((runs, attr.real_size));
                 }
             }
             0x30 if !attr.non_resident && attr.value_len >= 66 => {
@@ -426,6 +557,19 @@ fn parse_record(rec: &mut [u8], sector_size: u32) -> Option<Vec<MftEntry>> {
     }
     let size = data_size.unwrap_or(max_size);
     let allocated = data_allocated.unwrap_or(0);
+    // The default $DATA stream was spilled to another MFT record: remember
+    // how to find it so the scanner can read the real size/allocated
+    // afterwards. ($FILE_NAME's own size field is a stale directory cache —
+    // 0 for most user files — so the fallback above cannot stand in for it.)
+    let (fixup_record, fixup_list) = if data_size.is_some() {
+        (None, None)
+    } else {
+        match (attr_list, attr_list_runs) {
+            (Some((s, e)), _) => (attr_list_data_record(&rec[s..e]), None),
+            (None, Some((runs, size))) => (None, Some((runs, size))),
+            _ => (None, None),
+        }
+    };
     let mut out = Vec::with_capacity(names.len());
     for (parent_frn, name, hidden, system, readonly, reparse) in names {
         out.push(MftEntry {
@@ -441,9 +585,52 @@ fn parse_record(rec: &mut [u8], sector_size: u32) -> Option<Vec<MftEntry>> {
             system,
             readonly,
             reparse,
+            fixup_record,
+            fixup_list: fixup_list.clone(),
         });
     }
     Some(out)
+}
+
+/// Locate the MFT record holding the *unnamed* `$DATA` stream's first segment
+/// (`lowest_vcn == 0`) inside a resident `$ATTRIBUTE_LIST`.
+///
+/// ATTR_LIST_ENTRY layout (NTFS 3.1, entries 8-byte aligned):
+/// `type u32 @0 | length u16 @4 | name_len u8 @6 | name_off u8 @7 |
+///  lowest_vcn u64 @8 | file_reference u64 @16 | instance u16 @24 | name @26`.
+fn attr_list_data_record(list: &[u8]) -> Option<u64> {
+    let mut off = 0usize;
+    while off + 26 <= list.len() {
+        let ty = u32::from_le_bytes(list[off..off + 4].try_into().unwrap());
+        let len = u16::from_le_bytes([list[off + 4], list[off + 5]]) as usize;
+        if len < 26 || off + len > list.len() {
+            break;
+        }
+        let name_len = list[off + 6];
+        let lowest_vcn = u64::from_le_bytes(list[off + 8..off + 16].try_into().unwrap());
+        let file_ref = u64::from_le_bytes(list[off + 16..off + 24].try_into().unwrap());
+        if ty == 0x80 && name_len == 0 && lowest_vcn == 0 {
+            return Some(file_ref & FRN_MASK);
+        }
+        off += len;
+    }
+    None
+}
+
+/// Extract `(real_size, allocated)` of a record's unnamed non-resident
+/// `$DATA` first segment — used to patch entries whose stream was spilled.
+fn record_default_data_size(rec: &[u8]) -> Option<(u64, u64)> {
+    let hdr = parse_file_header(rec).ok()?;
+    for attr in iterate_attributes(rec, hdr.attr_off, hdr.bytes_in_use) {
+        if attr.attr_type == 0x80
+            && attr.name_len == 0
+            && attr.non_resident
+            && attr.lowest_vcn == 0
+        {
+            return Some((attr.real_size, attr.allocated));
+        }
+    }
+    None
 }
 
 /// Parse a slice of back-to-back FILE records (parallel-scan worker body).
@@ -530,12 +717,21 @@ struct AttrRef {
     attr_type: u32,
     end: usize,
     non_resident: bool,
+    /// Attribute name length in UTF-16 units. **Zero means the unnamed
+    /// (default) stream** — only that one describes the file itself; named
+    /// streams (`$BadClus:$Bad`, `file:Zone.Identifier`, ...) must be ignored
+    /// or `du`/`size:` report the stream, not the file.
+    name_len: u8,
     value_len: u32,
     value_off: usize,
     real_size: u64,
     /// Allocated clusters in bytes ($DATA only; 0 for resident attributes,
     /// which live inside the FILE record and occupy no clusters).
     allocated: u64,
+    /// First VCN of a non-resident stream segment. A stream split across
+    /// `$ATTRIBUTE_LIST` records carries its authoritative size only in the
+    /// segment whose `lowest_vcn == 0`.
+    lowest_vcn: u64,
     mapping_pairs_off: usize,
 }
 
@@ -550,27 +746,33 @@ fn iterate_attributes<'a>(rec: &'a [u8], mut off: usize, limit: usize) -> impl I
             return None;
         }
         let non_resident = rec[off + 8] != 0;
-        let (value_len, value_off, real_size, allocated, mapping_pairs_off) = if non_resident {
-            let mp = u16::from_le_bytes([rec[off + 32], rec[off + 33]]) as usize;
-            // non-resident header: allocated_size @ +40, real_size @ +48
-            let as_ = u64::from_le_bytes(rec[off + 40..off + 48].try_into().unwrap());
-            let rs = u64::from_le_bytes(rec[off + 48..off + 56].try_into().unwrap());
-            (0u32, 0usize, rs, as_, off + mp)
-        } else {
-            let vl = u32::from_le_bytes(rec[off + 16..off + 20].try_into().unwrap());
-            let vo = u16::from_le_bytes([rec[off + 20], rec[off + 21]]) as usize;
-            (vl, off + vo, 0u64, 0u64, 0usize)
-        };
+        let name_len = rec[off + 9];
+        let (value_len, value_off, real_size, allocated, lowest_vcn, mapping_pairs_off) =
+            if non_resident {
+                let mp = u16::from_le_bytes([rec[off + 32], rec[off + 33]]) as usize;
+                // non-resident header: lowest_vcn @ +16, allocated_size @ +40,
+                // real_size @ +48
+                let lv = u64::from_le_bytes(rec[off + 16..off + 24].try_into().unwrap());
+                let as_ = u64::from_le_bytes(rec[off + 40..off + 48].try_into().unwrap());
+                let rs = u64::from_le_bytes(rec[off + 48..off + 56].try_into().unwrap());
+                (0u32, 0usize, rs, as_, lv, off + mp)
+            } else {
+                let vl = u32::from_le_bytes(rec[off + 16..off + 20].try_into().unwrap());
+                let vo = u16::from_le_bytes([rec[off + 20], rec[off + 21]]) as usize;
+                (vl, off + vo, 0u64, 0u64, 0u64, 0usize)
+            };
         let end = off + len;
         off += len;
         Some(AttrRef {
             attr_type,
             end,
             non_resident,
+            name_len,
             value_len,
             value_off,
             real_size,
             allocated,
+            lowest_vcn,
             mapping_pairs_off,
         })
     })
@@ -804,6 +1006,210 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].size, 7); // falls back to $FILE_NAME's field
         assert_eq!(entries[0].allocated, 0);
+    }
+
+    /// Append a non-resident $DATA attribute (optionally a *named* stream).
+    /// Returns the offset just past it.
+    fn put_data_attr(rec: &mut [u8], off: usize, name: Option<&str>, real: u64, allocated: u64) -> usize {
+        let name16: Vec<u8> = match name {
+            Some(n) => n.encode_utf16().flat_map(|u| u.to_le_bytes()).collect(),
+            None => Vec::new(),
+        };
+        let head = 64usize;
+        let attr_len = (head + name16.len()).div_ceil(8) * 8;
+        put_u32(rec, off, 0x80);
+        put_u32(rec, off + 4, attr_len as u32);
+        rec[off + 8] = 1; // non-resident
+        rec[off + 9] = match name {
+            Some(n) => n.encode_utf16().count() as u8,
+            None => 0,
+        };
+        put_u16(rec, off + 10, if name.is_some() { head as u16 } else { 0 });
+        put_u16(rec, off + 32, (head + name16.len()) as u16); // mapping pairs offset
+        put_u64(rec, off + 40, allocated);
+        put_u64(rec, off + 48, real);
+        put_u64(rec, off + 56, real);
+        rec[off + head..off + head + name16.len()].copy_from_slice(&name16);
+        off + attr_len
+    }
+
+    /// Resident $ATTRIBUTE_LIST with a single entry pointing the unnamed
+    /// $DATA stream (lowest VCN 0) at `target_record`.
+    fn put_attr_list(rec: &mut [u8], off: usize, target_record: u64) -> usize {
+        const ENTRY: usize = 26;
+        let attr_len = (24 + ENTRY).div_ceil(8) * 8;
+        put_u32(rec, off, 0x20);
+        put_u32(rec, off + 4, attr_len as u32);
+        rec[off + 8] = 0; // resident
+        put_u32(rec, off + 16, ENTRY as u32);
+        put_u16(rec, off + 20, 24);
+        let v = off + 24;
+        put_u32(rec, v, 0x80); // $DATA
+        put_u16(rec, v + 4, ENTRY as u16);
+        rec[v + 6] = 0; // unnamed
+        rec[v + 7] = ENTRY as u8;
+        put_u64(rec, v + 8, 0); // lowest_vcn
+        put_u64(rec, v + 16, target_record);
+        off + attr_len
+    }
+
+    /// FILE record with one $FILE_NAME (size field 0, like real volumes) plus
+    /// explicit non-resident $DATA streams. Returns (record, offset of the
+    /// terminator) so callers can append more attributes.
+    fn make_record_with_data(
+        record_number: u32,
+        name: &str,
+        datas: &[(Option<&str>, u64, u64)],
+    ) -> (Vec<u8>, usize) {
+        let mut rec = vec![0u8; 1024];
+        rec[0..4].copy_from_slice(b"FILE");
+        put_u16(&mut rec, 4, 48);
+        put_u16(&mut rec, 6, 2);
+        put_u16(&mut rec, 16, 1);
+        put_u16(&mut rec, 18, 1);
+        put_u16(&mut rec, 20, 56);
+        put_u16(&mut rec, 22, 0x01);
+        put_u32(&mut rec, 24, 1024);
+        put_u32(&mut rec, 28, 1024);
+        put_u32(&mut rec, 44, record_number);
+        put_u16(&mut rec, 48, 0x1234);
+        put_u16(&mut rec, 50, 0x0000);
+        put_u16(&mut rec, 510, 0x1234);
+        put_u16(&mut rec, 1022, 0x1234);
+        let mut off = 56usize;
+        let name16: Vec<u8> = name.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        let attr_len = (24 + 66 + name16.len()).div_ceil(8) * 8;
+        put_u32(&mut rec, off, 0x30);
+        put_u32(&mut rec, off + 4, attr_len as u32);
+        rec[off + 8] = 0;
+        put_u32(&mut rec, off + 16, (66 + name16.len()) as u32);
+        put_u16(&mut rec, off + 20, 24);
+        let v = off + 24;
+        put_u64(&mut rec, v, 5); // parent FRN
+        put_u64(&mut rec, v + 48, 0); // $FILE_NAME size cache: 0, as on disk
+        rec[v + 64] = name.encode_utf16().count() as u8;
+        rec[v + 65] = 1;
+        rec[v + 66..v + 66 + name16.len()].copy_from_slice(&name16);
+        off += attr_len;
+        for &(n, real, alloc) in datas {
+            off = put_data_attr(&mut rec, off, n, real, alloc);
+        }
+        put_u32(&mut rec, off, 0xFFFF_FFFF);
+        (rec, off)
+    }
+
+    #[test]
+    fn named_data_stream_is_ignored() {
+        // $BadClus-style: the unnamed stream is empty, a named stream spans
+        // the whole volume. The file size must come from the unnamed one.
+        let (mut rec, _) =
+            make_record_with_data(300, "bad", &[(None, 0, 0), (Some("$Bad"), 999_999, 0)]);
+        let entries = parse_record(&mut rec, 512).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].size, 0);
+        assert_eq!(entries[0].allocated, 0);
+    }
+
+    #[test]
+    fn unnamed_stream_wins_over_named() {
+        let (mut rec, _) = make_record_with_data(
+            303,
+            "mixed.bin",
+            &[(Some("Zone.Identifier"), 26, 0), (None, 4096, 8192)],
+        );
+        let entries = parse_record(&mut rec, 512).unwrap();
+        assert_eq!(entries[0].size, 4096);
+        assert_eq!(entries[0].allocated, 8192);
+    }
+
+    #[test]
+    fn spilled_data_records_fixup_target() {
+        // No $DATA in the base record; a resident $ATTRIBUTE_LIST points at
+        // record 999 instead (heavily fragmented large file).
+        let (mut rec, off) = make_record_with_data(301, "big.img", &[]);
+        let off = put_attr_list(&mut rec, off, 999);
+        put_u32(&mut rec, off, 0xFFFF_FFFF);
+        let entries = parse_record(&mut rec, 512).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].fixup_record, Some(999));
+    }
+
+    #[test]
+    fn attr_list_data_record_picks_unnamed_first_segment() {
+        let mut list = vec![0u8; 26];
+        put_u32(&mut list, 0, 0x80);
+        put_u16(&mut list, 4, 26);
+        list[6] = 0;
+        list[7] = 26;
+        put_u64(&mut list, 8, 0);
+        put_u64(&mut list, 16, 4242);
+        assert_eq!(attr_list_data_record(&list), Some(4242));
+
+        // A named stream entry must not be picked.
+        let mut named = vec![0u8; 26];
+        put_u32(&mut named, 0, 0x80);
+        put_u16(&mut named, 4, 26);
+        named[6] = 4;
+        put_u64(&mut named, 16, 777);
+        assert_eq!(attr_list_data_record(&named), None);
+
+        // Continuation segment (lowest_vcn != 0) carries no authoritative size.
+        let mut cont = vec![0u8; 26];
+        put_u32(&mut cont, 0, 0x80);
+        put_u16(&mut cont, 4, 26);
+        put_u64(&mut cont, 8, 100);
+        put_u64(&mut cont, 16, 888);
+        assert_eq!(attr_list_data_record(&cont), None);
+    }
+
+    #[test]
+    fn record_default_data_size_skips_named_streams() {
+        let (rec, _) = make_record_with_data(
+            302,
+            "x.bin",
+            &[(Some("$Bad"), 999_999, 0), (None, 4096, 8192)],
+        );
+        let fixed = apply_fixups(&rec, 512).unwrap();
+        assert_eq!(record_default_data_size(&fixed), Some((4096, 8192)));
+    }
+
+    /// Non-resident $ATTRIBUTE_LIST (the list outgrew the record) with the
+    /// given mapping-pairs bytes.
+    fn put_attr_list_nonresident(
+        rec: &mut [u8],
+        off: usize,
+        real_size: u64,
+        runlist: &[u8],
+    ) -> usize {
+        let head = 64usize;
+        let attr_len = (head + runlist.len()).div_ceil(8) * 8;
+        put_u32(rec, off, 0x20);
+        put_u32(rec, off + 4, attr_len as u32);
+        rec[off + 8] = 1; // non-resident
+        put_u16(rec, off + 32, head as u16);
+        put_u64(rec, off + 40, real_size);
+        put_u64(rec, off + 48, real_size);
+        put_u64(rec, off + 56, real_size);
+        rec[off + head..off + head + runlist.len()].copy_from_slice(runlist);
+        off + attr_len
+    }
+
+    #[test]
+    fn nonresident_attr_list_is_carried_for_later_resolution() {
+        // 54k-extent style file: $DATA gone, $ATTRIBUTE_LIST itself spilled.
+        let (mut rec, off) = make_record_with_data(304, "huge.iso", &[]);
+        // header 0x22 = 2-byte length + 2-byte LCN delta, terminator 0x00
+        let runlist = [0x22u8, 0x00, 0x01, 0x40, 0x00, 0x00]; // 0x100 clusters @ LCN 0x40
+        let off = put_attr_list_nonresident(&mut rec, off, 4096, &runlist);
+        put_u32(&mut rec, off, 0xFFFF_FFFF);
+        let entries = parse_record(&mut rec, 512).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].fixup_record, None);
+        let (runs, size) = entries[0].fixup_list.as_ref().expect("list carried");
+        assert_eq!(*size, 4096);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].len, 0x100);
+        assert_eq!(runs[0].lcn, 0x40);
     }
 
     #[test]

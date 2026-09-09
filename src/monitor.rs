@@ -57,7 +57,23 @@ pub fn run(
     let mut appended: Vec<(String, EntryMeta)> = Vec::new();
     let mut last_flush = std::time::Instant::now();
     loop {
-        let (next, records) = vol.read_journal(start, MASK)?;
+        // A monitor that was down long enough for the journal to be recycled
+        // past the saved position fails here with ERROR_JOURNAL_DELETE_IN_
+        // PROGRESS (1181) — resuming from that USN is impossible. Sync to the
+        // current position instead of dying in a restart loop; the gap is
+        // covered by `fer index` (a rebuild), which the message says.
+        let (next, records) = match vol.read_journal(start, MASK) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!(
+                    "[monitor] reading the USN journal from {start} failed ({e}) — it was \
+                     recycled while the monitor was down. Syncing to the current position; \
+                     changes in the gap are NOT in the index (run `fer index` to rebuild)."
+                );
+                start = sync_to_now(&vol);
+                vol.read_journal(start, MASK)?
+            }
+        };
         if !records.is_empty() && next < start {
             bail!(
                 "USN journal on {drive}: wrapped (next={next} < start={start}) — \
