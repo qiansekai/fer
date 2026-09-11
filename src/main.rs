@@ -63,6 +63,17 @@ enum Cmd {
         /// and the CLI auto-forward below).
         #[arg(long, default_value = "127.0.0.1:19876")]
         addr: String,
+        /// Skip the background page warm-up.
+        ///
+        /// The warm-up touches one byte per 4 KB page of every mapped section so
+        /// the first query pays no page-fault tax (measured: 631 ms cold vs 22 ms
+        /// warm for `a?c`). The cost is that the whole dump — 1.2+ GB here — ends
+        /// up in the process working set, which reads as high memory in Task
+        /// Manager even though the pages are file-backed and the OS reclaims them
+        /// under pressure. Pass this when the working-set figure matters more than
+        /// the first-query latency.
+        #[arg(long)]
+        no_warm: bool,
     },
     /// Watch the USN journal and keep the index live (requires admin — refuses
     /// to start un-elevated)
@@ -363,10 +374,10 @@ fn main() -> Result<()> {
                 eprintln!("{} results (total {total}) in {took} ms", hits.len());
             }
         }
-        Cmd::Serve { addr } => {
+        Cmd::Serve { addr, no_warm } => {
             let mem = load_index(&db)?;
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(file_engine_rust::server::serve(&addr, mem, &db))?;
+            rt.block_on(file_engine_rust::server::serve(&addr, mem, &db, !no_warm))?;
         }
         Cmd::Monitor {
             volume,

@@ -76,7 +76,12 @@ impl QueryCache {
     }
 }
 
-pub async fn serve(addr: &str, mem: MemIndex, db: &std::path::Path) -> Result<()> {
+/// `warm` controls the background page warm-up: when true (the default) the
+/// whole dump is touched once so the first client query pays no page-fault tax,
+/// at the cost of pulling the entire dump into the working set. Pass false
+/// (`serve --no-warm`) when the working-set figure matters more than first-query
+/// latency — the pages are file-backed, so either way the OS can reclaim them.
+pub async fn serve(addr: &str, mem: MemIndex, db: &std::path::Path, warm: bool) -> Result<()> {
     eprintln!(
         "[server] memory index ready: {} entries, {} MB",
         mem.len(),
@@ -90,9 +95,12 @@ pub async fn serve(addr: &str, mem: MemIndex, db: &std::path::Path) -> Result<()
     // Background warm-up: touch one byte per page of every mapped section so
     // the first client query doesn't pay the mmap page-fault tax. Sequential
     // reads over ~1 GB; the OS scheduler deprioritizes naturally. CLI
-    // single-shot runs skip this (warm-up would exceed the query cost).
-    let warm_mem = state.mem.read().unwrap().clone();
-    std::thread::spawn(move || warm_mem.warm());
+    // single-shot runs skip this (warm-up would exceed the query cost), and
+    // `--no-warm` skips it here as well.
+    if warm {
+        let warm_mem = state.mem.read().unwrap().clone();
+        std::thread::spawn(move || warm_mem.warm());
+    }
     // Background dump hot-reload: `fer monitor` and external `fer index` runs
     // rewrite the dump while this server is up. Poll its mtime and swap the
     // engine, so a long-lived serve never answers from a stale snapshot. The
@@ -122,8 +130,10 @@ pub async fn serve(addr: &str, mem: MemIndex, db: &std::path::Path) -> Result<()
                     // is all page faults, and the old engine keeps serving
                     // during this ~1s sequential touch, so no client ever pays
                     // the cold-page tax on the new snapshot (measured 631ms
-                    // cold vs 22ms warm for `a?c`).
-                    fresh.warm();
+                    // cold vs 22ms warm for `a?c`). Skipped under --no-warm.
+                    if warm {
+                        fresh.warm();
+                    }
                     *reload_slot.write().unwrap() = Arc::new(fresh);
                     reload_cache.lock().unwrap().clear();
                     eprintln!("[server] dump changed on disk — reloaded {n} entries");
