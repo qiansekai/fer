@@ -41,7 +41,7 @@ use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -122,7 +122,23 @@ impl Batch {
 pub struct Broadcaster {
     clients: Arc<Mutex<Vec<TcpStream>>>,
     addr: String,
+    /// When the last *large* batch actually went out (throttling, see below).
+    last_big_send: Mutex<Instant>,
 }
+
+/// Throttling policy for the change feed.
+///
+/// The monitor re-sends its **entire** pending set every round — that is what
+/// makes the receiver idempotent — and the pending set only clears on flush
+/// (1800 s by default). Small sets are cheap and must go out immediately (that
+/// is the whole point of the feed), but a large one is expensive to re-serialize
+/// every `--interval-secs`: `serde_json` allocates a fresh multi-megabyte
+/// `String` each round. So send eagerly below `BIG_BATCH` and throttle above it.
+/// The receiver stays correct either way — it is fed a full snapshot, just less
+/// often.
+const BIG_BATCH: usize = 2_000;
+/// Minimum gap between two large broadcasts.
+const BIG_GAP: Duration = Duration::from_secs(30);
 
 impl Broadcaster {
     /// Bind the feed port and start accepting receivers. Returns `None` (with a
@@ -158,6 +174,7 @@ impl Broadcaster {
         Some(Self {
             clients,
             addr: addr.to_string(),
+            last_big_send: Mutex::new(Instant::now() - BIG_GAP),
         })
     }
 
@@ -170,9 +187,11 @@ impl Broadcaster {
     }
 
     /// Broadcast one batch. Skipped entirely when nobody is listening, so an
-    /// unconnected monitor pays nothing per round.
+    /// unconnected monitor pays nothing per round. Large batches are throttled
+    /// (see `BIG_BATCH` / `BIG_GAP`).
     pub fn send(&self, batch: &Batch) {
-        if batch.is_empty() {
+        let n = batch.append.len() + batch.remove.len();
+        if n == 0 {
             return;
         }
         let mut clients = match self.clients.lock() {
@@ -181,6 +200,17 @@ impl Broadcaster {
         };
         if clients.is_empty() {
             return;
+        }
+        if n >= BIG_BATCH {
+            match self.last_big_send.lock() {
+                Ok(mut last) => {
+                    if last.elapsed() < BIG_GAP {
+                        return; // too soon for an expensive batch; a later round carries it
+                    }
+                    *last = Instant::now();
+                }
+                Err(_) => return,
+            }
         }
         let mut line = match serde_json::to_string(batch) {
             Ok(s) => s,
