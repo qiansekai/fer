@@ -107,6 +107,17 @@ async function copyPath(p) {
   } catch { error.value = '剪贴板不可用（需要 https 或 localhost）' }
 }
 
+// Double-click opens Explorer with the entry selected. POST (not GET) because it
+// has a side effect — see /api/reveal in src/server.rs.
+async function reveal(h) {
+  error.value = ''
+  try {
+    const r = await fetch(`/api/reveal?path=${encodeURIComponent(h.path)}`, { method: 'POST' })
+    const j = await r.json()
+    if (!j.ok) error.value = j.error || '定位失败'
+  } catch (e) { error.value = String(e) }
+}
+
 function fmtSize(n) {
   if (n === null || n === undefined) return '-'
   if (n < 1024) return n + ' B'
@@ -198,7 +209,8 @@ onUnmounted(() => { clearInterval(feedTimer); clearTimeout(debounce) })
           :key="h.path"
           :class="{ copied: copiedPath === h.path }"
           @click="copyPath(h.path)"
-          :title="h.path"
+          @dblclick="reveal(h)"
+          :title="h.path + '\n双击在资源管理器中定位'"
         >
           <td class="col-path">
             <span class="badge" :class="h.is_dir ? 'dir' : 'file'">{{ h.is_dir ? 'D' : 'F' }}</span>
@@ -213,7 +225,8 @@ onUnmounted(() => { clearInterval(feedTimer); clearTimeout(debounce) })
 
     <p v-else-if="q.trim() && !loading" class="empty">没有匹配结果</p>
     <p v-else-if="!q.trim()" class="empty">
-      输入关键词开始搜索。点击任意行可复制完整路径。
+      输入关键词开始搜索。<br />
+      单击任意行复制完整路径，<b>双击在资源管理器中定位</b>。
     </p>
   </div>
 </template>

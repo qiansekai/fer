@@ -285,6 +285,7 @@ pub async fn serve(
         .route("/api/feed", get(feed))
         .route("/api/du", get(du))
         .route("/api/stats", get(stats))
+        .route("/api/reveal", post(reveal))
         .route("/api/rescan", post(rescan))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -299,6 +300,51 @@ async fn index_page() -> Html<&'static str> {
 
 async fn health() -> Json<Value> {
     Json(json!({ "ok": true }))
+}
+
+#[derive(Deserialize)]
+struct RevealQuery {
+    path: String,
+}
+
+/// Show `path` in Explorer with the entry selected — what a double-click in the
+/// UI does.
+///
+/// Safety notes, since this is the one endpoint that launches a process:
+/// * The path travels as a **separate argv element**, never interpolated into a
+///   command string, so quotes/`&`/`|` in a file name cannot become a second
+///   command. `explorer.exe` also parses `/select,<path>` itself, and a leading
+///   `/` or `-` is neutralised by the fact that the whole argument is prefixed
+///   with `/select,`.
+/// * It is a POST, not a GET, so a stray link or a prefetch cannot trigger it.
+/// * `Origin`/`Referer`, when present, must match this server — otherwise any web
+///   page the user visits could make their Explorer pop open folders.
+/// * Only existing paths are accepted, so this cannot be used to probe the
+///   filesystem for names that do not exist.
+async fn reveal(Query(q): Query<RevealQuery>, headers: axum::http::HeaderMap) -> Json<Value> {
+    // Same-origin check. A missing header (curl, an agent) is allowed; anything
+    // pointing elsewhere is refused — that is what stops a random web page the
+    // user has open from popping folders up in their Explorer.
+    for name in ["origin", "referer"] {
+        if let Some(v) = headers.get(name).and_then(|h| h.to_str().ok()) {
+            let same = v.starts_with("http://127.0.0.1:")
+                || v.starts_with("http://localhost:")
+                || v.starts_with("http://[::1]:");
+            if !v.is_empty() && !same {
+                return Json(json!({ "ok": false, "error": "拒绝跨源请求" }));
+            }
+        }
+    }
+    if !std::path::Path::new(&q.path).exists() {
+        return Json(json!({ "ok": false, "error": "路径不存在" }));
+    }
+    match std::process::Command::new("explorer.exe")
+        .arg(format!("/select,{}", q.path))
+        .spawn()
+    {
+        Ok(_) => Json(json!({ "ok": true })),
+        Err(e) => Json(json!({ "ok": false, "error": e.to_string() })),
+    }
 }
 
 /// Change-feed status: what the real-time overlay is carrying on top of the
