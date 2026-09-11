@@ -74,6 +74,15 @@ enum Cmd {
         /// the first-query latency.
         #[arg(long)]
         no_warm: bool,
+        /// Connect to `fer monitor`'s real-time change feed so files created
+        /// since the last dump flush are searchable immediately. The monitor
+        /// broadcasts what it has applied in memory; the server keeps that in a
+        /// small overlay on top of the dump snapshot. Ignored with --no-watch.
+        #[arg(long, default_value = file_engine_rust::push::DEFAULT_PUSH_ADDR)]
+        watch: String,
+        /// Serve the dump snapshot only, without the real-time change feed.
+        #[arg(long)]
+        no_watch: bool,
     },
     /// Watch the USN journal and keep the index live (requires admin — refuses
     /// to start un-elevated)
@@ -85,6 +94,14 @@ enum Cmd {
         /// Flush the in-memory index back to the dump at least this often
         #[arg(long, default_value_t = 60)]
         flush_secs: u64,
+        /// Broadcast applied changes to `fer serve` on this address, so files
+        /// created now become searchable within one `--interval-secs` instead of
+        /// waiting for the next flush.
+        #[arg(long, default_value = file_engine_rust::push::DEFAULT_PUSH_ADDR)]
+        push: String,
+        /// Do not broadcast changes.
+        #[arg(long)]
+        no_push: bool,
     },
     /// Index statistics
     Stats,
@@ -374,15 +391,28 @@ fn main() -> Result<()> {
                 eprintln!("{} results (total {total}) in {took} ms", hits.len());
             }
         }
-        Cmd::Serve { addr, no_warm } => {
+        Cmd::Serve {
+            addr,
+            no_warm,
+            watch,
+            no_watch,
+        } => {
             let mem = load_index(&db)?;
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(file_engine_rust::server::serve(&addr, mem, &db, !no_warm))?;
+            rt.block_on(file_engine_rust::server::serve(
+                &addr,
+                mem,
+                &db,
+                !no_warm,
+                if no_watch { None } else { Some(watch.as_str()) },
+            ))?;
         }
         Cmd::Monitor {
             volume,
             interval_secs,
             flush_secs,
+            push,
+            no_push,
         } => {
             if !file_engine_rust::is_elevated() {
                 file_engine_rust::try_self_elevate()?;
@@ -395,6 +425,7 @@ fn main() -> Result<()> {
                 dump,
                 Duration::from_secs(interval_secs),
                 Duration::from_secs(flush_secs),
+                if no_push { None } else { Some(push) },
             )?;
         }
         Cmd::Image {

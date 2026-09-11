@@ -2,7 +2,7 @@
 //! against the in-memory engine; `/api/rescan` rebuilds from the volumes and
 //! refreshes the dump + the live engine.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -18,14 +18,110 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::indexer::{self, Method};
-use crate::mem::{MemIndex, dump_path};
+use crate::mem::{MemBuilder, MemIndex, dump_path};
 use crate::usn;
+use crate::{fold_lower, push};
 
 #[derive(Clone)]
 struct AppState {
     mem: Arc<RwLock<Arc<MemIndex>>>,
+    /// Real-time changes pushed by `fer monitor` (see [`Overlay`]).
+    overlay: Arc<RwLock<Overlay>>,
     db: PathBuf,
     cache: Arc<Mutex<QueryCache>>,
+}
+
+/// Real-time overlay fed by `fer monitor` over `crate::push`.
+///
+/// The dump snapshot is the base index. `monitor` holds the *live* index in
+/// memory but only writes it back every `--flush-secs` (1800 s by default —
+/// a flush rewrites the whole multi-GB dump, so shortening it means
+/// terabytes/day of writes). Everything in this struct is therefore "what
+/// changed since the last flush", and it is what makes a file created seconds
+/// ago searchable.
+///
+/// `delta` is a small [`MemIndex`] built from the pending appends, so the
+/// overlay reuses the entire query engine instead of maintaining a parallel
+/// matcher. Both sides are keyed by lowercase path, which makes re-applying a
+/// batch (the monitor resends its whole pending set each round) idempotent.
+#[derive(Default)]
+struct Overlay {
+    appended: HashMap<String, push::AppendEntry>,
+    removed: HashSet<String>,
+    delta: Option<Arc<MemIndex>>,
+    batches: u64,
+    last_apply: Option<Instant>,
+    /// True once the pending set hit [`OVERLAY_MAX`]: the overlay stops growing
+    /// and a flush (or `fer index`) is required to shrink it again.
+    saturated: bool,
+}
+
+/// Cap on pending appends held in the overlay. A flush clears it long before
+/// this in practice; the cap only guards against a monitor whose flush never
+/// fires (e.g. `--flush-secs` set absurdly high).
+const OVERLAY_MAX: usize = 200_000;
+
+impl Overlay {
+    /// Apply one batch. This is a **full replacement**, not a delta: the
+    /// monitor re-sends its entire pending set every round (see `crate::push`),
+    /// so anything missing from `batch` is no longer pending.
+    ///
+    /// That distinction is load-bearing. A file created and then deleted within
+    /// one flush window is dropped from the monitor's `appended` list and never
+    /// enters its `removed` set (there is no index entry to point at yet), so no
+    /// later batch mentions it at all — an accumulating receiver would keep the
+    /// stale append forever and keep reporting a path that no longer exists.
+    fn apply(&mut self, b: push::Batch) {
+        self.appended.clear();
+        self.removed.clear();
+        for p in &b.remove {
+            self.removed.insert(fold_lower(p));
+        }
+        for e in b.append {
+            let k = fold_lower(&e.p);
+            if self.removed.contains(&k) {
+                continue; // deleted after being created, within the same window
+            }
+            if self.appended.len() >= OVERLAY_MAX {
+                self.saturated = true;
+                break;
+            }
+            self.appended.insert(k, e);
+        }
+        self.batches += 1;
+        self.last_apply = Some(Instant::now());
+        self.rebuild();
+    }
+
+    fn rebuild(&mut self) {
+        if self.appended.is_empty() {
+            self.delta = None;
+            return;
+        }
+        let mut b = MemBuilder::default();
+        for e in self.appended.values() {
+            b.push(&e.p, e.meta());
+        }
+        self.delta = Some(Arc::new(b.finish()));
+    }
+
+    /// Cheap per-query view: the delta index plus the removal set.
+    fn snapshot(&self) -> (Option<Arc<MemIndex>>, Arc<HashSet<String>>) {
+        (self.delta.clone(), Arc::new(self.removed.clone()))
+    }
+
+    /// Drop everything: a fresh dump already contains these changes, so keeping
+    /// them would shadow the reloaded snapshot.
+    fn reset(&mut self) {
+        self.appended.clear();
+        self.removed.clear();
+        self.delta = None;
+        self.saturated = false;
+    }
+
+    fn pending(&self) -> (usize, usize) {
+        (self.appended.len(), self.removed.len())
+    }
 }
 
 /// Tiny TTL-bounded LRU for identical repeated queries (agents re-issue the
@@ -81,7 +177,13 @@ impl QueryCache {
 /// at the cost of pulling the entire dump into the working set. Pass false
 /// (`serve --no-warm`) when the working-set figure matters more than first-query
 /// latency — the pages are file-backed, so either way the OS can reclaim them.
-pub async fn serve(addr: &str, mem: MemIndex, db: &std::path::Path, warm: bool) -> Result<()> {
+pub async fn serve(
+    addr: &str,
+    mem: MemIndex,
+    db: &std::path::Path,
+    warm: bool,
+    feed_addr: Option<&str>,
+) -> Result<()> {
     eprintln!(
         "[server] memory index ready: {} entries, {} MB",
         mem.len(),
@@ -89,6 +191,7 @@ pub async fn serve(addr: &str, mem: MemIndex, db: &std::path::Path, warm: bool) 
     );
     let state = AppState {
         mem: Arc::new(RwLock::new(Arc::new(mem))),
+        overlay: Arc::new(RwLock::new(Overlay::default())),
         db: db.to_path_buf(),
         cache: Arc::new(Mutex::new(QueryCache::default())),
     };
@@ -101,6 +204,32 @@ pub async fn serve(addr: &str, mem: MemIndex, db: &std::path::Path, warm: bool) 
         let warm_mem = state.mem.read().unwrap().clone();
         std::thread::spawn(move || warm_mem.warm());
     }
+    // Real-time change feed: `fer monitor` broadcasts the changes it has already
+    // applied in memory. Without this, a file created now stays invisible until
+    // the monitor's next dump flush — 1800 s by default, because a flush rewrites
+    // the whole multi-GB dump. See `crate::push` for the wire format.
+    if let Some(feed_src) = feed_addr {
+        let feed = push::Feed::connect(feed_src);
+        let ov = state.overlay.clone();
+        let drain_cache = state.cache.clone();
+        std::thread::spawn(move || {
+            loop {
+                let batches = feed.drain();
+                if !batches.is_empty() {
+                    {
+                        let mut g = ov.write().unwrap();
+                        for b in batches {
+                            g.apply(b);
+                        }
+                    }
+                    // Results changed: drop cached responses so the next query
+                    // reflects the new state instead of a 3 s-old answer.
+                    drain_cache.lock().unwrap().clear();
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        });
+    }
     // Background dump hot-reload: `fer monitor` and external `fer index` runs
     // rewrite the dump while this server is up. Poll its mtime and swap the
     // engine, so a long-lived serve never answers from a stale snapshot. The
@@ -109,6 +238,7 @@ pub async fn serve(addr: &str, mem: MemIndex, db: &std::path::Path, warm: bool) 
     // pages come straight from the page cache the writer just populated.
     let reload_slot = state.mem.clone();
     let reload_cache = state.cache.clone();
+    let reload_overlay = state.overlay.clone();
     let reload_dump = dump_path(db);
     std::thread::spawn(move || {
         let mut stamp = std::fs::metadata(&reload_dump)
@@ -136,6 +266,12 @@ pub async fn serve(addr: &str, mem: MemIndex, db: &std::path::Path, warm: bool) 
                     }
                     *reload_slot.write().unwrap() = Arc::new(fresh);
                     reload_cache.lock().unwrap().clear();
+                    // The reloaded dump already contains every change the overlay
+                    // was carrying; keeping them would shadow the fresh snapshot
+                    // (and permanently pin entries the dump has since dropped).
+                    if let Ok(mut o) = reload_overlay.write() {
+                        o.reset();
+                    }
                     eprintln!("[server] dump changed on disk — reloaded {n} entries");
                 }
                 Err(e) => eprintln!("[server] dump reload failed (keeping old engine): {e:#}"),
@@ -146,6 +282,7 @@ pub async fn serve(addr: &str, mem: MemIndex, db: &std::path::Path, warm: bool) 
         .route("/", get(index_page))
         .route("/api/health", get(health))
         .route("/api/search", get(search))
+        .route("/api/feed", get(feed))
         .route("/api/du", get(du))
         .route("/api/stats", get(stats))
         .route("/api/rescan", post(rescan))
@@ -162,6 +299,26 @@ async fn index_page() -> Html<&'static str> {
 
 async fn health() -> Json<Value> {
     Json(json!({ "ok": true }))
+}
+
+/// Change-feed status: what the real-time overlay is carrying on top of the
+/// dump snapshot. `delta_entries` is the number of entries a query can see
+/// beyond the snapshot right now.
+async fn feed(State(st): State<AppState>) -> Json<Value> {
+    let g = match st.overlay.read() {
+        Ok(g) => g,
+        Err(_) => return Json(json!({ "ok": false, "error": "overlay lock poisoned" })),
+    };
+    let (appended, removed) = g.pending();
+    Json(json!({
+        "ok": true,
+        "pending_append": appended,
+        "pending_remove": removed,
+        "delta_entries": g.delta.as_ref().map(|d| d.len()).unwrap_or(0),
+        "batches_applied": g.batches,
+        "saturated": g.saturated,
+        "last_apply_age_ms": g.last_apply.map(|t| t.elapsed().as_millis()),
+    }))
 }
 
 #[derive(Deserialize)]
@@ -192,11 +349,35 @@ async fn search(State(st): State<AppState>, Query(q): Query<SearchQuery>) -> Jso
     // if-let scrutinee would live across the `.await` and make the handler
     // future !Send. The scan (up to ~70ms) runs off the executor.
     let mem = st.mem.read().unwrap().clone();
+    let (delta, removed) = st.overlay.read().unwrap().snapshot();
     let qq = q.q.clone();
     let outcome = tokio::task::spawn_blocking(move || {
+        // The overlay holds everything `fer monitor` has applied since the last
+        // dump flush. Query it first so a file created seconds ago lands on page
+        // one — the snapshot alone would not have it at all until the next flush
+        // (1800 s by default).
+        let mut hits: Vec<crate::Hit> = Vec::with_capacity(limit);
+        let mut total = 0u64;
+        if let Some(d) = &delta {
+            let dids = d.search(&parsed);
+            total += dids.len() as u64;
+            for h in d.hits(&dids, limit) {
+                if !removed.contains(&fold_lower(&h.path)) {
+                    hits.push(h);
+                }
+            }
+        }
         let ids = mem.search(&parsed);
-        let total = ids.len() as u64;
-        let hits = mem.hits(&ids, limit);
+        total += ids.len() as u64;
+        // Over-fetch by the removal-set size so deletions the monitor reported
+        // cannot starve the page below `limit` entries.
+        let extra = removed.len().min(10_000);
+        let mut base = mem.hits(&ids, limit.saturating_add(extra));
+        if !removed.is_empty() {
+            base.retain(|h| !removed.contains(&fold_lower(&h.path)));
+        }
+        hits.append(&mut base);
+        hits.truncate(limit);
         (total, hits)
     })
     .await;

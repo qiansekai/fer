@@ -31,12 +31,17 @@ const MASK: u32 = USN_REASON_FILE_CREATE
 /// Watch one volume forever, applying journal events every `interval` and
 /// flushing the index to `dump` every `flush_every` seconds whenever changes
 /// are pending. The in-memory index is authoritative between flushes.
+///
+/// When `push_addr` is set a [`crate::push::Broadcaster`] is bound there and
+/// every applied batch is broadcast to connected `fer serve` receivers, so a
+/// long-lived server can show newly created files without waiting for a flush.
 pub fn run(
     mut mem: MemIndex,
     drive: char,
     dump: PathBuf,
     interval: Duration,
     flush_every: Duration,
+    push_addr: Option<String>,
 ) -> Result<()> {
     // Hard gate: the USN journal needs an elevated token; failing 10 minutes
     // into a watch (or worse, flushing a broken index) is worse than refusing
@@ -44,6 +49,7 @@ pub fn run(
     if !crate::is_elevated() {
         bail!("fer monitor needs an elevated process (USN journal access)");
     }
+    let feed = push_addr.as_deref().and_then(crate::push::Broadcaster::bind);
     let mut vol = UsnVolume::open(drive)?;
     let usn_sidecar = usn_sidecar_path(&dump);
     let mut start = read_usn(&usn_sidecar, drive).unwrap_or_else(|| sync_to_now(&vol));
@@ -138,6 +144,14 @@ pub fn run(
         if cache.len() > 1_000_000 {
             cache.clear();
         }
+        // Broadcast the pending set BEFORE the flush decision: `removed` holds
+        // indices into the *current* index, so the paths must be resolved while
+        // that index is still the authoritative one (flush rebuilds it).
+        if applied > 0
+            && let Some(f) = &feed
+        {
+            f.send(&build_batch(&mem, &removed, &appended));
+        }
         let pending = !appended.is_empty() || !removed.is_empty();
         let due = pending && last_flush.elapsed() >= flush_every;
         if due {
@@ -152,6 +166,34 @@ pub fn run(
         }
         thread::sleep(interval);
     }
+}
+
+/// Turn the pending change set into a push batch.
+///
+/// `removed` stores indices into `mem`, so this must run BEFORE the flush that
+/// rebuilds the index. The whole pending set is sent every round (not a delta):
+/// re-applying a path is idempotent on the receiver, which makes a dropped
+/// message self-heal on the next round.
+fn build_batch(
+    mem: &MemIndex,
+    removed: &HashSet<u32>,
+    appended: &[(String, EntryMeta)],
+) -> crate::push::Batch {
+    let mut batch = crate::push::Batch::default();
+    for &i in removed {
+        let i = i as usize;
+        if i >= mem.len() {
+            continue;
+        }
+        batch
+            .remove
+            .push(String::from_utf8_lossy(mem.path_bytes(i)).into_owned());
+    }
+    batch.append = appended
+        .iter()
+        .map(|(p, m)| crate::push::AppendEntry::new(p.clone(), *m))
+        .collect();
+    batch
 }
 
 /// Rebuild the index (drop `removed` indices, append new entries) and write it

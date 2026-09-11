@@ -9,6 +9,7 @@
 //! * `image`   — volume → dynamic VHDX forensic image (used clusters only,
 //!   multi-threaded raw reads, streaming SHA-256)
 //! * `monitor` — USN journal polling to keep the index live
+//! * `push`    — real-time change feed: monitor → serve (overlay, no dump rewrite)
 //! * `server`  — HTTP API (axum) with a minimal web UI
 //! * `store`   — SQLite + FTS5 (feature `sqlite`, dev/test oracle only —
 //!   production queries never touch it)
@@ -20,6 +21,7 @@ pub mod indexer;
 pub mod mem;
 pub mod mft;
 pub mod monitor;
+pub mod push;
 pub mod query;
 pub mod server;
 pub mod sha256;
