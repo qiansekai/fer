@@ -482,39 +482,11 @@ async fn rescan(State(st): State<AppState>) -> Json<Value> {
     }
 }
 
-const INDEX_HTML: &str = r#"<!doctype html>
-<html lang="zh">
-<head>
-<meta charset="utf-8">
-<title>fer — File Express Retriever</title>
-<style>
-body{font-family:system-ui,Segoe UI,sans-serif;margin:2rem auto;max-width:56rem;padding:0 1rem;background:#0f1115;color:#e8eaed}
-h1{font-size:1.4rem}h1 span{color:#8ab4f8}
-input#q{width:100%;padding:.6rem .8rem;font-size:1rem;background:#1c1f26;color:#e8eaed;border:1px solid #3c4043;border-radius:8px;box-sizing:border-box}
-.row{margin:.5rem 0;color:#9aa0a6;font-size:.85rem}
-ul{list-style:none;padding:0;margin:0}
-li{padding:.3rem .2rem;border-bottom:1px solid #23262d;font-family:Consolas,monospace;font-size:.9rem;overflow-wrap:anywhere}
-li.dir{color:#8ab4f8}
-</style>
-</head>
-<body>
-<h1><span>fer</span> — File Express Retriever · 毫秒级全盘文件名搜索</h1>
-<input id="q" placeholder="输入文件名（支持 * ? 通配符），回车或输入即搜…" autofocus>
-<div class="row"><label><input type="checkbox" id="p"> 全路径匹配</label>
-<span id="meta" style="margin-left:1em"></span></div>
-<ul id="res"></ul>
-<script>
-const q=document.getElementById('q'),res=document.getElementById('res'),meta=document.getElementById('meta');
-let t;
-q.addEventListener('input',()=>{clearTimeout(t);t=setTimeout(run,120);});
-async function run(){
-  const v=q.value.trim();if(!v){res.innerHTML='';meta.textContent='';return;}
-  const s=Date.now();
-  const r=await fetch('/api/search?q='+encodeURIComponent(v)+'&limit=100').then(x=>x.json());
-  meta.textContent=r.total+' 个结果 · '+(Date.now()-s)+' ms · '+r.engine;
-  res.innerHTML=(r.hits||[]).map(h=>'<li'+(h.is_dir?' class="dir"':'')+'>'+h.path.replace(/&/g,'&amp;').replace(/</g,'&lt;')+'</li>').join('');
-}
-run();
-</script>
-</body>
-</html>"#;
+/// The web UI, built from `webui/` by Vite into a single self-contained
+/// index.html (all JS and CSS inlined by vite-plugin-singlefile — see
+/// `webui/vite.config.js`). Embedding the build output keeps `fer serve` a
+/// lone binary with no asset directory to ship or locate at runtime.
+///
+/// `build.rs` checks that the file exists and tells you to run
+/// `cd webui && npm install && npm run build` if it does not.
+const INDEX_HTML: &str = include_str!("../webui/dist/index.html");
