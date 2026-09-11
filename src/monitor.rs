@@ -62,6 +62,12 @@ pub fn run(
     let mut removed: HashSet<u32> = HashSet::new();
     let mut appended: Vec<(String, EntryMeta)> = Vec::new();
     let mut last_flush = std::time::Instant::now();
+    // Periodic self-report. The monitor once ballooned to 20 GB of private
+    // commit within a minute of starting while `applied` counts and the push
+    // batch both looked normal, and nothing in the logs said which structure
+    // was growing. These are the only per-round collections that can; printing
+    // their sizes makes the culprit identifiable the next time it happens.
+    let mut last_report = std::time::Instant::now();
     loop {
         // A monitor that was down long enough for the journal to be recycled
         // past the saved position fails here with ERROR_JOURNAL_DELETE_IN_
@@ -141,6 +147,17 @@ pub fn run(
         if applied > 0 {
             eprintln!("[monitor] applied {applied} changes (usn={start})");
         }
+        if last_report.elapsed() >= Duration::from_secs(60) {
+            eprintln!(
+                "[monitor] stats: mem={} appended={} removed={} frns={} cache={}",
+                mem.len(),
+                appended.len(),
+                removed.len(),
+                removed_frns.len(),
+                cache.len()
+            );
+            last_report = std::time::Instant::now();
+        }
         if cache.len() > 1_000_000 {
             cache.clear();
         }
@@ -156,13 +173,37 @@ pub fn run(
         let due = pending && last_flush.elapsed() >= flush_every;
         if due {
             let kept = mem.len() - removed.len() + appended.len();
-            mem = flush(&mem, &removed, &appended, &dump)?;
+            let n_removed = removed.len();
+            let n_appended = appended.len();
+            // `flush` returns the index it just built — a heap `Owned` copy of the
+            // whole volume (~1.4 GB here). The file it wrote is byte-identical, so
+            // re-map the dump instead of keeping that copy alive: the old mmap is
+            // dropped anyway, the new one costs ~1 ms, and its pages come straight
+            // from the page cache the writer just populated. Without this the
+            // monitor sits on 1.4 GB of committed private memory that nothing ever
+            // touches (measured: 1,700 MB private / 12 MB resident after one flush).
+            // On the (unlikely) reload failure keep the owned copy — correctness
+            // first, memory second.
+            let owned = flush(&mem, &removed, &appended, &dump)?;
+            // `kept` is what the loop above *intended* to write; `owned.len()` is
+            // what the builder actually produced. They diverge when the source
+            // index contains entries the arena writes cannot round-trip (an
+            // inflated or span-corrupt dump), so log both plus the pending-set
+            // sizes: a shrinking `mem` across flushes with a small `removed` is
+            // the signature of that, and it was invisible before this line.
+            let written = owned.len();
+            mem = MemIndex::load_dump(&dump).unwrap_or(owned);
             write_usn(&usn_sidecar, drive, start)?;
             removed_frns.clear();
             removed.clear();
             appended.clear();
             last_flush = std::time::Instant::now();
-            eprintln!("[monitor] flushed: {kept} entries -> {}", dump.display());
+            eprintln!(
+                "[monitor] flushed: kept={kept} written={written} \
+                 (mem={} removed={n_removed} appended={n_appended}) -> {}",
+                mem.len(),
+                dump.display()
+            );
         }
         thread::sleep(interval);
     }
