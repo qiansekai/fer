@@ -278,6 +278,14 @@ impl UsnVolume {
         let mut all = Vec::new();
         let mut current = start_usn;
         loop {
+            // Advance the read cursor before every call. `READ_USN_JOURNAL_DATA`
+            // carries StartUsn as an in/out parameter, and without re-setting it
+            // each ioctl re-reads the same window from `start_usn` — so a journal
+            // backlog larger than `buf` keeps returning a full buffer, the loop
+            // never hits its `< buf.len()` exit, and `all` grows without bound.
+            // Measured before the fix: monitor private commit 4 MB -> 5.2 GB in
+            // ~15 s (~83 MB/s) once the D: journal held more than 64 KB.
+            rjd.StartUsn = current;
             let mut returned = 0u32;
             let ok = self.ioctl(
                 FSCTL_READ_USN_JOURNAL,
