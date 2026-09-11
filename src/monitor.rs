@@ -93,6 +93,11 @@ pub fn run(
             );
         }
         let mut applied = 0usize;
+        // Create/rename events whose parent chain could not be resolved are
+        // dropped without a trace (the `resolve_path` call short-circuits the
+        // whole branch). Counting them is what makes "my new file is not
+        // searchable" distinguishable from "the event never arrived".
+        let mut resolve_fail = 0usize;
         for r in &records {
             if r.reason & (USN_REASON_FILE_DELETE | USN_REASON_RENAME_OLD_NAME) != 0 {
                 let live = if removed_frns.contains(&r.frn) {
@@ -115,30 +120,34 @@ pub fn run(
                     applied += 1;
                 }
             }
-            if r.reason & (USN_REASON_FILE_CREATE | USN_REASON_RENAME_NEW_NAME) != 0
-                && let Some(parent) = resolve_path(&mut vol, drive, r.parent_frn, &mut cache)
-            {
-                let path = if parent.is_empty() {
-                    format!("{drive}:\\{}", r.name)
-                } else {
-                    format!("{parent}\\{}", r.name)
-                };
-                // Rename-into-place / case change: retire any entry that
-                // already occupies this path.
-                if let Some(idx) = mem.find_path_idx(&path) {
-                    let old_frn = mem.meta_at(idx).frn.unwrap_or(0);
-                    removed_frns.insert(old_frn);
-                    removed.insert(idx as u32);
+            if r.reason & (USN_REASON_FILE_CREATE | USN_REASON_RENAME_NEW_NAME) != 0 {
+                match resolve_path(&mut vol, drive, r.parent_frn, &mut cache) {
+                    Some(parent) => {
+                        let path = if parent.is_empty() {
+                            format!("{drive}:\\{}", r.name)
+                        } else {
+                            format!("{parent}\\{}", r.name)
+                        };
+                        // Rename-into-place / case change: retire any entry that
+                        // already occupies this path.
+                        if let Some(idx) = mem.find_path_idx(&path) {
+                            let old_frn = mem.meta_at(idx).frn.unwrap_or(0);
+                            removed_frns.insert(old_frn);
+                            removed.insert(idx as u32);
+                        }
+                        let meta =
+                            EntryMeta { is_dir: r.is_dir, frn: Some(r.frn), ..Default::default() };
+                        if let Some(k) = appended
+                            .iter()
+                            .position(|(p, _)| p.eq_ignore_ascii_case(&path))
+                        {
+                            appended.swap_remove(k); // same path re-created this window
+                        }
+                        appended.push((path, meta));
+                        applied += 1;
+                    }
+                    None => resolve_fail += 1,
                 }
-                let meta = EntryMeta { is_dir: r.is_dir, frn: Some(r.frn), ..Default::default() };
-                if let Some(k) = appended
-                    .iter()
-                    .position(|(p, _)| p.eq_ignore_ascii_case(&path))
-                {
-                    appended.swap_remove(k); // same path re-created this window
-                }
-                appended.push((path, meta));
-                applied += 1;
             }
         }
         if next != start {
@@ -149,12 +158,13 @@ pub fn run(
         }
         if last_report.elapsed() >= Duration::from_secs(60) {
             eprintln!(
-                "[monitor] stats: mem={} appended={} removed={} frns={} cache={}",
+                "[monitor] stats: mem={} appended={} removed={} frns={} cache={} resolve_fail={}",
                 mem.len(),
                 appended.len(),
                 removed.len(),
                 removed_frns.len(),
-                cache.len()
+                cache.len(),
+                resolve_fail
             );
             last_report = std::time::Instant::now();
         }

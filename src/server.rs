@@ -310,6 +310,11 @@ async fn feed(State(st): State<AppState>) -> Json<Value> {
         Err(_) => return Json(json!({ "ok": false, "error": "overlay lock poisoned" })),
     };
     let (appended, removed) = g.pending();
+    // Sample a few pending paths. Without this the feed only exposes counts, so
+    // "the overlay holds 500 entries but my new file is not searchable" cannot be
+    // told apart from "the file never entered the overlay at all".
+    let sample_append: Vec<&str> = g.appended.values().take(4).map(|e| e.p.as_str()).collect();
+    let sample_remove: Vec<&str> = g.removed.iter().take(3).map(|s| s.as_str()).collect();
     Json(json!({
         "ok": true,
         "pending_append": appended,
@@ -318,6 +323,8 @@ async fn feed(State(st): State<AppState>) -> Json<Value> {
         "batches_applied": g.batches,
         "saturated": g.saturated,
         "last_apply_age_ms": g.last_apply.map(|t| t.elapsed().as_millis()),
+        "sample_append": sample_append,
+        "sample_remove": sample_remove,
     }))
 }
 
