@@ -45,6 +45,12 @@ enum Cmd {
         /// walk is an explicit degraded mode (no hard links/sizes/timestamps)
         #[arg(long, default_value = "auto")]
         method: String,
+        /// Allow overwriting a higher-fidelity dump with a degraded one
+        /// (e.g. --method walk over an existing MFT dump). Refused by default:
+        /// the loss (hard-link aliases, sizes, timestamps) is silent at query
+        /// time — size:/dm:/du merely start returning less.
+        #[arg(long)]
+        force_degrade: bool,
     },
     /// Instant search in the query language (see README)
     Search {
@@ -269,7 +275,7 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Index { volumes, method } => {
+        Cmd::Index { volumes, method, force_degrade } => {
             let method = Method::parse(&method)?;
             // Un-elevated? Ask the user via UAC and re-run elevated — except
             // for the explicit --method walk degraded choice, which is the
@@ -292,9 +298,41 @@ fn main() -> Result<()> {
                 std::fs::create_dir_all(parent)
                     .with_context(|| format!("creating index directory {}", parent.display()))?;
             }
+            // 不允许用更差的方法覆盖更好的 dump。查询期不会报错：size:/dm:/du 只是开始
+            // 返回更少的结果，人很难立刻察觉索引已经降级 —— 所以这里硬拦，要这么做必须
+            // 显式 --force-degrade 承担后果。（自动路径已由 indexer::ensure_elevated 挡住，
+            // 这里补的是「提权环境下显式指定降级方法」这条路径。）
+            if let Some(prev) = read_index_meta(&dump) {
+                if method_rank(&prev.method) > method_rank(effective_method(&method)) && !force_degrade {
+                    anyhow::bail!(
+                        "refusing to overwrite the existing `{}` index with a `{}` one — hard-link \
+                         aliases, sizes and timestamps would be lost (size:/dm:/du silently return \
+                         less). Pass --force-degrade to accept that, or drop --method to rebuild at \
+                         full fidelity",
+                        prev.method,
+                        method
+                    );
+                }
+            }
             let (report, mem) = indexer::build(&vols, method)?;
             let t_dump = Instant::now();
             mem.save(&dump)?;
+            // 记录索引质量：既是 fer stats 的展示来源，也是下次「拒绝降级覆盖」的判据
+            write_index_meta(
+                &dump,
+                &IndexMeta {
+                    method: report.method.clone(),
+                    volumes: vols.iter().map(|v| format!("{}:", v.drive)).collect(),
+                    files: report.files,
+                    dirs: report.dirs,
+                    skipped: report.skipped,
+                    elapsed_ms: report.elapsed_ms as u64,
+                    built_at_unix: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
+                },
+            )?;
             eprintln!(
                 "[dump] {} entries, {} MB written to {} in {} ms (peak RSS {})",
                 mem.len(),
@@ -547,6 +585,7 @@ fn main() -> Result<()> {
             let files = mem.file_count() as u64;
             let dirs = mem.dir_count() as u64;
             let dump = dump_path(&db);
+            let meta = read_index_meta(&dump);
             let dump_mb = std::fs::metadata(&dump)
                 .map(|m| m.len() / (1 << 20))
                 .unwrap_or(0);
@@ -558,6 +597,8 @@ fn main() -> Result<()> {
                     "files": files,
                     "dirs": dirs,
                     "entries": files + dirs,
+                    "index_method": meta.as_ref().map(|m| m.method.clone()),
+                    "built_at_unix": meta.as_ref().map(|m| m.built_at_unix),
                 }))?;
             } else {
                 println!("dump:    {}", dump.display());
@@ -565,6 +606,15 @@ fn main() -> Result<()> {
                 println!("dirs:    {dirs}");
                 println!("entries: {}", files + dirs);
                 println!("size:    {dump_mb} MB");
+                match &meta {
+                    Some(m) => println!(
+                        "method:  {} (built_at_unix {}, volumes {})",
+                        m.method,
+                        m.built_at_unix,
+                        m.volumes.join(",")
+                    ),
+                    None => println!("method:  unknown (no sidecar metadata)"),
+                }
             }
         }
         Cmd::Du {
@@ -694,5 +744,58 @@ fn peak_rss_bytes() -> u64 {
         pmc.PeakWorkingSetSize as u64
     } else {
         0
+    }
+}
+
+
+
+/// 索引质量元数据（sidecar：`<dump>.meta`）。
+/// 单独放一个文件而不写进 dump 头：dump 格式零改动、完全向后兼容，旧版 fer 也能读新 dump。
+#[derive(serde::Serialize, serde::Deserialize)]
+struct IndexMeta {
+    method: String,
+    volumes: Vec<String>,
+    files: u64,
+    dirs: u64,
+    skipped: u64,
+    elapsed_ms: u64,
+    built_at_unix: u64,
+}
+
+fn meta_path(dump: &Path) -> PathBuf {
+    let mut s = dump.as_os_str().to_os_string();
+    s.push(".meta");
+    PathBuf::from(s)
+}
+
+fn write_index_meta(dump: &Path, meta: &IndexMeta) -> Result<()> {
+    let path = meta_path(dump);
+    std::fs::write(&path, serde_json::to_vec_pretty(meta)?)
+        .with_context(|| format!("writing index metadata {}", path.display()))
+}
+
+fn read_index_meta(dump: &Path) -> Option<IndexMeta> {
+    serde_json::from_slice(&std::fs::read(meta_path(dump)).ok()?).ok()
+}
+
+/// 索引保真度排序：mft 最高（硬链接别名/大小/时间戳齐全），usn 次之，walk 最低（只有名字）。
+/// 未知返回 0 —— 老 dump 没有 sidecar 时不参与降级判定，保守起见不拦。
+fn method_rank(m: &str) -> u8 {
+    match m {
+        "mft" => 3,
+        "usn" => 2,
+        "walk" => 1,
+        _ => 0,
+    }
+}
+
+/// 某个 --method 选择**实际**会用的索引方法。`auto` 与 `mft` 等价（见 indexer：
+/// Auto = 纯 MFT、不回退），这个映射在降级判定里是关键 —— 否则 `fer index`（默认
+/// auto）会被误判成比已有 walk 索引"更差"而拒绝恢复（实测踩过）。
+fn effective_method(m: &Method) -> &'static str {
+    match m {
+        Method::Auto | Method::Mft => "mft",
+        Method::Usn => "usn",
+        Method::Walk => "walk",
     }
 }
