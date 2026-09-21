@@ -108,6 +108,29 @@ enum Cmd {
         /// Do not broadcast changes.
         #[arg(long)]
         no_push: bool,
+        /// Accept control commands (flush | rebuild | status) on this loopback
+        /// address, so `fer flush` / `fer rebuild` can poke this monitor
+        /// instead of waiting out --flush-secs.
+        #[arg(long, default_value = file_engine_rust::control::DEFAULT_CONTROL_ADDR)]
+        control: String,
+        /// Do not listen for control commands.
+        #[arg(long)]
+        no_control: bool,
+    },
+    /// Ask the running `fer monitor` to write its pending changes to the dump
+    /// now instead of waiting out --flush-secs
+    Flush {
+        /// Monitor control address
+        #[arg(long, default_value = file_engine_rust::control::DEFAULT_CONTROL_ADDR)]
+        addr: String,
+    },
+    /// Ask the running `fer monitor` to re-scan its volume from $MFT and rewrite
+    /// the dump now — repairs the drift that accumulates between flushes and the
+    /// gaps a recycled USN journal can no longer replay
+    Rebuild {
+        /// Monitor control address
+        #[arg(long, default_value = file_engine_rust::control::DEFAULT_CONTROL_ADDR)]
+        addr: String,
     },
     /// Index statistics
     Stats,
@@ -302,35 +325,33 @@ fn main() -> Result<()> {
             // 返回更少的结果，人很难立刻察觉索引已经降级 —— 所以这里硬拦，要这么做必须
             // 显式 --force-degrade 承担后果。（自动路径已由 indexer::ensure_elevated 挡住，
             // 这里补的是「提权环境下显式指定降级方法」这条路径。）
-            if let Some(prev) = read_index_meta(&dump) {
-                if method_rank(&prev.method) > method_rank(effective_method(&method)) && !force_degrade {
-                    anyhow::bail!(
-                        "refusing to overwrite the existing `{}` index with a `{}` one — hard-link \
-                         aliases, sizes and timestamps would be lost (size:/dm:/du silently return \
-                         less). Pass --force-degrade to accept that, or drop --method to rebuild at \
-                         full fidelity",
-                        prev.method,
-                        method
-                    );
-                }
+            if let Some(prev) = file_engine_rust::meta::read_index_meta(&dump)
+                && method_rank(&prev.method) > method_rank(effective_method(&method))
+                && !force_degrade
+            {
+                anyhow::bail!(
+                    "refusing to overwrite the existing `{}` index with a `{}` one — hard-link \
+                     aliases, sizes and timestamps would be lost (size:/dm:/du silently return \
+                     less). Pass --force-degrade to accept that, or drop --method to rebuild at \
+                     full fidelity",
+                    prev.method,
+                    method
+                );
             }
             let (report, mem) = indexer::build(&vols, method)?;
             let t_dump = Instant::now();
             mem.save(&dump)?;
             // 记录索引质量：既是 fer stats 的展示来源，也是下次「拒绝降级覆盖」的判据
-            write_index_meta(
+            file_engine_rust::meta::write_index_meta(
                 &dump,
-                &IndexMeta {
+                &file_engine_rust::meta::IndexMeta {
                     method: report.method.clone(),
                     volumes: vols.iter().map(|v| format!("{}:", v.drive)).collect(),
                     files: report.files,
                     dirs: report.dirs,
                     skipped: report.skipped,
                     elapsed_ms: report.elapsed_ms as u64,
-                    built_at_unix: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0),
+                    built_at_unix: file_engine_rust::meta::IndexMeta::now_unix(),
                 },
             )?;
             eprintln!(
@@ -451,6 +472,8 @@ fn main() -> Result<()> {
             flush_secs,
             push,
             no_push,
+            control,
+            no_control,
         } => {
             if !file_engine_rust::is_elevated() {
                 file_engine_rust::try_self_elevate()?;
@@ -464,7 +487,14 @@ fn main() -> Result<()> {
                 Duration::from_secs(interval_secs),
                 Duration::from_secs(flush_secs),
                 if no_push { None } else { Some(push) },
+                if no_control { None } else { Some(control) },
             )?;
+        }
+        Cmd::Flush { addr } => {
+            println!("{}", file_engine_rust::control::request(&addr, "flush")?);
+        }
+        Cmd::Rebuild { addr } => {
+            println!("{}", file_engine_rust::control::request(&addr, "rebuild")?);
         }
         Cmd::Image {
             volume,
@@ -585,7 +615,7 @@ fn main() -> Result<()> {
             let files = mem.file_count() as u64;
             let dirs = mem.dir_count() as u64;
             let dump = dump_path(&db);
-            let meta = read_index_meta(&dump);
+            let meta = file_engine_rust::meta::read_index_meta(&dump);
             let dump_mb = std::fs::metadata(&dump)
                 .map(|m| m.len() / (1 << 20))
                 .unwrap_or(0);
@@ -748,35 +778,6 @@ fn peak_rss_bytes() -> u64 {
 }
 
 
-
-/// 索引质量元数据（sidecar：`<dump>.meta`）。
-/// 单独放一个文件而不写进 dump 头：dump 格式零改动、完全向后兼容，旧版 fer 也能读新 dump。
-#[derive(serde::Serialize, serde::Deserialize)]
-struct IndexMeta {
-    method: String,
-    volumes: Vec<String>,
-    files: u64,
-    dirs: u64,
-    skipped: u64,
-    elapsed_ms: u64,
-    built_at_unix: u64,
-}
-
-fn meta_path(dump: &Path) -> PathBuf {
-    let mut s = dump.as_os_str().to_os_string();
-    s.push(".meta");
-    PathBuf::from(s)
-}
-
-fn write_index_meta(dump: &Path, meta: &IndexMeta) -> Result<()> {
-    let path = meta_path(dump);
-    std::fs::write(&path, serde_json::to_vec_pretty(meta)?)
-        .with_context(|| format!("writing index metadata {}", path.display()))
-}
-
-fn read_index_meta(dump: &Path) -> Option<IndexMeta> {
-    serde_json::from_slice(&std::fs::read(meta_path(dump)).ok()?).ok()
-}
 
 /// 索引保真度排序：mft 最高（硬链接别名/大小/时间戳齐全），usn 次之，walk 最低（只有名字）。
 /// 未知返回 0 —— 老 dump 没有 sidecar 时不参与降级判定，保守起见不拦。

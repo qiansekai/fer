@@ -287,6 +287,7 @@ pub async fn serve(
         .route("/api/stats", get(stats))
         .route("/api/reveal", post(reveal))
         .route("/api/rescan", post(rescan))
+        .route("/api/rebuild", post(rebuild))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     eprintln!("[server] listening on http://{addr}");
@@ -523,6 +524,24 @@ async fn rescan(State(st): State<AppState>) -> Json<Value> {
     st.cache.lock().unwrap().clear();
     match outcome {
         Ok(Ok(v)) => Json(json!({ "ok": true, "result": v })),
+        Ok(Err(e)) => Json(json!({ "ok": false, "error": format!("{e:#}") })),
+        Err(e) => Json(json!({ "ok": false, "error": e.to_string() })),
+    }
+}
+
+/// Ask the running `fer monitor` to re-scan its volume and rewrite the dump.
+///
+/// The default deployment runs `serve` unelevated — raw $MFT access needs admin,
+/// which is exactly why `/api/rescan` fails there. The monitor *is* elevated, so
+/// this forwards the request to its control channel; the dump-mtime hot reload
+/// then swaps the fresh index in without restarting anything.
+async fn rebuild() -> Json<Value> {
+    let outcome = tokio::task::spawn_blocking(|| {
+        crate::control::request(crate::control::DEFAULT_CONTROL_ADDR, "rebuild")
+    })
+    .await;
+    match outcome {
+        Ok(Ok(msg)) => Json(json!({ "ok": true, "message": msg })),
         Ok(Err(e)) => Json(json!({ "ok": false, "error": format!("{e:#}") })),
         Err(e) => Json(json!({ "ok": false, "error": e.to_string() })),
     }

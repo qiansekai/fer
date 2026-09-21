@@ -10,6 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::RecvTimeoutError;
 use std::thread;
 use std::time::Duration;
 
@@ -42,6 +43,7 @@ pub fn run(
     interval: Duration,
     flush_every: Duration,
     push_addr: Option<String>,
+    control_addr: Option<String>,
 ) -> Result<()> {
     // Hard gate: the USN journal needs an elevated token; failing 10 minutes
     // into a watch (or worse, flushing a broken index) is worse than refusing
@@ -50,6 +52,10 @@ pub fn run(
         bail!("fer monitor needs an elevated process (USN journal access)");
     }
     let feed = push_addr.as_deref().and_then(crate::push::Broadcaster::bind);
+    // Control channel: lets `fer flush` / `fer rebuild` poke this loop instead of
+    // waiting out `--flush-secs`. Optional — a monitor without it still watches
+    // the journal.
+    let control = control_addr.as_deref().and_then(crate::control::bind);
     let mut vol = UsnVolume::open(drive)?;
     let usn_sidecar = usn_sidecar_path(&dump);
     let mut start = read_usn(&usn_sidecar, drive).unwrap_or_else(|| sync_to_now(&vol));
@@ -69,6 +75,23 @@ pub fn run(
     // their sizes makes the culprit identifiable the next time it happens.
     let mut last_report = std::time::Instant::now();
     loop {
+        // Wait out the poll interval, or wake immediately for a control command:
+        // `recv_timeout` replaces the plain sleep so `fer rebuild` is served at
+        // once rather than on the next tick.
+        let mut command: Option<crate::control::Request> = match &control {
+            Some(rx) => match rx.recv_timeout(interval) {
+                Ok(req) => Some(req),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => {
+                    thread::sleep(interval);
+                    None
+                }
+            },
+            None => {
+                thread::sleep(interval);
+                None
+            }
+        };
         // A monitor that was down long enough for the journal to be recycled
         // past the saved position fails here with ERROR_JOURNAL_DELETE_IN_
         // PROGRESS (1181) — resuming from that USN is impossible. Sync to the
@@ -180,7 +203,13 @@ pub fn run(
             f.send(&build_batch(&mem, &removed, &appended));
         }
         let pending = !appended.is_empty() || !removed.is_empty();
-        let due = pending && last_flush.elapsed() >= flush_every;
+        // A `fer flush` on the control channel overrides the debounce window.
+        let force_flush = matches!(
+            command.as_ref().map(|r| r.cmd),
+            Some(crate::control::Cmd::Flush)
+        );
+        let due = pending && (last_flush.elapsed() >= flush_every || force_flush);
+        let mut flushed = false;
         if due {
             let kept = mem.len() - removed.len() + appended.len();
             let n_removed = removed.len();
@@ -214,9 +243,133 @@ pub fn run(
                 mem.len(),
                 dump.display()
             );
+            flushed = true;
         }
-        thread::sleep(interval);
+        if let Some(req) = command.take() {
+            let msg = match req.cmd {
+                crate::control::Cmd::Flush => {
+                    if flushed {
+                        format!("ok: flushed {} entries to {}", mem.len(), dump.display())
+                    } else {
+                        "ok: no pending changes (the dump already matches the journal)".to_string()
+                    }
+                }
+                crate::control::Cmd::Status => format!(
+                    "ok: mem={} appended={} removed={} retired_frns={} usn={start} \
+                     last_flush={}s ago",
+                    mem.len(),
+                    appended.len(),
+                    removed.len(),
+                    removed_frns.len(),
+                    last_flush.elapsed().as_secs()
+                ),
+                crate::control::Cmd::Rebuild => {
+                    let t0 = std::time::Instant::now();
+                    // Journal position BEFORE the scan: changes made while the
+                    // rebuild runs are replayed from here on the next iteration,
+                    // so a rebuild cannot lose them.
+                    let before = vol.query_journal().map(|(_, n)| n).unwrap_or(start);
+                    let vols = crate::indexer::resolve_volumes(&drive.to_string());
+                    let outcome = crate::indexer::build(&vols, crate::indexer::Method::Mft);
+                    match outcome {
+                        Ok((report, fresh)) => {
+                            // This monitor owns one volume; entries already
+                            // indexed on the others are carried over verbatim,
+                            // otherwise a rebuild would silently shrink the dump.
+                            let mut b = MemBuilder::default();
+                            let mut files = 0u64;
+                            let mut dirs = 0u64;
+                            for i in 0..mem.len() {
+                                if !path_on_drive(mem.path_bytes(i), drive) {
+                                    let meta = mem.meta_at(i);
+                                    if meta.is_dir {
+                                        dirs += 1;
+                                    } else {
+                                        files += 1;
+                                    }
+                                    b.push_arena(
+                                        mem.path_bytes(i),
+                                        mem.name_l_bytes(i),
+                                        mem.rev_bytes(i),
+                                        meta,
+                                    );
+                                }
+                            }
+                            for i in 0..fresh.len() {
+                                let meta = fresh.meta_at(i);
+                                if meta.is_dir {
+                                    dirs += 1;
+                                } else {
+                                    files += 1;
+                                }
+                                b.push_arena(
+                                    fresh.path_bytes(i),
+                                    fresh.name_l_bytes(i),
+                                    fresh.rev_bytes(i),
+                                    meta,
+                                );
+                            }
+                            let new = b.finish();
+                            let entries = new.len();
+                            match new.save(&dump) {
+                                Ok(()) => {
+                                    mem = MemIndex::load_dump(&dump).unwrap_or(new);
+                                    cache.clear();
+                                    removed_frns.clear();
+                                    removed.clear();
+                                    appended.clear();
+                                    start = before;
+                                    last_flush = std::time::Instant::now();
+                                    let _ = write_usn(&usn_sidecar, drive, start);
+                                    // Keep the quality sidecar honest: `fer stats`
+                                    // reports built_at_unix from it, so a rebuild that
+                                    // does not stamp it leaves a freshly rebuilt index
+                                    // looking stale. The volume list is carried over —
+                                    // this dump still covers every volume, only `drive`
+                                    // was re-scanned.
+                                    let volumes = crate::meta::read_index_meta(&dump)
+                                        .map(|m| m.volumes)
+                                        .unwrap_or_else(|| vec![format!("{drive}:")]);
+                                    let _ = crate::meta::write_index_meta(
+                                        &dump,
+                                        &crate::meta::IndexMeta {
+                                            method: "mft".to_string(),
+                                            volumes,
+                                            files,
+                                            dirs,
+                                            skipped: report.skipped,
+                                            elapsed_ms: t0.elapsed().as_millis() as u64,
+                                            built_at_unix: crate::meta::IndexMeta::now_unix(),
+                                        },
+                                    );
+                                    let msg = format!(
+                                        "ok: rebuilt {drive}: in {} ms — {entries} entries \
+                                         ({} files + {} dirs scanned) -> {}",
+                                        t0.elapsed().as_millis(),
+                                        report.files,
+                                        report.dirs,
+                                        dump.display()
+                                    );
+                                    eprintln!("[monitor] {msg}");
+                                    msg
+                                }
+                                Err(e) => format!(
+                                    "err: rebuild scanned {drive}: but writing the dump failed: {e}"
+                                ),
+                            }
+                        }
+                        Err(e) => format!("err: rebuild failed: {e}"),
+                    }
+                }
+            };
+            let _ = req.reply.send(msg);
+        }
     }
+}
+
+/// Whether an indexed path (raw arena bytes, original case) lives on `drive`.
+fn path_on_drive(path: &[u8], drive: char) -> bool {
+    path.len() >= 2 && path[1] == b':' && (path[0] as char).eq_ignore_ascii_case(&drive)
 }
 
 /// Turn the pending change set into a push batch.

@@ -10,15 +10,19 @@
 //!   multi-threaded raw reads, streaming SHA-256)
 //! * `monitor` — USN journal polling to keep the index live
 //! * `push`    — real-time change feed: monitor → serve (overlay, no dump rewrite)
+//! * `control` — loopback control channel: on-demand flush / rebuild of a running monitor
+//! * `meta`    — index-quality sidecar (`<dump>.meta`: method, volumes, built_at)
 //! * `server`  — HTTP API (axum) with a minimal web UI
 //! * `store`   — SQLite + FTS5 (feature `sqlite`, dev/test oracle only —
 //!   production queries never touch it)
 
+pub mod control;
 pub mod du;
 pub mod dupes;
 pub mod image;
 pub mod indexer;
 pub mod mem;
+pub mod meta;
 pub mod mft;
 pub mod monitor;
 pub mod push;

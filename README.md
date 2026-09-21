@@ -68,6 +68,8 @@ fer search "foo" --limit 50 --count-only     # 只看命中数
 fer serve --addr 127.0.0.1:19876   # HTTP API + 网页 UI（默认端口）
 fer upgrade                          # 格式迁移：老 dump 就地重建 trigram 段并写为最新版（免管理员）
 fer monitor --volume D               # USN 实时增量（需管理员）
+fer flush                            # 让常驻 monitor 立刻把内存索引落盘（不等 --flush-secs）
+fer rebuild                          # 让常驻 monitor 立刻重扫本卷 $MFT 并重写 dump（~5-20s）
 fer stats                            # 索引统计
 fer dupes --min-size 1kb --limit 50  # 找重复文件（同大小分组 + 内容哈希 + 字节校验）
 fer dupes --name adb.exe             # 只看文件名含 adb.exe 的重复组
