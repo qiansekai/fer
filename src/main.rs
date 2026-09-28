@@ -100,8 +100,11 @@ enum Cmd {
     /// Watch the USN journal and keep the index live (requires admin — refuses
     /// to start un-elevated)
     Monitor {
-        #[arg(long)]
-        volume: char,
+        /// Volume(s) to watch: "D", a comma-separated list ("D,H"), or the flag
+        /// repeated (--volume D --volume H). Every volume needs the elevated
+        /// process this command runs in to open its USN journal.
+        #[arg(long, value_delimiter = ',', required = true)]
+        volume: Vec<char>,
         #[arg(long, default_value_t = 5)]
         interval_secs: u64,
         /// Flush the in-memory index back to the dump at least this often
@@ -311,9 +314,24 @@ fn main() -> Result<()> {
                     method
                 );
             }
+            // Journal positions BEFORE the scan: the dump about to be written
+            // matches this point, so the sidecar can be stamped with it once the
+            // dump is safely on disk. Without the stamp the monitor's next start
+            // resumes from the previous flush position and replays up to
+            // --flush-secs of already-indexed history, re-creating long-gone
+            // creates as zero-metadata entries (measured: a 19-minute replay and
+            // 8,900 pending appends). Volumes whose journal cannot be queried are
+            // skipped (a missing line is safe, a wrong position is not).
+            let usn_before = file_engine_rust::monitor::journal_positions(
+                &vols.iter().map(|v| v.drive).collect::<Vec<_>>(),
+            );
             let (report, mem) = indexer::build(&vols, method)?;
             let t_dump = Instant::now();
             mem.save(&dump)?;
+            // Dump on disk: only now may the sidecar move forward, and only for
+            // the volumes this run actually scanned (other volumes' lines are
+            // preserved by the writer).
+            let _ = file_engine_rust::monitor::write_usn_positions(&dump, &usn_before);
             // 记录索引质量：既是 fer stats 的展示来源，也是下次「拒绝降级覆盖」的判据
             file_engine_rust::meta::write_index_meta(
                 &dump,
@@ -482,7 +500,7 @@ fn main() -> Result<()> {
             let dump = dump_path(&db);
             file_engine_rust::monitor::run(
                 mem,
-                volume.to_ascii_uppercase(),
+                volume,
                 dump,
                 Duration::from_secs(interval_secs),
                 Duration::from_secs(flush_secs),
