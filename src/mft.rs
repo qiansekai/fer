@@ -99,7 +99,11 @@ pub struct MftScanner {
 }
 
 /// Windows FILETIME (100ns since 1601) → unix seconds.
-fn filetime_to_unix(ft: u64) -> i64 {
+///
+/// `pub(crate)` so the monitor's create/rename metadata fill (which stats a
+/// path with `std::fs`, not the raw `$MFT`) converts timestamps exactly the
+/// same way instead of carrying a second copy of the epoch constant.
+pub(crate) fn filetime_to_unix(ft: u64) -> i64 {
     (ft / 10_000_000).saturating_sub(11_644_473_600) as i64
 }
 

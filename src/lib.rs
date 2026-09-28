@@ -6,8 +6,6 @@
 //! * `query`   — filter query language (`ext: size: dm: parent:` …)
 //! * `mem`     — FERIDX01 dump engine: mmap zero-copy, all queries in memory
 //! * `du`      — directory size aggregation (WizTree-style totals from the dump)
-//! * `image`   — volume → dynamic VHDX forensic image (used clusters only,
-//!   multi-threaded raw reads, streaming SHA-256)
 //! * `monitor` — USN journal polling to keep the index live
 //! * `push`    — real-time change feed: monitor → serve (overlay, no dump rewrite)
 //! * `control` — loopback control channel: on-demand flush / rebuild of a running monitor
@@ -19,7 +17,6 @@
 pub mod control;
 pub mod du;
 pub mod dupes;
-pub mod image;
 pub mod indexer;
 pub mod mem;
 pub mod meta;
@@ -28,7 +25,6 @@ pub mod monitor;
 pub mod push;
 pub mod query;
 pub mod server;
-pub mod sha256;
 #[cfg(feature = "sqlite")]
 pub mod store;
 pub mod usn;

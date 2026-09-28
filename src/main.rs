@@ -7,9 +7,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde_json::json;
 
-use file_engine_rust::image;
 use file_engine_rust::indexer::{self, Method};
-use file_engine_rust::mem::{MemIndex, dump_path};
+use file_engine_rust::mem::{MemIndex, SortKey, dump_path};
 use file_engine_rust::query::Query;
 use file_engine_rust::usn;
 
@@ -59,6 +58,14 @@ enum Cmd {
         query: String,
         #[arg(long, default_value_t = 100)]
         limit: usize,
+        /// Sort the page by name|path|size|allocated|mtime|ctime (server-side
+        /// when a serve is running, so the page holds the top N of the whole
+        /// result set rather than the first N re-sorted)
+        #[arg(long)]
+        sort: Option<String>,
+        /// Descending order; only meaningful together with --sort
+        #[arg(long)]
+        desc: bool,
         #[arg(long)]
         count_only: bool,
     },
@@ -166,54 +173,6 @@ enum Cmd {
         #[arg(long, default_value_t = 50)]
         limit: usize,
     },
-    /// Capture an NTFS volume as a dynamic VHDX forensic image (used clusters
-    /// only; multi-threaded raw reads; requires an elevated shell)
-    Image {
-        /// Drive letter of the volume to image (e.g. I)
-        #[arg(long)]
-        volume: char,
-        /// Output .vhdx path (required unless --estimate)
-        #[arg(long)]
-        output: Option<PathBuf>,
-        /// Payload block size in MiB (power of two, 1..=256; 8 measured best
-        /// for USB-attached sources: finer zero-block skipping)
-        #[arg(long, default_value_t = 8)]
-        block_size_mb: u32,
-        /// Reader threads (default: min(cpus, 4) — measured best for USB
-        /// bridges, which gain nothing beyond a few concurrent readers)
-        #[arg(long)]
-        threads: Option<usize>,
-        /// Data read path: physical (raw disk, default) or volume
-        /// (filesystem-driver path; may be faster on some USB bridges)
-        #[arg(long, value_enum, default_value_t = image::ReadMode::Physical)]
-        read_mode: image::ReadMode,
-        /// Re-read the finished image and verify the SHA-256
-        #[arg(long, conflicts_with = "no_hash")]
-        verify: bool,
-        /// Skip the streaming SHA-256 (pure copy, fastest; incompatible
-        /// with --verify)
-        #[arg(long)]
-        no_hash: bool,
-        /// Dry run: measure a short cold read sample and report the estimated
-        /// image size and duration without writing anything
-        #[arg(long)]
-        estimate: bool,
-        /// Read payload from a VSS snapshot device (e.g.
-        /// "\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy2") for a
-        /// point-in-time-consistent image; geometry and bitmap still come
-        /// from the live volume, the partition table from the physical disk
-        #[arg(long)]
-        snapshot_device: Option<String>,
-        /// Salvage mode: zero-fill unreadable sectors instead of aborting
-        /// (for damaged disks; bad ranges are reported)
-        #[arg(long)]
-        bad_sector_zero: bool,
-        /// Image the whole disk (all partitions + partition table) into one
-        /// VHDX instead of just the selected volume; unreadable partitions
-        /// are copied in full
-        #[arg(long, conflicts_with = "snapshot_device")]
-        all_partitions: bool,
-    },
 }
 
 fn default_db() -> PathBuf {
@@ -261,13 +220,27 @@ fn urlencode(s: &str) -> String {
 /// 17-336ms cold CLI query into a ~2-5ms hop. Any failure (no daemon, stale
 /// response, engine mismatch) returns None and the caller falls back to
 /// loading the dump locally — the fallback is always correct.
-fn try_remote_search(addr: &str, query: &str, limit: usize) -> Option<serde_json::Value> {
+fn try_remote_search(
+    addr: &str,
+    query: &str,
+    limit: usize,
+    sort: Option<&str>,
+    desc: bool,
+) -> Option<serde_json::Value> {
     let sock = addr.to_socket_addrs().ok()?.next()?;
     let mut stream = TcpStream::connect_timeout(&sock, Duration::from_millis(150)).ok()?;
     stream
         .set_read_timeout(Some(Duration::from_millis(2500)))
         .ok()?;
-    let path = format!("/api/search?q={}&limit={}", urlencode(query), limit);
+    // The sort key is one of a fixed set, so it needs no escaping; the daemon
+    // validates it again and answers {"ok":false} for anything it does not know.
+    let mut path = format!("/api/search?q={}&limit={}", urlencode(query), limit);
+    if let Some(key) = sort {
+        path.push_str(&format!("&sort={key}"));
+        if desc {
+            path.push_str("&desc=1");
+        }
+    }
     let req = format!(
         "GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nAccept: application/json\r\n\r\n"
     );
@@ -384,15 +357,39 @@ fn main() -> Result<()> {
         Cmd::Search {
             query,
             limit,
+            sort,
+            desc,
             count_only,
         } => {
+            // Parse before the remote hop so an unknown key is rejected here
+            // instead of being forwarded as a query the daemon must refuse.
+            let sort_key = match sort.as_deref() {
+                Some(raw) if !raw.is_empty() => match SortKey::parse(raw) {
+                    Some(k) => Some(k),
+                    None => anyhow::bail!(
+                        "unknown sort key '{raw}' - expected one of: {}",
+                        SortKey::ALL
+                            .iter()
+                            .map(|k| k.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                },
+                _ => None,
+            };
             // Fast path: a long-running `fer serve` on the default port has
             // the dump mapped and warm — forward the query instead of paying
             // process startup + mmap page-fault tax again. Only for the
             // default index base: a custom --db must never hit someone
             // else's daemon.
             if cli.db.is_none()
-                && let Some(resp) = try_remote_search("127.0.0.1:19876", &query, limit)
+                && let Some(resp) = try_remote_search(
+                    "127.0.0.1:19876",
+                    &query,
+                    limit,
+                    sort_key.map(SortKey::as_str),
+                    desc,
+                )
             {
                 if cli.json {
                     print_json(resp)?;
@@ -428,7 +425,10 @@ fn main() -> Result<()> {
             let t = Instant::now();
             let ids = mem.search(&q);
             let total = ids.len() as u64;
-            let hits = mem.hits(&ids, limit);
+            let hits = match sort_key {
+                Some(k) => mem.hits_sorted(&ids, limit, k, desc),
+                None => mem.hits(&ids, limit),
+            };
             let took = t.elapsed().as_millis();
             if cli.json {
                 print_json(json!({
@@ -495,92 +495,6 @@ fn main() -> Result<()> {
         }
         Cmd::Rebuild { addr } => {
             println!("{}", file_engine_rust::control::request(&addr, "rebuild")?);
-        }
-        Cmd::Image {
-            volume,
-            output,
-            block_size_mb,
-            threads,
-            read_mode,
-            verify,
-            no_hash,
-            estimate,
-            snapshot_device,
-            bad_sector_zero,
-            all_partitions,
-        } => {
-            if !file_engine_rust::is_elevated() {
-                file_engine_rust::try_self_elevate()?;
-            }
-            if estimate {
-                let eopts = image::EstimateOptions { volume, block_size_mb, no_hash, read_mode };
-                let est = image::estimate(&eopts)?;
-                if cli.json {
-                    print_json(json!({ "ok": true, "estimate": est }))?;
-                } else {
-                    println!(
-                        "volume {}: estimate\n  volume {} (used {}, {:.1}%)\n  image  {} ({} of {} blocks stored)\n  read   {:.0} MB/s (cold sample)\n  ETA    {:.0}s total (read {:.0}s{})\n  note   sample is pure-read; a busy system volume can be 2-3x slower (measured C: 159s vs 67s)",
-                        est.volume,
-                        fmt_bytes(est.volume_bytes),
-                        fmt_bytes(est.used_bytes),
-                        est.used_bytes as f64 / est.volume_bytes.max(1) as f64 * 100.0,
-                        fmt_bytes(est.image_bytes),
-                        est.blocks_stored,
-                        est.blocks_total,
-                        est.read_mbps,
-                        est.est_total_seconds,
-                        est.est_read_seconds,
-                        if est.est_hash_seconds > 0.0 {
-                            format!(", hash {:.0}s", est.est_hash_seconds)
-                        } else {
-                            String::new()
-                        },
-                    );
-                }
-                return Ok(());
-            }
-            let output = output
-                .as_deref()
-                .context("--output is required unless --estimate is given")?;
-            let opts = image::ImageOptions {
-                volume,
-                output,
-                block_size_mb,
-                threads,
-                verify,
-                read_mode,
-                no_hash,
-                snapshot_device: snapshot_device.as_deref(),
-                bad_sector_zero,
-                all_partitions,
-            };
-            let report = image::run(&opts)?;
-            if cli.json {
-                print_json(json!({ "ok": true, "report": report }))?;
-            } else {
-                println!(
-                    "volume {}: -> {}\n  volume {} (used {}, {:.1}%)\n  image  {} ({} blocks)\n  sha256 {}\n  elapsed {:.1}s{}{}",
-                    report.volume,
-                    report.output,
-                    fmt_bytes(report.volume_bytes),
-                    fmt_bytes(report.used_bytes),
-                    report.used_percent,
-                    fmt_bytes(report.image_bytes),
-                    report.blocks,
-                    report.sha256,
-                    report.elapsed_ms as f64 / 1000.0,
-                    if report.verified { ", verified" } else { "" },
-                    if report.bad_sector_bytes > 0 {
-                        format!(
-                            ", {} bad sector bytes zero-filled ({} ranges)",
-                            report.bad_sector_bytes,
-                            report.bad_sectors.len()
-                        )
-                    } else {
-                        String::new()
-                    },
-                );
-            }
         }
         Cmd::Upgrade => {
             let dump = dump_path(&db);

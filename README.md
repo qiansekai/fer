@@ -65,6 +65,8 @@ fer search "AGENTS.md"               # 秒搜（子串）
 fer search "*.rs"                    # 通配符
 fer search "ext:mp4 size:>1gb dm:thisweek"   # 过滤查询语言
 fer search "foo" --limit 50 --count-only     # 只看命中数
+fer search "size:>1gb" --sort size --desc --limit 10   # 服务端排序：全库最大的 10 个文件
+fer search "ext:log dm:today" --sort mtime --desc      # 最新的日志排在最前
 fer serve --addr 127.0.0.1:19876   # HTTP API + 网页 UI（默认端口）
 fer upgrade                          # 格式迁移：老 dump 就地重建 trigram 段并写为最新版（免管理员）
 fer monitor --volume D               # USN 实时增量（需管理员）
@@ -75,45 +77,8 @@ fer dupes --min-size 1kb --limit 50  # 找重复文件（同大小分组 + 内�
 fer dupes --name adb.exe             # 只看文件名含 adb.exe 的重复组
 fer du "D:\proj" --top 20            # 磁盘占用聚合（WizTree 式 du，见下节）
 fer du "D:\" --depth 1 --top 10 --json  # 整卷顶层占用，JSON 输出
-fer image --volume I --output disk.vhdx --verify   # 卷 → 动态 VHDX 取证镜像（已用簇，多线程，SHA-256）
-fer image --volume I --output disk.vhdx --threads 8 --block-size-mb 32  # 控制并行度与块大小
-fer image --volume I --estimate                     # 干跑预估：镜像大小 + ETA（冷样本实测吞吐，误差 <7%）
-fer image --volume I --output disk.vhdx --no-hash   # 纯拷贝（跳过 SHA-256，最快）
-fer image --volume I --output disk.vhdx --all-partitions  # 整盘：所有分区 + 分区表进一个 VHDX
-fer image --volume I --output disk.vhdx --bad-sector-zero # 抢救模式：坏扇区填零继续
 fer --db <path> <cmd>                # 自定义索引库（默认 %LOCALAPPDATA%\file-engine-rust\index.db）
 ```
-
-## fer image — 卷 → 动态 VHDX 取证镜像
-
-把 NTFS 卷做成**动态 VHDX**（Windows 磁盘管理可直接挂载），只拷贝已用簇：
-
-- `IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS` 定位卷在物理盘上的偏移 → `FSCTL_GET_VOLUME_BITMAP` 直接拿 NTFS 已用簇位图（零 NTFS 结构解析）→ 多线程从 `\\.\PhysicalDriveN` 只读已用扇区
-- 全零块跳过（BAT 保持 NOT_PRESENT），镜像体积 ≈ 已用空间；未用扇区按零参与 SHA-256，**卷哈希与全盘 dd 的修剪卷哈希一致**
-- `--all-partitions` 整盘镜像：`IOCTL_DISK_GET_DRIVE_LAYOUT_EX` 枚举分区，每个 NTFS 分区拿自己的位图，ESP/恢复分区等无位图分区全量拷贝，虚拟大小 = 整盘 → 挂载后所有分区都在（实测 8GB 三分区盘：3 个分区卷标/文件数全部一致）
-- `--bad-sector-zero` 抢救模式：读失败时逐扇区重试、坏扇区填零继续（学 Disk2vhd 的 ERROR_CRC 处理），坏块位置进报告；不加则直接报错退出
-- `--verify` 完成后重开镜像、走 BAT 重读 payload 块比对哈希；`--no-hash` 跳过流式
-  SHA-256（纯拷贝模式，最快）
-- `--estimate` 干跑预估：位图精确算出存储块数（镜像大小误差 <0.1%）+ 跨 range 冷样本
-  实测读吞吐 → ETA（实测误差 <7%），不写任何文件
-- `--snapshot-device <path>` 从 VSS 快照读 payload（时间点一致的系统盘镜像）：几何与
-  位图仍取自活卷、分区表取自物理盘。快照设备本身不支持 extents/bitmap 查询（实测
-  err 1/234），所以几何必须来自活卷：
-  ```powershell
-  $id  = (Invoke-CimMethod Win32_ShadowCopy -MethodName Create -Arguments @{Volume='C:\'}).ShadowID
-  $dev = (vssadmin list shadows /for=C: | Select-String 'Shadow Copy Volume:').ToString().Split(':')[-1].Trim()
-  fer image --volume C --snapshot-device $dev --output C-consistent.vhdx --no-hash
-  vssadmin delete shadows /shadow=$id /quiet
-  ```
-  实测（C: 128 GB / 已用 115 GB）：181.9 s / 124.52 GB，挂载后 GPT + 根目录 23 条目
-  与源卷一致
-- 读路径 `--read-mode physical|volume`（默认 physical 从裸盘读；volume 走文件系统
-  驱动路径，个别 USB 桥更快）；镜像在线卷前先 `FlushFileBuffers` 刷卷缓存，保证
-  「刚写入的文件」也在镜像里（位图是缓存视角、payload 读裸盘，不刷会漏）
-- 实测（USB 盘 238.5 GB / 已用 47.7 GB，2026-09-08）：`--no-hash` 161.5 s
-  （约 300 MB/s，与 Disk2vhd 同速）；默认带 SHA-256 249.4 s
-- 需要管理员（物理盘直读），非提权自动弹 UAC 请求提权
-- 限制：单 extent 卷（不支持跨区/带区卷）；NTFS only；扇区位图块不生成（块内全扇区有效语义）
 
 ## 查询语言（CLI 与 HTTP 共用）
 
@@ -171,7 +136,11 @@ fer du <root> [--depth N] [--top N] [--allocated] [--json]
 
 ```
 GET /api/health                     → {"ok":true}
-GET /api/search?q=<query>&limit=<n> → 命中列表（带 size/mtime/ctime/flags）
+GET /api/search?q=<query>&limit=<n>&sort=<key>&desc=<0|1> → 命中列表（带 size/mtime/ctime/flags/allocated）
+                                      sort ∈ name|path|size|allocated|mtime|ctime；缺省 = 引擎索引序（响应与旧版逐字段一致）
+                                      desc 接受 1/true/yes/on 与 0/false/no/off，缺省升序；排序键非法 → ok:false
+                                      排序在服务端做，页里是**整个结果集的 top N**，不是「先取 N 条再排序」
+                                      total = 不设 limit 时实际会返回的命中数（已扣除实时 overlay 里的删除）
 GET /api/du?path=<p>&depth=<n>&top=<n>&allocated=<bool> → 目录占用聚合（WizTree 式，字段同 `fer du --json`）
 GET /api/stats                      → 索引统计 + 卷列表
 POST /api/rescan                    → 后台全量重建

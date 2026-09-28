@@ -331,6 +331,83 @@ impl std::ops::Deref for MemIndex {
     }
 }
 
+/// Sort key for [`MemIndex::hits_sorted`] and the `/api/search?...&sort=`
+/// knob. The variants mirror the [`Hit`] fields one-to-one, so a caller names
+/// the field it wants to order by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortKey {
+    Name,
+    Path,
+    Size,
+    Allocated,
+    Mtime,
+    Ctime,
+}
+
+impl SortKey {
+    /// Canonical wire spellings, in documentation order.
+    pub const ALL: [SortKey; 6] = [
+        SortKey::Name,
+        SortKey::Path,
+        SortKey::Size,
+        SortKey::Allocated,
+        SortKey::Mtime,
+        SortKey::Ctime,
+    ];
+
+    /// Parse a wire spelling (ASCII case-insensitive). `None` for anything
+    /// unknown — the caller decides whether that is a hard error.
+    pub fn parse(s: &str) -> Option<SortKey> {
+        match s.to_ascii_lowercase().as_str() {
+            "name" => Some(SortKey::Name),
+            "path" => Some(SortKey::Path),
+            "size" => Some(SortKey::Size),
+            "allocated" => Some(SortKey::Allocated),
+            "mtime" => Some(SortKey::Mtime),
+            "ctime" => Some(SortKey::Ctime),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SortKey::Name => "name",
+            SortKey::Path => "path",
+            SortKey::Size => "size",
+            SortKey::Allocated => "allocated",
+            SortKey::Mtime => "mtime",
+            SortKey::Ctime => "ctime",
+        }
+    }
+
+    /// Order two [`Hit`]s by this key; `desc` reverses the key **only**, so
+    /// the tie-break stays ascending in both directions.
+    ///
+    /// The tie-break is the raw path bytes — a total order over distinct
+    /// paths. That matters beyond tidiness: the overlay merge in
+    /// `server.rs` picks a top-N from the delta and dump sides separately and
+    /// then re-sorts the pool, and that is only the union's true top-N if both
+    /// sides share one total order. [`MemIndex::cmp_entries`] is the
+    /// entry-side twin of this function; the two must stay in lockstep.
+    pub fn cmp_hits(self, a: &Hit, b: &Hit, desc: bool) -> Ordering {
+        let mut c = match self {
+            SortKey::Name => ci_cmp(
+                basename_bytes(a.path.as_bytes()),
+                basename_bytes(b.path.as_bytes()),
+            ),
+            SortKey::Path => ci_cmp(a.path.as_bytes(), b.path.as_bytes()),
+            SortKey::Size => a.size.cmp(&b.size),
+            SortKey::Allocated => a.allocated.cmp(&b.allocated),
+            SortKey::Mtime => a.mtime.cmp(&b.mtime),
+            SortKey::Ctime => a.ctime.cmp(&b.ctime),
+        };
+        if desc {
+            c = c.reverse();
+        }
+        c.then_with(|| a.path.as_bytes().cmp(b.path.as_bytes()))
+    }
+}
+
 impl MemIndex {
     #[cfg(feature = "sqlite")]
     pub fn load(conn: &Connection) -> Result<Self> {
@@ -775,6 +852,29 @@ impl MemIndex {
             .filter(|&i| self.entries[i as usize].frn == frn)
     }
 
+    /// Every entry index sharing `frn`, in ascending id order (the `by_frn`
+    /// permutation is sorted by `(frn, id)`, so the range is already ordered).
+    ///
+    /// One FILE record carries one `$FILE_NAME` per hard link, i.e. several
+    /// entries can share an FRN. `find_frn` returns only the first, so a delete
+    /// that uses it leaves every other alias behind as a permanent ghost:
+    /// measured with two hard links to one record, both deleted — the second
+    /// stayed searchable 30 s later and was written into the next dump (the
+    /// "still indexed 5 minutes after deleting" defect). The monitor uses this
+    /// to retire the whole record.
+    pub fn find_frn_all(&self, frn: u64) -> Vec<u32> {
+        if frn == 0 {
+            return Vec::new();
+        }
+        let lo = self
+            .by_frn
+            .partition_point(|&i| self.entries[i as usize].frn < frn);
+        let hi = self
+            .by_frn
+            .partition_point(|&i| self.entries[i as usize].frn <= frn);
+        self.by_frn.slice()[lo..hi].to_vec()
+    }
+
     /// Exact (ASCII-CI) path lookup — the monitor dedupes create/rename events
     /// against existing entries via the CI-sorted path permutation.
     pub fn find_path_idx(&self, path: &str) -> Option<usize> {
@@ -874,7 +974,7 @@ impl MemIndex {
         // small as possible and galloping intersect turns each step into
         // O(|small| log |large|) instead of O(|small| + |large|). All term
         // results are already materialized, so this sort is free.
-        let n = self.entries.len() as u32;
+        let n = self.id_cap();
         let mut include = evals(&q.include);
         include.sort_by_key(IdSet::cardinality);
         let mut acc: Option<IdSet<'_>> = None;
@@ -938,6 +1038,102 @@ impl MemIndex {
             }
         }
         out
+    }
+
+    /// Entry index of an id: direct for dense dumps (id == index), a binary
+    /// search for the SQL-loaded oracle. `None` when the index does not know
+    /// the id (impossible for ids produced by [`MemIndex::search`]; the oracle
+    /// path carries rowid gaps).
+    fn idx_of(&self, id: u32) -> Option<usize> {
+        if self.dense {
+            let i = id as usize;
+            (i < self.entries.len()).then_some(i)
+        } else {
+            self.entries.binary_search_by_key(&id, |e| e.id).ok()
+        }
+    }
+
+    /// Allocated bytes of entry `i`, with the same pre-v6 fallback
+    /// [`MemIndex::hits`] reports (logical size).
+    fn alloc_at(&self, i: usize) -> u64 {
+        self.alloc.map(|a| a[i]).unwrap_or(self.entries[i].size)
+    }
+
+    /// Entry-side twin of [`SortKey::cmp_hits`]: identical key, identical
+    /// ascending raw-path tie-break. Keep the two in lockstep — the overlay
+    /// merge relies on both sides agreeing on one total order.
+    fn cmp_entries(&self, a: usize, b: usize, sort: SortKey, desc: bool) -> Ordering {
+        let (ea, eb) = (&self.entries[a], &self.entries[b]);
+        let (pa, pb) = (
+            path_of(&self.entries, &self.paths, a as u32),
+            path_of(&self.entries, &self.paths, b as u32),
+        );
+        let mut c = match sort {
+            SortKey::Name => ci_cmp(basename_bytes(pa), basename_bytes(pb)),
+            // ASCII-CI, matching the `by_path` permutation's order; the raw
+            // path tie-break below keeps the order total.
+            SortKey::Path => ci_cmp(pa, pb),
+            SortKey::Size => ea.size.cmp(&eb.size),
+            SortKey::Allocated => self.alloc_at(a).cmp(&self.alloc_at(b)),
+            SortKey::Mtime => ea.mtime.cmp(&eb.mtime),
+            SortKey::Ctime => ea.ctime.cmp(&eb.ctime),
+        };
+        if desc {
+            c = c.reverse();
+        }
+        c.then_with(|| pa.cmp(pb))
+    }
+
+    /// Top-`limit` hits of `ids` in the requested order.
+    ///
+    /// `select_nth_unstable_by` picks the N winners in O(n) and only those N
+    /// entries are ordered and turned into strings — a query that matches
+    /// millions of ids and asks for 100 hits never materializes a path for the
+    /// millions. The result is a true top-N under the total order of
+    /// [`SortKey::cmp_hits`], independent of the input order of `ids`.
+    pub fn hits_sorted(&self, ids: &[u32], limit: usize, sort: SortKey, desc: bool) -> Vec<Hit> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        // Drop ids this index cannot resolve, so the comparator below never
+        // needs a fallback index.
+        let mut buf: Vec<u32> = Vec::with_capacity(ids.len());
+        for &id in ids {
+            if self.idx_of(id).is_some() {
+                buf.push(id);
+            }
+        }
+        if buf.is_empty() {
+            return Vec::new();
+        }
+        let cmp = |a: u32, b: u32| -> Ordering {
+            // Both ids resolved during the filter pass above.
+            let (ia, ib) = (self.idx_of(a).unwrap_or(0), self.idx_of(b).unwrap_or(0));
+            self.cmp_entries(ia, ib, sort, desc)
+        };
+        if buf.len() > limit {
+            buf.select_nth_unstable_by(limit - 1, |a, b| cmp(*a, *b));
+            buf.truncate(limit);
+        }
+        buf.sort_unstable_by(|a, b| cmp(*a, *b));
+        // Materialize in the sorted order (hits() preserves input order).
+        self.hits(&buf, limit)
+    }
+
+    /// Exclusive upper bound of an entry id in this index.
+    ///
+    /// Dense dumps and in-memory builds have `id == index`, so the entry count
+    /// is the bound. The SQL oracle loads 1-based rowids with gaps, where the
+    /// count is *not* a bound: sizing a bitmap by it silently drops the highest
+    /// id from every bitmap-based evaluation (the no-include start set,
+    /// `!flag:` complements, big sorted×sorted intersections), which is exactly
+    /// what `consistency_with_sql` caught for `!hidden:true`.
+    fn id_cap(&self) -> u32 {
+        if self.dense {
+            self.entries.len() as u32
+        } else {
+            self.entries.last().map_or(0, |e| e.id + 1)
+        }
     }
 
     fn all_ids(&self) -> Vec<u32> {
@@ -1036,7 +1232,7 @@ impl MemIndex {
                     // Complement of a (small) flag list: a full bitmap minus
                     // the flagged ids — ~0.5ms instead of materializing a
                     // 4M-entry complement Vec.
-                    let mut bits = Bitset::full(self.entries.len() as u32);
+                    let mut bits = Bitset::full(self.id_cap());
                     bits.clear_ids(list.slice());
                     IdSet::Bits(bits)
                 }
@@ -1722,6 +1918,16 @@ fn rev_of<'a>(entries: &'a [Entry], revs: &'a [u8], i: u32) -> &'a [u8] {
 fn path_of<'a>(entries: &'a [Entry], paths: &'a [u8], i: u32) -> &'a [u8] {
     let e = &entries[i as usize];
     &paths[e.path_off as usize..e.path_off as usize + e.path_len as usize]
+}
+
+/// Bytes after the last separator of an arena path. The sort keys need the
+/// basename without building a `String` (the CLI/server variants of this
+/// helper work on `str`; this one is allocation-free on raw arena bytes).
+fn basename_bytes(p: &[u8]) -> &[u8] {
+    match p.iter().rposition(|&b| b == b'\\' || b == b'/') {
+        Some(i) => &p[i + 1..],
+        None => p,
+    }
 }
 
 #[inline]
@@ -2687,6 +2893,27 @@ mod tests {
         assert_eq!(mem.path_at(idx as usize), r"D:\proj\src\main.rs");
         assert!(mem.find_frn(43).is_none());
         assert!(mem.find_frn(0).is_none()); // 0 = "no FRN"
+    }
+
+    #[test]
+    fn find_frn_all_returns_every_alias() {
+        // Hard links: one FILE record, several $FILE_NAME aliases. A delete has
+        // to retire the record as a whole, which needs every alias — find_frn
+        // alone only ever sees the first one.
+        let mut b = MemBuilder::default();
+        let alias = |size: u64, frn: Option<u64>| EntryMeta { size, frn, ..Default::default() };
+        b.push(r"D:\links\h1.bin", alias(7, Some(70)));
+        b.push(r"D:\links\h2.bin", alias(7, Some(70)));
+        b.push(r"D:\links\h3.bin", alias(7, Some(70)));
+        b.push(r"D:\links\solo.bin", alias(8, Some(71)));
+        b.push(r"D:\links\nofrn.bin", alias(9, None));
+        let mem = b.finish();
+        assert_eq!(mem.find_frn_all(70), vec![0, 1, 2]); // ascending id
+        assert_eq!(mem.find_frn_all(71), vec![3]);
+        assert!(mem.find_frn_all(72).is_empty());
+        assert!(mem.find_frn_all(0).is_empty()); // 0 = "no FRN"
+        // the single-hit lookup keeps its old contract
+        assert_eq!(mem.find_frn(70), Some(0));
     }
 
     #[test]
