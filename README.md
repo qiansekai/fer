@@ -42,7 +42,14 @@
 
 仅支持 Windows（依赖 NTFS `$MFT` / USN 原生 API）。
 
+网页 UI（`webui/dist/index.html`）是构建产物、不入库，**首次构建要先编一次前端**
+（需 Node.js）——`build.rs` 在它缺失时会 panic 并打印同样的命令：
+
 ```bash
+cd webui
+npm install
+npm run build                       # vite-plugin-singlefile → 单文件 dist/index.html（供 include_str! 嵌入）
+cd ..
 cargo build --release               # 产物 target-gnu/release/fer.exe（独立 exe，无运行时依赖）
 cargo build --profile min-size      # 精简编译（opt-level="z"；默认构建不编译 SQLite）
 ```
@@ -70,6 +77,7 @@ fer search "ext:log dm:today" --sort mtime --desc      # 最新的日志排在�
 fer serve --addr 127.0.0.1:19876   # HTTP API + 网页 UI（默认端口）
 fer upgrade                          # 格式迁移：老 dump 就地重建 trigram 段并写为最新版（免管理员）
 fer monitor --volume D               # USN 实时增量（需管理员）
+fer monitor --volume D,H             # 多卷监视（逗号列表或重复传参；每卷独立 journal）
 fer flush                            # 让常驻 monitor 立刻把内存索引落盘（不等 --flush-secs）
 fer rebuild                          # 让常驻 monitor 立刻重扫本卷 $MFT 并重写 dump（~5-20s）
 fer stats                            # 索引统计
@@ -329,8 +337,18 @@ serve 稳态（引擎侧 took_ms，预热线程 + TTL 缓存）：`ext:rs` 0ms�
 - **转发结果与本地加载逐条一致**：`--db` 强制绕过转发对照三组查询，total 完全相同
 - 索引重建不中断查询：`fer index` 原子替换 dump，serve 的 mtime 轮询 2 s 内热重载
   新引擎（实测日志 `dump changed on disk — reloaded 4577969 entries`），无需重启
-- 测试/静态检查：`cargo test` 57 passed / 0 failed（+3 ignored 需管理员），
+- 测试/静态检查：`cargo test` 132 passed / 0 failed（+3 ignored 需管理员；
+  `--features sqlite` 追加 SQL 交叉验证后 144 passed / 0 failed），
   `cargo clippy --all-targets -- -D warnings` 0 警告
+
+### 2026-09-29 索引质量大修后复测（本机 6 卷 · 4,223,028 条 · dump v6）
+
+- `fer index` 全 6 卷：3,697,813 文件 + 525,215 目录 → **4,223,028 条 / dump 1462 MB / 19 s**
+- 新建目录内的文件 **0.8-1 s** 以真实完整路径可见，且 size/mtime/allocated 与磁盘一致
+  （改前：挂到不存在的假父路径 + 零元数据）；H: 卷新文件 4.3 s 可见（改前要等全量 `fer index`）
+- `fer rebuild` 单卷重扫重建 17.5 s；重建后整卷 `du --allocated` 与
+  `fsutil volume allocationreport` 差 **0.08%**
+- `fer search --sort <key>` 为服务端 top-N（`select_nth_unstable_by`，不物化全量结果集）
 
 ## 已知限制 / TODO
 
@@ -354,7 +372,14 @@ serve 稳态（引擎侧 took_ms，预热线程 + TTL 缓存）：`ext:rs` 0ms�
 - 8.3 短名（namespace=2）不入索引（避免噪音）；分片 `$MFT` 不支持 attribute-list 布局
   （报错退出，可用 `--method usn|walk` 显式降级，会丢失硬链接别名与大小/时间元数据）
 - FAT/exFAT 卷不支持（监控需 ReadDirectoryChangesW，列为 TODO）
-- 多卷监控需逐个 `fer monitor`；USN 日志回卷会报错提示重建
+- 多卷监控：`fer monitor --volume D,H`（逗号列表或重复传参），每卷独立 journal 与位置边车；
+  单卷打不开只记日志并每 60 s 重试。USN 日志回卷会报错并提示重建（期间的变更靠
+  `fer index` 补；重启后从边车位置重放，边车不领先 dump 是刻意取舍）
+- 原地写大不更新 size：USN mask 未含 `DATA_OVERWRITE`/`DATA_EXTEND`，文件被写大后
+  `size:` 过滤与 du 要等下次 flush（≤`--flush-secs`）或 `fer rebuild` 才反映
+- 变更推送带自适应节流（单批 >2000 条或距上次 >30 s 时合并发送）：磁盘并发写入量大时
+  overlay 最迟约 30 s 刷新一次（小 pending 时 <15 s）
+- `desc` 只认小写字面量（`desc=TRUE` 报 `ok:false`；`sort` 键本身大小写不敏感）
 - release 构建开 `target-cpu=native`（本机专用，exe 不可分发）
 
 ## 与上游对照
