@@ -30,9 +30,9 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_SYSTEM, GetCompressedFileSizeW,
 };
 use windows_sys::Win32::System::Ioctl::{
-    USN_REASON_DATA_EXTEND, USN_REASON_DATA_OVERWRITE, USN_REASON_DATA_TRUNCATION,
-    USN_REASON_FILE_CREATE, USN_REASON_FILE_DELETE, USN_REASON_HARD_LINK_CHANGE,
-    USN_REASON_RENAME_NEW_NAME, USN_REASON_RENAME_OLD_NAME,
+    USN_REASON_BASIC_INFO_CHANGE, USN_REASON_DATA_EXTEND, USN_REASON_DATA_OVERWRITE,
+    USN_REASON_DATA_TRUNCATION, USN_REASON_FILE_CREATE, USN_REASON_FILE_DELETE,
+    USN_REASON_HARD_LINK_CHANGE, USN_REASON_RENAME_NEW_NAME, USN_REASON_RENAME_OLD_NAME,
 };
 
 use serde::{Deserialize, Serialize};
@@ -56,18 +56,25 @@ const MASK: u32 = USN_REASON_FILE_CREATE
     | USN_REASON_HARD_LINK_CHANGE
     | REFRESH_REASON;
 
-/// Reason bits that mean "this file's contents changed", so the size and mtime
-/// the index holds are stale.
+/// Reason bits that mean "the metadata this index holds is stale", so the entry
+/// has to be re-stat'ed: contents written (size/mtime) or attributes set
+/// (hidden/system/readonly and, through SetFileTime, mtime alone).
 ///
-/// These used to be left out of the mask on purpose (every write event is a
-/// stat), and the cost was that a file written larger kept its old size until
-/// the next flush — up to `--flush-secs` (1800 s here) or a `fer rebuild`.
-/// `size:` filters, `du` and the Web UI all reported the stale value in the
-/// meantime. The stat is now paid, but at most once per FRN per round (see
-/// `Pending::refreshed`), which bounds the cost to "files actually written
-/// this round" rather than "write system calls this round".
-const REFRESH_REASON: u32 =
-    USN_REASON_DATA_OVERWRITE | USN_REASON_DATA_EXTEND | USN_REASON_DATA_TRUNCATION;
+/// These used to be deliberately absent from the mask — every such event costs a
+/// stat — and the price was staleness: a file written larger kept its old size,
+/// a file marked hidden kept `flags = 0` (measured: `hidden:true` still missed it
+/// 12 s after `attrib +h`), and a bare timestamp touch kept its old mtime, all
+/// until the next flush — up to `--flush-secs` (1800 s here) or a `fer rebuild`.
+/// `size:` / `dm:` / `hidden:` filters, `du` and the Web UI reported the stale
+/// value in the meantime.
+///
+/// The stat is now paid, but at most once per FRN per round (see
+/// `Pending::refreshed`), which bounds the cost to "files actually written or
+/// re-attributed this round" rather than "every write system call".
+const REFRESH_REASON: u32 = USN_REASON_DATA_OVERWRITE
+    | USN_REASON_DATA_EXTEND
+    | USN_REASON_DATA_TRUNCATION
+    | USN_REASON_BASIC_INFO_CHANGE;
 
 /// How far the journal may sit ahead of the applied position before the round
 /// stops sleeping out `interval` and starts replaying back to back. Below it
@@ -2266,6 +2273,41 @@ mod tests {
         assert_eq!(stats.applied, 0);
         assert!(pending.appended.is_empty());
         assert!(pending.removed.is_empty());
+    }
+
+    /// A BASIC_INFO_CHANGE (attrib +h, a bare SetFileTime touch) must refresh
+    /// the entry too: before this the hidden/system/readonly bits and mtime in
+    /// the index stayed at their creation-time values until the next flush —
+    /// measured as "hidden:true still missed a file 12 s after attrib +h".
+    #[test]
+    fn basic_info_change_refreshes_flags_and_time() {
+        let mem = hard_link_index();
+        let mut pending = Pending::default();
+        let mut kernel = resolve_links;
+        let mut stat = |_p: &str, _d: bool, frn: u64| {
+            Ok(StatMeta {
+                meta: EntryMeta {
+                    size: 9,
+                    mtime: 1_700_000_999,
+                    flags: EntryMeta::FLAG_HIDDEN,
+                    frn: Some(frn),
+                    ..Default::default()
+                },
+                alloc_failed: false,
+            })
+        };
+        let stats = apply_records(
+            &mem,
+            'D',
+            &[rec(71, "other.bin", USN_REASON_BASIC_INFO_CHANGE, false)],
+            &mut pending,
+            &mut kernel,
+            &mut stat,
+        );
+        assert_eq!(stats.applied, 1);
+        assert_eq!(pending.appended.len(), 1);
+        assert_eq!(pending.appended[0].1.flags, EntryMeta::FLAG_HIDDEN);
+        assert_eq!(pending.appended[0].1.mtime, 1_700_000_999);
     }
 
     // -- journal replay health (startup self-heal) --------------------------

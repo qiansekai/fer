@@ -26,9 +26,9 @@
   启动后台预热线程（首查不付 mmap 缺页税）与 **dump 热重载**——`fer monitor` /
   `fer index` 重写 dump 后 2 秒内自动换引擎，常驻进程无需重启
 - **过滤查询语言**：`ext: size: dm: dc: type: hidden: parent: path: name:` + 取反（`!`）
-- **实时监控**：`fer monitor` 轮询 USN 日志增量更新（删除按 FRN 直删，内容写大即时刷新
-  元数据）；变更经推送 overlay **秒级**出现在 CLI 与网页；停机重启自动从 pending 快照续跑，
-  不必手工 `fer index`
+- **实时监控**：`fer monitor` 轮询 USN 日志增量更新（删除按 FRN 直删；内容写大、属性变更
+  `attrib +h`、`SetFileTime` touch 都在一个轮询周期内刷新元数据）；变更经推送 overlay
+  **实测 1-5 秒**出现在 CLI 与网页；停机重启自动从 pending 快照续跑，不必手工 `fer index`
 - **HTTP API + 网页 UI** + **CLI --json**（稳定 JSON 输出，面向 agent）
 - **Everything 架构**：`fer index` 一次性把全盘扫进内存引擎并写成
   **FERIDX01 dump**（~1.2GB）；查询全靠内存的排序数组 + **整 arena 单遍 SIMD 扫描**
@@ -366,6 +366,11 @@ serve 稳态（引擎侧 took_ms，预热线程 + TTL 缓存）：`ext:rs` 0ms�
   v6 新增 per-entry allocated 段（磁盘占用口径）；v5- 老 dump 加载时
   `allocated` 回退为逻辑大小，真实簇数需 `fer index` 重扫 $MFT
 - trigram 段只覆盖文件名（≥3 字节子串）；路径子串与 <3 字节子串走 arena 扫描
+- **实时更新的范围**（三条必须同时成立）：① 卷在 `monitor --volume` 列表里（本机 `D,H`；
+  C/E/F/G 的变更要等 `fer index` / `fer rebuild`）② 查询走 serve —— 变更先进 serve 的 overlay，
+  `fer search`（默认自动转发）与网页秒级可见，而**直读 dump 的路径**（`--db`、serve 未运行）
+  看不到未落盘的部分（dump 仍是每 `--flush-secs` 重写一次，`fer flush` 可立刻落盘）
+  ③ 变更属于创建/删除/重命名/硬链接增删/内容写/属性设置；安全描述符与 EA 变更不在 mask 内
 - 内存引擎的路径排序只折叠 ASCII 大小写（非 ASCII 大小写字母如 É/Ö 按字节比较）
   ——Windows 路径中极少见
 - 8.3 短名（namespace=2）不入索引（避免噪音）；分片 `$MFT` 不支持 attribute-list 布局
