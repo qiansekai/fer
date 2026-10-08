@@ -15,6 +15,8 @@
 //! path:D:\proj\src    full-path prefix match
 //! name:pattern        explicit basename match (substring or wildcard)
 //! regex:^foo.*bar$    regex against the basename (case-insensitive)
+//! skip:.git,node_modules   drop any path having that WHOLE component
+//!                     (always an exclusion, with or without a leading '!')
 //! !term               negate a term
 //! ```
 //!
@@ -60,6 +62,11 @@ pub enum Term {
     Flag { bit: u8, on: bool },
     /// `parent:` / `path:` prefix on the full path (lowercased).
     PathPrefix(String),
+    /// `skip:node_modules,.git` — matches entries whose path contains any of
+    /// these strings as a **whole path component** (`\node_modules\`), so
+    /// `skip:.git` never matches `a.gitb`. Always routed to the exclude
+    /// side by [`Query::parse`], with or without a leading `!`.
+    PathComponent(Vec<String>),
 }
 
 impl Query {
@@ -75,7 +82,9 @@ impl Query {
                 continue;
             }
             let term = parse_term(body)?;
-            if negated {
+            // `skip:` is exclusion by definition: it must never end up on the
+            // include side, whether or not the caller wrote a leading '!'.
+            if negated || matches!(term, Term::PathComponent(_)) {
                 exclude.push(term);
             } else {
                 include.push(term);
@@ -90,7 +99,7 @@ fn parse_term(body: &str) -> Result<Term> {
         let f = field.to_ascii_lowercase();
         const FIELDS: &[&str] = &[
             "ext", "size", "dm", "dc", "type", "hidden", "system", "readonly", "reparse",
-            "parent", "path", "name", "regex",
+            "parent", "path", "name", "regex", "skip",
         ];
         if !FIELDS.contains(&f.as_str()) {
             // `D:\proj`-style tokens: the colon is a drive letter, not a field.
@@ -98,7 +107,7 @@ fn parse_term(body: &str) -> Result<Term> {
                 return Ok(name_term(body));
             }
             bail!(
-                "unknown field '{field}:' (supported: ext size dm dc type hidden system readonly reparse parent path name regex)"
+                "unknown field '{field}:' (supported: ext size dm dc type hidden system readonly reparse parent path name regex skip)"
             );
         }
         if value.is_empty() {
@@ -139,6 +148,19 @@ fn parse_term(body: &str) -> Result<Term> {
                 Ok(Term::Flag { bit, on })
             }
             "parent" | "path" => Ok(Term::PathPrefix(value.to_lowercase())),
+            // Path components are compared against `\`-separated segments, so
+            // a caller may write them with or without surrounding separators.
+            "skip" => {
+                let comps: Vec<String> = value
+                    .split(',')
+                    .map(|c| c.trim().trim_matches(['\\', '/']).to_lowercase())
+                    .filter(|c| !c.is_empty())
+                    .collect();
+                if comps.is_empty() {
+                    bail!("skip: needs at least one path component");
+                }
+                Ok(Term::PathComponent(comps))
+            }
             "name" => Ok(name_term(value)),
             "regex" => {
                 // Lowercase the pattern: names are stored lowercased, and the
@@ -148,7 +170,7 @@ fn parse_term(body: &str) -> Result<Term> {
                     .map_err(|e| anyhow::anyhow!("regex: invalid pattern '{value}': {e}"))?;
                 Ok(Term::Regex(pat))
             }
-            other => bail!("unknown field '{other}:' (supported: ext size dm dc type hidden system readonly reparse parent path name regex)"),
+            other => bail!("unknown field '{other}:' (supported: ext size dm dc type hidden system readonly reparse parent path name regex skip)"),
         }
     } else {
         Ok(name_term(body))
@@ -303,6 +325,27 @@ mod tests {
         // bare token with a separator → full-path substring
         let q = Query::parse(r"D:\proj\src").unwrap();
         assert!(matches!(q.include[0], Term::PathSubstr(ref p) if p == r"d:\proj\src"));
+    }
+
+    #[test]
+    fn skip_is_always_an_exclusion() {
+        // `skip:` must land on the exclude side even without a leading '!'.
+        let q = Query::parse("ext:rs skip:.git,node_modules").unwrap();
+        assert_eq!(q.include.len(), 1);
+        assert_eq!(q.exclude.len(), 1);
+        assert!(
+            matches!(q.exclude[0], Term::PathComponent(ref c)
+                if c == &vec![".git".to_string(), "node_modules".to_string()])
+        );
+        // a leading '!' is accepted and changes nothing
+        let q = Query::parse("!skip:.git").unwrap();
+        assert_eq!(q.include.len(), 0);
+        assert_eq!(q.exclude.len(), 1);
+        // separators around a component are tolerated; empty values rejected
+        let q = Query::parse(r"skip:\node_modules\").unwrap();
+        assert!(matches!(q.exclude[0], Term::PathComponent(ref c) if c[0] == "node_modules"));
+        assert!(Query::parse("skip:").is_err());
+        assert!(Query::parse("skip:,").is_err());
     }
 
     #[test]

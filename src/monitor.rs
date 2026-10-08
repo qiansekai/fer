@@ -23,16 +23,19 @@ use std::sync::mpsc::RecvTimeoutError;
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_READONLY,
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_SYSTEM, GetCompressedFileSizeW,
 };
 use windows_sys::Win32::System::Ioctl::{
+    USN_REASON_DATA_EXTEND, USN_REASON_DATA_OVERWRITE, USN_REASON_DATA_TRUNCATION,
     USN_REASON_FILE_CREATE, USN_REASON_FILE_DELETE, USN_REASON_HARD_LINK_CHANGE,
     USN_REASON_RENAME_NEW_NAME, USN_REASON_RENAME_OLD_NAME,
 };
+
+use serde::{Deserialize, Serialize};
 
 use crate::EntryMeta;
 use crate::mem::{MemBuilder, MemIndex};
@@ -50,7 +53,21 @@ const MASK: u32 = USN_REASON_FILE_CREATE
     | USN_REASON_FILE_DELETE
     | USN_REASON_RENAME_NEW_NAME
     | USN_REASON_RENAME_OLD_NAME
-    | USN_REASON_HARD_LINK_CHANGE;
+    | USN_REASON_HARD_LINK_CHANGE
+    | REFRESH_REASON;
+
+/// Reason bits that mean "this file's contents changed", so the size and mtime
+/// the index holds are stale.
+///
+/// These used to be left out of the mask on purpose (every write event is a
+/// stat), and the cost was that a file written larger kept its old size until
+/// the next flush — up to `--flush-secs` (1800 s here) or a `fer rebuild`.
+/// `size:` filters, `du` and the Web UI all reported the stale value in the
+/// meantime. The stat is now paid, but at most once per FRN per round (see
+/// `Pending::refreshed`), which bounds the cost to "files actually written
+/// this round" rather than "write system calls this round".
+const REFRESH_REASON: u32 =
+    USN_REASON_DATA_OVERWRITE | USN_REASON_DATA_EXTEND | USN_REASON_DATA_TRUNCATION;
 
 /// How far the journal may sit ahead of the applied position before the round
 /// stops sleeping out `interval` and starts replaying back to back. Below it
@@ -96,6 +113,11 @@ struct Pending {
     removed: HashSet<u32>,
     /// Created/renamed entries; not in the loaded index until the flush.
     appended: Vec<(String, EntryMeta)>,
+    /// FRNs whose metadata was already refreshed in the *current* round. A
+    /// writer raises DATA_* once per buffer flush, so without this memo a single
+    /// busy download would cost a stat per flush instead of one per poll
+    /// interval. Cleared at the end of every round and on flush.
+    refreshed: HashSet<u64>,
 }
 
 impl Pending {
@@ -106,6 +128,7 @@ impl Pending {
         self.appended.clear();
         self.removed.clear();
         self.removed_frns.clear();
+        self.refreshed.clear();
     }
 }
 
@@ -517,10 +540,19 @@ fn apply_records(
         if hard_link || r.reason & (USN_REASON_FILE_DELETE | USN_REASON_RENAME_OLD_NAME) != 0 {
             stats.applied += retire_aliases(mem, drive, r, pending, stat);
         }
+        let appearance =
+            hard_link || r.reason & (USN_REASON_FILE_CREATE | USN_REASON_RENAME_NEW_NAME) != 0;
+        // Content changed: the indexed size/mtime are stale. A create already
+        // stat'ed the file, so only the other records are refreshed — and at
+        // most once per FRN per round, because a writer raises DATA_* on every
+        // buffer flush.
+        if !appearance && r.reason & REFRESH_REASON != 0 && pending.refreshed.insert(r.frn) {
+            stats.applied += refresh_entry(mem, drive, r, pending, kernel, stat);
+        }
         // Appearance side: create, rename-into-place and hard-link change - the
         // last one is either a link appearing or a link disappearing, and only
         // the stat below can tell which.
-        if hard_link || r.reason & (USN_REASON_FILE_CREATE | USN_REASON_RENAME_NEW_NAME) != 0 {
+        if appearance {
             match resolve_parent(mem, drive, r.parent_frn, pending, kernel, stat) {
                 Some(parent) => {
                     let path = if parent.is_empty() {
@@ -588,6 +620,54 @@ fn apply_records(
         }
     }
     stats
+}
+
+/// Refresh one entry's metadata after a content change (DATA_OVERWRITE /
+/// DATA_EXTEND / DATA_TRUNCATION). Returns 1 when the pending set changed.
+///
+/// Only records the index already knows are refreshed: an unknown FRN means the
+/// file's own FILE_CREATE has not been seen yet (the create path stats it
+/// anyway), or the record belongs to something this monitor does not index. The
+/// update is the same upsert a create performs — retire the stale entry, then
+/// append the fresh metadata — so neither the flush nor the change feed needs a
+/// special case for it.
+///
+/// A stat failure leaves the entry untouched: a locked file's size is unknown,
+/// not zero, and a file that really went away owns a DELETE record that will
+/// retire it.
+fn refresh_entry(
+    mem: &MemIndex,
+    drive: char,
+    r: &UsnRecord,
+    pending: &mut Pending,
+    kernel: &mut impl FnMut(u64) -> Option<String>,
+    stat: &mut impl FnMut(&str, bool, u64) -> StatResult,
+) -> usize {
+    let known = mem
+        .find_frn_all(r.frn)
+        .iter()
+        .any(|&i| path_on_drive(mem.path_bytes(i as usize), drive))
+        || pending.appended.iter().any(|(_, m)| m.frn == Some(r.frn));
+    if !known {
+        return 0;
+    }
+    let Some(parent) = resolve_parent(mem, drive, r.parent_frn, pending, kernel, stat) else {
+        return 0;
+    };
+    let path = if parent.is_empty() {
+        format!("{drive}:\\{}", r.name)
+    } else {
+        format!("{parent}\\{}", r.name)
+    };
+    match stat(&path, r.is_dir, r.frn) {
+        Ok(s) => {
+            retire_path(mem, &path, pending);
+            drop_pending_path(pending, &path);
+            pending.appended.push((path, s.meta));
+            1
+        }
+        Err(_) => 0,
+    }
 }
 
 /// Retire the index entry at the given path, if any. Returns 1 when it was
@@ -983,6 +1063,63 @@ pub fn run(
     // itself. push_stale_since bounds how long that hold-back may last.
     let mut push_stale = false;
     let mut push_stale_since: Option<std::time::Instant> = None;
+    let snap_path = snapshot_path(&dump);
+    // Armed so the first round with changes writes a snapshot immediately: the
+    // window between a change and its first snapshot is the only part a restart
+    // can still lose to a recycled journal.
+    let mut last_snapshot = std::time::Instant::now() - SNAPSHOT_MIN_GAP;
+    // Position the *dump on disk* was stamped with, per volume. Every flush and
+    // rebuild moves it; while it lags the journal's FirstUsn a crash would leave
+    // a hole a replay cannot fill — see the loop below.
+    let mut durable: HashMap<char, i64> = vols
+        .iter()
+        .map(|w| (w.drive, read_usn(&usn_sidecar, w.drive).unwrap_or(w.start)))
+        .collect();
+    // Restore the change set the previous run had not flushed yet, and resume
+    // from the position it recorded instead of the dump position — the journal
+    // has usually recycled the latter long before the next flush is due.
+    if let Some(snap) = read_snapshot(&snap_path) {
+        let mut appends = 0usize;
+        let mut removals = 0usize;
+        for w in vols.iter_mut() {
+            if let Some(&(_, pos)) = snap.positions.iter().find(|(d, _)| *d == w.drive) {
+                w.start = pos;
+                w.lag = journal_lag(&w.vol, w.start);
+                w.catching_up = w.lag > CATCHUP_LAG;
+            }
+            let (a, r) = apply_snapshot(
+                &snap,
+                w.drive,
+                |path| mem.find_path_idx(path).map(|i| i as u32),
+                &mut w.pending,
+            );
+            appends += a;
+            removals += r;
+        }
+        let positions: Vec<(char, i64)> = vols.iter().map(|v| (v.drive, v.start)).collect();
+        eprintln!(
+            "[monitor] restored {appends} appended + {removals} removed pending changes from {} \
+             (resuming at {})",
+            snap_path.display(),
+            pos_summary(&positions)
+        );
+        // The restored entries are not in the dump the server loaded, so the
+        // first live round must broadcast them even if it applies nothing new.
+        push_stale = true;
+        push_stale_since = Some(std::time::Instant::now());
+    }
+    // A restart normally replays from `durable`. When the journal was recycled
+    // while the monitor was down that position is gone and the changes in
+    // between would stay invisible forever ("files created last night are not
+    // searchable, and waiting does not help"). Rebuild those volumes up front
+    // instead of replaying a hole.
+    if let Some(msg) = auto_heal_gaps(&mut mem, &mut vols, &drives, &dump, &usn_sidecar) {
+        last_flush = std::time::Instant::now();
+        for v in vols.iter() {
+            durable.insert(v.drive, v.start);
+        }
+        eprintln!("[monitor] {msg}");
+    }
     loop {
         // Wait out the poll interval, or wake immediately for a control command:
         // recv_timeout replaces the plain sleep so fer rebuild is served at once
@@ -1109,6 +1246,9 @@ pub fn run(
             if w.cache.len() > 1_000_000 {
                 w.cache.clear();
             }
+            // The refresh memo is per round: a file written again next round
+            // must be re-stat'ed.
+            w.pending.refreshed.clear();
         }
         // Volumes that could not be read are taken out of the watch set (their
         // dump entries stay untouched) and retried by revive_down.
@@ -1178,8 +1318,66 @@ pub fn run(
                     push_stale_since.get_or_insert_with(std::time::Instant::now);
                 }
             }
+            // Persist the pending set before the flush decision — `removed`
+            // holds indices into the *current* index, which the flush rebuilds.
+            // A successful flush deletes the file again (the dump then holds
+            // everything it described).
+            // Rough serialized size of the snapshot, used to keep its write rate
+            // bounded as the pending set grows.
+            let est_bytes =
+                (merged.appended_len() as u64) * 128 + (merged.removed_len() as u64) * 80;
+            let gap = SNAPSHOT_MIN_GAP.max(Duration::from_secs(est_bytes / SNAPSHOT_BYTES_PER_SEC));
+            if !merged.is_empty()
+                && round_stats.applied > 0
+                && last_snapshot.elapsed() >= gap
+            {
+                let snap = PendingSnapshot {
+                    v: SNAPSHOT_VERSION,
+                    positions: vols.iter().map(|v| (v.drive, v.start)).collect(),
+                    removed: merged
+                        .removed()
+                        .filter_map(|i| {
+                            let i = i as usize;
+                            (i < mem.len())
+                                .then(|| String::from_utf8_lossy(mem.path_bytes(i)).into_owned())
+                        })
+                        .collect(),
+                    appended: merged
+                        .appended()
+                        .map(|(p, m)| crate::push::AppendEntry::new(p.clone(), *m))
+                        .collect(),
+                };
+                match write_snapshot(&snap_path, &snap) {
+                    Ok(()) => eprintln!(
+                        "[monitor] pending snapshot: {} appended + {} removed @ {}",
+                        snap.appended.len(),
+                        snap.removed.len(),
+                        pos_summary(&snap.positions)
+                    ),
+                    Err(e) => eprintln!("[monitor] pending snapshot failed: {e}"),
+                }
+                last_snapshot = std::time::Instant::now();
+            }
             let pending_changes = !merged.is_empty();
-            // A fer flush on the control channel overrides the debounce window.
+            // Nothing pending: the dump already holds everything the index has,
+            // so the stored position may advance to the live one without
+            // rewriting the whole dump. That keeps a restart's replay window as
+            // short as possible and makes the automatic-rebuild path rare.
+            if !pending_changes {
+                let positions: Vec<(char, i64)> =
+                    vols.iter().map(|v| (v.drive, v.start)).collect();
+                if positions.iter().any(|&(d, p)| durable.get(&d) != Some(&p)) {
+                    write_usns(&usn_sidecar, &positions)?;
+                    for &(d, p) in &positions {
+                        durable.insert(d, p);
+                    }
+                }
+            }
+            // The only early-flush trigger is an explicit `fer flush`. The
+            // journal's replay window on a busy volume is only tens of seconds,
+            // so "flush before the journal recycles the dump position" would
+            // rewrite the whole dump every round; the pending snapshot is what
+            // keeps a restart from losing changes instead.
             let force_flush = matches!(
                 command.as_ref().map(|r| r.cmd),
                 Some(crate::control::Cmd::Flush)
@@ -1211,7 +1409,11 @@ pub fn run(
                 // line, and none of them overwrites another's.
                 let positions: Vec<(char, i64)> = vols.iter().map(|v| (v.drive, v.start)).collect();
                 write_usns(&usn_sidecar, &positions)?;
+                for &(drive, usn) in &positions {
+                    durable.insert(drive, usn);
+                }
                 flush_report = (kept, written, n_removed, n_appended);
+                clear_snapshot(&snap_path);
                 flushed = true;
             }
         }
@@ -1259,122 +1461,15 @@ pub fn run(
                     )
                 }
                 crate::control::Cmd::Rebuild => {
-                    let t0 = std::time::Instant::now();
-                    // Journal position BEFORE the scan, taken per volume: changes
-                    // made while the rebuild runs are replayed from here on the
-                    // next iteration, so a rebuild cannot lose them.
-                    let befores: Vec<(char, i64)> = vols
-                        .iter()
-                        .map(|v| (v.drive, v.vol.query_journal().map(|(_, n)| n).unwrap_or(v.start)))
-                        .collect();
-                    // Re-scan every volume this monitor can read right now. The
-                    // entries of every other volume — and of watched volumes that
-                    // are down at the moment — are carried over verbatim,
-                    // otherwise a rebuild would silently shrink the cross-volume
-                    // dump.
-                    let scan = drive_list(&vols.iter().map(|v| v.drive).collect::<Vec<_>>());
-                    let outcome = crate::indexer::build(
-                        &crate::indexer::resolve_volumes(&scan),
-                        crate::indexer::Method::Mft,
-                    );
-                    match outcome {
-                        Ok((report, fresh)) => {
-                            let mut b = MemBuilder::default();
-                            let mut files = 0u64;
-                            let mut dirs = 0u64;
-                            for i in 0..mem.len() {
-                                if !drives.iter().any(|&d| path_on_drive(mem.path_bytes(i), d)) {
-                                    let meta = mem.meta_at(i);
-                                    if meta.is_dir {
-                                        dirs += 1;
-                                    } else {
-                                        files += 1;
-                                    }
-                                    b.push_arena(
-                                        mem.path_bytes(i),
-                                        mem.name_l_bytes(i),
-                                        mem.rev_bytes(i),
-                                        meta,
-                                    );
-                                }
+                    match rebuild_watched(&mut mem, &mut vols, &drives, &dump, &usn_sidecar) {
+                        Ok(msg) => {
+                            push_stale = false;
+                            push_stale_since = None;
+                            last_flush = std::time::Instant::now();
+                            for v in vols.iter() {
+                                durable.insert(v.drive, v.start);
                             }
-                            for i in 0..fresh.len() {
-                                let meta = fresh.meta_at(i);
-                                if meta.is_dir {
-                                    dirs += 1;
-                                } else {
-                                    files += 1;
-                                }
-                                b.push_arena(
-                                    fresh.path_bytes(i),
-                                    fresh.name_l_bytes(i),
-                                    fresh.rev_bytes(i),
-                                    meta,
-                                );
-                            }
-                            let new = b.finish();
-                            let entries = new.len();
-                            match new.save(&dump) {
-                                Ok(()) => {
-                                    mem = MemIndex::load_dump(&dump).unwrap_or(new);
-                                    for w in vols.iter_mut() {
-                                        if let Some(&(_, pos)) =
-                                            befores.iter().find(|(d, _)| *d == w.drive)
-                                        {
-                                            w.start = pos;
-                                        }
-                                        w.cache.clear();
-                                        w.pending.clear();
-                                        w.lag = journal_lag(&w.vol, w.start);
-                                        w.catching_up = w.lag > CATCHUP_LAG;
-                                    }
-                                    // The dump now carries everything; nothing is
-                                    // left over from a paused feed either.
-                                    push_stale = false;
-                                    push_stale_since = None;
-                                    last_flush = std::time::Instant::now();
-                                    let positions: Vec<(char, i64)> =
-                                        vols.iter().map(|v| (v.drive, v.start)).collect();
-                                    let _ = write_usns(&usn_sidecar, &positions);
-                                    // Keep the quality sidecar honest: fer stats
-                                    // reports built_at_unix from it, so a rebuild
-                                    // that does not stamp it leaves a freshly
-                                    // rebuilt index looking stale. The volume list
-                                    // is carried over — this dump still covers
-                                    // every volume, only the watched ones were
-                                    // re-scanned.
-                                    let volumes = crate::meta::read_index_meta(&dump)
-                                        .map(|m| m.volumes)
-                                        .unwrap_or_else(|| {
-                                            drives.iter().map(|d| format!("{d}:")).collect()
-                                        });
-                                    let _ = crate::meta::write_index_meta(
-                                        &dump,
-                                        &crate::meta::IndexMeta {
-                                            method: "mft".to_string(),
-                                            volumes,
-                                            files,
-                                            dirs,
-                                            skipped: report.skipped,
-                                            elapsed_ms: t0.elapsed().as_millis() as u64,
-                                            built_at_unix: crate::meta::IndexMeta::now_unix(),
-                                        },
-                                    );
-                                    let msg = format!(
-                                        "ok: rebuilt {scan} in {} ms — {entries} entries \
-                                         ({} files + {} dirs scanned) -> {}",
-                                        t0.elapsed().as_millis(),
-                                        report.files,
-                                        report.dirs,
-                                        dump.display()
-                                    );
-                                    eprintln!("[monitor] {msg}");
-                                    msg
-                                }
-                                Err(e) => format!(
-                                    "err: rebuild scanned {scan} but writing the dump failed: {e}"
-                                ),
-                            }
+                            msg
                         }
                         Err(e) => format!("err: rebuild failed: {e}"),
                     }
@@ -1476,6 +1571,297 @@ fn flush(mem: &MemIndex, pending: &MergedPending<'_>, dump: &Path) -> Result<Mem
     let new = b.finish();
     new.save(dump)?;
     Ok(new)
+}
+
+/// Whether a stored USN position can still be replayed from the journal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplayHealth {
+    /// Every record from the stored position is still in the journal.
+    Replayable,
+    /// The journal's oldest record is newer than the stored position *and*
+    /// there are newer records: everything in between was recycled, so a replay
+    /// would silently miss it. The volume needs a rebuild.
+    Gap { first_usn: i64, stored: i64 },
+    /// Nothing to replay: the journal is at or behind the stored position.
+    Current,
+}
+
+/// Pure decision behind [`replay_health`], so the boundary cases are testable
+/// without a volume handle.
+fn classify_replay(stored: i64, first_usn: i64, next_usn: i64) -> ReplayHealth {
+    if next_usn <= stored {
+        ReplayHealth::Current
+    } else if first_usn > stored {
+        ReplayHealth::Gap { first_usn, stored }
+    } else {
+        ReplayHealth::Replayable
+    }
+}
+
+/// Classify whether `start` can still be replayed from this volume's journal.
+/// A journal that cannot be queried is treated as replayable: the read path
+/// reports its own error and falls back to sync-to-now.
+fn replay_health(vol: &UsnVolume, start: i64) -> ReplayHealth {
+    match vol.journal_bounds() {
+        Ok((_id, first, next)) => classify_replay(start, first, next),
+        Err(_) => ReplayHealth::Replayable,
+    }
+}
+
+/// Rebuild the volumes this monitor watches from $MFT and rewrite the dump.
+///
+/// Shared by the `fer rebuild` control command and the automatic rebuild that
+/// runs when a restart finds the journal has recycled the stored position.
+/// Returns the human-readable result line.
+///
+/// Two correctness rules are inherited from the original inline version:
+/// 1. each volume resumes from the journal position taken *before* the scan, so
+///    changes made while the rebuild runs are replayed next round, not lost;
+/// 2. entries of volumes that are not being scanned — including watched volumes
+///    that are currently down — are carried over verbatim, because this dump
+///    covers every volume and a rebuild must not silently shrink it.
+fn rebuild_watched(
+    mem: &mut MemIndex,
+    vols: &mut [Watched],
+    drives: &[char],
+    dump: &Path,
+    usn_sidecar: &Path,
+) -> Result<String> {
+    let t0 = std::time::Instant::now();
+    let befores: Vec<(char, i64)> = vols
+        .iter()
+        .map(|v| (v.drive, v.vol.journal_bounds().map(|(_, _, n)| n).unwrap_or(v.start)))
+        .collect();
+    let scan = drive_list(&vols.iter().map(|v| v.drive).collect::<Vec<_>>());
+    let (report, fresh) = crate::indexer::build(
+        &crate::indexer::resolve_volumes(&scan),
+        crate::indexer::Method::Mft,
+    )?;
+    let mut b = MemBuilder::default();
+    let mut files = 0u64;
+    let mut dirs = 0u64;
+    for i in 0..mem.len() {
+        if !drives.iter().any(|&d| path_on_drive(mem.path_bytes(i), d)) {
+            let meta = mem.meta_at(i);
+            if meta.is_dir {
+                dirs += 1;
+            } else {
+                files += 1;
+            }
+            b.push_arena(
+                mem.path_bytes(i),
+                mem.name_l_bytes(i),
+                mem.rev_bytes(i),
+                meta,
+            );
+        }
+    }
+    for i in 0..fresh.len() {
+        let meta = fresh.meta_at(i);
+        if meta.is_dir {
+            dirs += 1;
+        } else {
+            files += 1;
+        }
+        b.push_arena(
+            fresh.path_bytes(i),
+            fresh.name_l_bytes(i),
+            fresh.rev_bytes(i),
+            meta,
+        );
+    }
+    let new = b.finish();
+    let entries = new.len();
+    new.save(dump)?;
+    *mem = MemIndex::load_dump(dump).unwrap_or(new);
+    for w in vols.iter_mut() {
+        if let Some(&(_, pos)) = befores.iter().find(|(d, _)| *d == w.drive) {
+            w.start = pos;
+        }
+        w.cache.clear();
+        w.pending.clear();
+        w.lag = journal_lag(&w.vol, w.start);
+        w.catching_up = w.lag > CATCHUP_LAG;
+    }
+    let positions: Vec<(char, i64)> = vols.iter().map(|v| (v.drive, v.start)).collect();
+    write_usns(usn_sidecar, &positions)?;
+    // The fresh dump contains everything the pending set described.
+    clear_snapshot(&snapshot_path(dump));
+    // Keep the quality sidecar honest: fer stats reports built_at_unix from it,
+    // so a rebuild that does not stamp it leaves a freshly rebuilt index looking
+    // stale. The volume list is carried over — this dump still covers every
+    // volume, only the watched ones were re-scanned.
+    let volumes = crate::meta::read_index_meta(dump)
+        .map(|m| m.volumes)
+        .unwrap_or_else(|| drives.iter().map(|d| format!("{d}:")).collect());
+    let _ = crate::meta::write_index_meta(
+        dump,
+        &crate::meta::IndexMeta {
+            method: "mft".to_string(),
+            volumes,
+            files,
+            dirs,
+            skipped: report.skipped,
+            elapsed_ms: t0.elapsed().as_millis() as u64,
+            built_at_unix: crate::meta::IndexMeta::now_unix(),
+        },
+    );
+    let msg = format!(
+        "ok: rebuilt {scan} in {} ms — {entries} entries ({} files + {} dirs scanned) -> {}",
+        t0.elapsed().as_millis(),
+        report.files,
+        report.dirs,
+        dump.display()
+    );
+    eprintln!("[monitor] {msg}");
+    Ok(msg)
+}
+
+/// Rebuild the watched volumes whose stored replay position the journal has
+/// already recycled (see [`ReplayHealth`]). Returns the log line when a rebuild
+/// ran, `None` when every volume can still be replayed.
+///
+/// This is the automatic form of "stop the monitor, run fer index, start it
+/// again": a restart that finds a recycled journal heals itself instead of
+/// silently dropping the changes made while the monitor was down.
+fn auto_heal_gaps(
+    mem: &mut MemIndex,
+    vols: &mut [Watched],
+    drives: &[char],
+    dump: &Path,
+    usn_sidecar: &Path,
+) -> Option<String> {
+    let gapped: Vec<char> = vols
+        .iter()
+        .filter(|w| matches!(replay_health(&w.vol, w.start), ReplayHealth::Gap { .. }))
+        .map(|w| w.drive)
+        .collect();
+    if gapped.is_empty() {
+        return None;
+    }
+    eprintln!(
+        "[monitor] {}: the USN journal no longer holds the stored replay position, so the changes \
+         made while the monitor was down would be lost. Rebuilding every watched volume from $MFT \
+         now (the automatic form of fer index) so the gap heals without manual work.",
+        gapped.iter().map(|d| format!("{d}:")).collect::<Vec<_>>().join(" ")
+    );
+    match rebuild_watched(mem, vols, drives, dump, usn_sidecar) {
+        Ok(msg) => Some(format!("automatic rebuild after a recycled journal: {msg}")),
+        Err(e) => {
+            eprintln!(
+                "[monitor] automatic rebuild failed: {e} — replaying whatever the journal still \
+                 holds; run fer rebuild to close the gap"
+            );
+            None
+        }
+    }
+}
+
+/// Version of the pending snapshot format. A file written by another version
+/// is ignored: a stale snapshot must never corrupt a fresh start.
+const SNAPSHOT_VERSION: u32 = 1;
+
+/// Minimum gap between two pending snapshots.
+///
+/// Why the snapshot exists: the USN journal keeps only tens of seconds of
+/// history on this volume (32 MB, and D: is busy enough to wrap it in ~20-30 s),
+/// while the dump is rewritten every `--flush-secs` (1800 s here). A restart
+/// could therefore only replay from the *dump* position — long since recycled —
+/// and had to either rebuild the whole volume from $MFT (measured 24 s plus a
+/// full dump rewrite) or lose the changes made before the restart. The snapshot
+/// records the position the **memory index** reached plus everything not yet
+/// flushed, so a restart resumes from there and only needs the journal for the
+/// last few seconds.
+///
+/// It is rewritten after every round that applied changes (bounded by this gap),
+/// because the shorter that window is, the less the journal has to still hold.
+const SNAPSHOT_MIN_GAP: Duration = Duration::from_secs(5);
+/// Snapshot writes are capped at roughly this many bytes per second, so a large
+/// pending set cannot turn the snapshot into the write load the deferred flush
+/// exists to avoid: the gap between writes grows with the set.
+const SNAPSHOT_BYTES_PER_SEC: u64 = 1 << 20;
+
+/// On-disk form of the pending change set (see [`SNAPSHOT_EVERY`]).
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct PendingSnapshot {
+    v: u32,
+    /// Replay position per volume at the moment of the snapshot.
+    positions: Vec<(char, i64)>,
+    /// Paths retired since the dump; matched against the freshly loaded index.
+    removed: Vec<String>,
+    /// Entries created/renamed/refreshed since the dump (upserts).
+    appended: Vec<crate::push::AppendEntry>,
+}
+
+/// `<dump>.pending` — the pending-set snapshot companion to the dump.
+fn snapshot_path(dump: &Path) -> PathBuf {
+    let mut p = std::ffi::OsString::from(dump.as_os_str());
+    p.push(".pending");
+    PathBuf::from(p)
+}
+
+/// Write the snapshot atomically (temp + rename), so a crash never leaves a
+/// half-written file for the next start to read.
+fn write_snapshot(path: &Path, snap: &PendingSnapshot) -> Result<()> {
+    let mut tmp = std::ffi::OsString::from(path.as_os_str());
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let data = serde_json::to_vec(snap).context("serializing the pending snapshot")?;
+    std::fs::write(&tmp, &data)
+        .with_context(|| format!("writing the pending snapshot {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
+    Ok(())
+}
+
+/// Read the snapshot, ignoring anything unreadable or from another format.
+fn read_snapshot(path: &Path) -> Option<PendingSnapshot> {
+    let data = std::fs::read(path).ok()?;
+    let snap: PendingSnapshot = serde_json::from_slice(&data).ok()?;
+    (snap.v == SNAPSHOT_VERSION).then_some(snap)
+}
+
+/// Forget the snapshot: it is only valid until the next dump write, which
+/// already contains everything it describes.
+fn clear_snapshot(path: &Path) {
+    let _ = std::fs::remove_file(path);
+}
+
+/// Apply one volume's share of a restored snapshot to its pending set.
+///
+/// `lookup` maps a path to its entry id in the freshly loaded dump (the caller
+/// passes `MemIndex::find_path_idx`); a path the dump does not hold was never
+/// flushed and is simply re-appended. Retirement comes first and an append
+/// retires whatever still occupies its path, so the restored set has exactly the
+/// upsert semantics the live path produces. Returns `(appends, removals)`.
+fn apply_snapshot(
+    snap: &PendingSnapshot,
+    drive: char,
+    lookup: impl Fn(&str) -> Option<u32>,
+    pending: &mut Pending,
+) -> (usize, usize) {
+    let mut appends = 0usize;
+    let mut removals = 0usize;
+    for path in &snap.removed {
+        if !path_on_drive(path.as_bytes(), drive) {
+            continue;
+        }
+        if let Some(idx) = lookup(path)
+            && pending.removed.insert(idx)
+        {
+            removals += 1;
+        }
+    }
+    for e in &snap.appended {
+        if !path_on_drive(e.p.as_bytes(), drive) {
+            continue;
+        }
+        if let Some(idx) = lookup(&e.p) {
+            pending.removed.insert(idx);
+        }
+        pending.appended.push((e.p.clone(), e.meta()));
+        appends += 1;
+    }
+    (appends, removals)
 }
 
 /// Sidecar holding the last-applied USN per volume ("C: 123456" lines).
@@ -1658,6 +2044,219 @@ mod tests {
                 stat_none(path, is_dir, frn)
             }
         }
+    }
+
+    // -- content-change refresh (DATA_* reasons) ----------------------------
+
+    /// A DATA_EXTEND on a file the index already holds must re-stat it and
+    /// replace the stale size. Without this a file written larger kept its
+    /// old size until the next flush (up to --flush-secs) or a rebuild.
+    #[test]
+    fn data_extend_refreshes_an_indexed_entry() {
+        let mem = hard_link_index();
+        let mut pending = Pending::default();
+        let mut kernel = resolve_links;
+        let mut stat = |_p: &str, _d: bool, frn: u64| {
+            Ok(StatMeta {
+                meta: EntryMeta {
+                    size: 4096,
+                    mtime: 1_700_000_500,
+                    frn: Some(frn),
+                    ..Default::default()
+                },
+                alloc_failed: false,
+            })
+        };
+        let stats = apply_records(
+            &mem,
+            'D',
+            &[rec(71, "other.bin", USN_REASON_DATA_EXTEND, false)],
+            &mut pending,
+            &mut kernel,
+            &mut stat,
+        );
+        assert_eq!(stats.applied, 1);
+        assert_eq!(pending.appended.len(), 1);
+        assert_eq!(pending.appended[0].0, r"D:\links\other.bin");
+        assert_eq!(pending.appended[0].1.size, 4096);
+        assert_eq!(pending.appended[0].1.mtime, 1_700_000_500);
+        // The stale entry is retired by the same upsert, so the flush writes
+        // one entry instead of two.
+        assert_eq!(pending.removed.len(), 1);
+    }
+
+    /// A record whose FRN the index does not know is ignored: the create path
+    /// stats the file when its own FILE_CREATE arrives, and a stat per write
+    /// of an untracked file would be pure waste.
+    #[test]
+    fn data_change_of_an_unknown_frn_is_ignored() {
+        let mem = hard_link_index();
+        let mut pending = Pending::default();
+        let mut kernel = resolve_links;
+        let mut stat = stat_ok;
+        let stats = apply_records(
+            &mem,
+            'D',
+            &[rec(999, "ghost.bin", USN_REASON_DATA_OVERWRITE, false)],
+            &mut pending,
+            &mut kernel,
+            &mut stat,
+        );
+        assert_eq!(stats.applied, 0);
+        assert!(pending.appended.is_empty());
+        assert!(pending.removed.is_empty());
+    }
+
+    /// A writer raises DATA_* once per buffer flush. The per-round memo has to
+    /// collapse a burst into a single stat.
+    #[test]
+    fn data_changes_are_refreshed_once_per_round() {
+        let mem = hard_link_index();
+        let mut pending = Pending::default();
+        let mut kernel = resolve_links;
+        // Cell, not a plain counter: the closure holds it while apply_records
+        // runs, and the assertions below read it between rounds.
+        let calls = std::cell::Cell::new(0usize);
+        let mut stat = |_p: &str, _d: bool, frn: u64| {
+            calls.set(calls.get() + 1);
+            Ok(StatMeta {
+                meta: EntryMeta { size: 4096, frn: Some(frn), ..Default::default() },
+                alloc_failed: false,
+            })
+        };
+        let records = [
+            rec(71, "other.bin", USN_REASON_DATA_EXTEND, false),
+            rec(71, "other.bin", USN_REASON_DATA_OVERWRITE, false),
+            rec(71, "other.bin", USN_REASON_DATA_TRUNCATION, false),
+        ];
+        let stats = apply_records(&mem, 'D', &records, &mut pending, &mut kernel, &mut stat);
+        assert_eq!(stats.applied, 1);
+        assert_eq!(calls.get(), 1, "one stat per FRN per round");
+        assert_eq!(pending.appended.len(), 1);
+
+        // The next round starts from a clean memo and refreshes again.
+        pending.refreshed.clear();
+        let stats = apply_records(&mem, 'D', &records, &mut pending, &mut kernel, &mut stat);
+        assert_eq!(stats.applied, 1);
+        assert_eq!(calls.get(), 2);
+    }
+
+    /// A failed refresh stat leaves the entry alone: a locked file's size is
+    /// unknown, not zero, and a file that really went away owns a DELETE
+    /// record that will retire it.
+    #[test]
+    fn a_failed_refresh_stat_leaves_the_entry_alone() {
+        let mem = hard_link_index();
+        let mut pending = Pending::default();
+        let mut kernel = resolve_links;
+        let mut stat = stat_other;
+        let stats = apply_records(
+            &mem,
+            'D',
+            &[rec(71, "other.bin", USN_REASON_DATA_EXTEND, false)],
+            &mut pending,
+            &mut kernel,
+            &mut stat,
+        );
+        assert_eq!(stats.applied, 0);
+        assert!(pending.appended.is_empty());
+        assert!(pending.removed.is_empty());
+    }
+
+    // -- journal replay health (startup self-heal) --------------------------
+
+    /// The replay floor decides whether a restart can trust the stored USN
+    /// position. Getting this backwards either rebuilds on every start or
+    /// drops the changes made while the monitor was down.
+    #[test]
+    fn replay_health_classifies_the_journal_floor() {
+        // Nothing new: current, even when the stored position is long gone.
+        assert_eq!(classify_replay(500, 900, 500), ReplayHealth::Current);
+        assert_eq!(classify_replay(500, 900, 400), ReplayHealth::Current);
+        // New records exist and the floor is behind the stored position.
+        assert_eq!(classify_replay(500, 500, 900), ReplayHealth::Replayable);
+        assert_eq!(classify_replay(500, 400, 900), ReplayHealth::Replayable);
+        // New records exist but the floor moved past the stored position: the
+        // records in between were recycled.
+        assert_eq!(
+            classify_replay(500, 700, 900),
+            ReplayHealth::Gap { first_usn: 700, stored: 500 }
+        );
+    }
+
+    // -- pending snapshot (restart without a rebuild) ------------------------
+
+    fn snap_sample() -> PendingSnapshot {
+        PendingSnapshot {
+            v: SNAPSHOT_VERSION,
+            positions: vec![('D', 1234), ('H', 7)],
+            removed: vec![r"D:\gone.txt".to_string(), r"H:\other.bin".to_string()],
+            appended: vec![
+                crate::push::AppendEntry::new(r"D:\new.txt", meta_file(42, 900)),
+                crate::push::AppendEntry::new(r"H:\h.txt", meta_file(7, 901)),
+            ],
+        }
+    }
+
+    #[test]
+    fn snapshot_round_trips_through_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db.feridx.pending");
+        let snap = snap_sample();
+        write_snapshot(&path, &snap).unwrap();
+        let back = read_snapshot(&path).expect("snapshot must be readable");
+        assert_eq!(back.positions, snap.positions);
+        assert_eq!(back.removed, snap.removed);
+        assert_eq!(back.appended.len(), 2);
+        assert_eq!(back.appended[0].p, r"D:\new.txt");
+        assert_eq!(back.appended[0].s, 42);
+        assert_eq!(back.appended[1].frn, Some(901));
+        clear_snapshot(&path);
+        assert!(read_snapshot(&path).is_none(), "a cleared snapshot is gone");
+    }
+
+    #[test]
+    fn a_foreign_snapshot_version_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v9.pending");
+        let mut snap = snap_sample();
+        snap.v = SNAPSHOT_VERSION + 1;
+        write_snapshot(&path, &snap).unwrap();
+        assert!(read_snapshot(&path).is_none());
+        // Garbage is ignored too, not fatal.
+        std::fs::write(&path, b"{not json").unwrap();
+        assert!(read_snapshot(&path).is_none());
+    }
+
+    /// The restored set must be the same upsert set the live path builds: an
+    /// entry the dump still holds is retired, and a path the dump does not
+    /// hold is simply re-appended.
+    #[test]
+    fn apply_snapshot_restores_an_upsert_set() {
+        let snap = snap_sample();
+        let mut pending = Pending::default();
+        // The dump knows the removed path and one of the appended ones.
+        let lookup = |p: &str| match p {
+            r"D:\gone.txt" => Some(11),
+            r"D:\new.txt" => Some(12),
+            _ => None,
+        };
+        let (appends, removals) = apply_snapshot(&snap, 'D', lookup, &mut pending);
+        assert_eq!(appends, 1);
+        assert_eq!(removals, 1);
+        // The stale entry for the re-created path is retired by the upsert.
+        assert_eq!(pending.removed.len(), 2);
+        assert!(pending.removed.contains(&11));
+        assert!(pending.removed.contains(&12));
+        assert_eq!(pending.appended.len(), 1);
+        assert_eq!(pending.appended[0].0, r"D:\new.txt");
+        assert_eq!(pending.appended[0].1.size, 42);
+
+        // Another volume only takes its own share.
+        let mut h_pending = Pending::default();
+        let (appends, removals) = apply_snapshot(&snap, 'H', |_| None, &mut h_pending);
+        assert_eq!((appends, removals), (1, 0));
+        assert_eq!(h_pending.appended[0].0, r"H:\h.txt");
     }
 
     // -- metadata fill ------------------------------------------------------

@@ -13,13 +13,11 @@
 //!   lookup) — all queries reduce to two binary searches
 //!   (partition points) over one of these
 //!
-//! All 12 query-language terms evaluate in memory. SQLite survives only as a
-//! dev/test oracle behind the `sqlite` feature — production queries (CLI,
-//! serve, monitor) never touch it.
+//! All query-language terms evaluate in memory.
 //!
 //! Known divergence: path CI ordering folds ASCII case only; non-ASCII
-//! letters with Unicode case (É/Ö/ü) compare bytewise — SQLite's fallback
-//! lowercases them. Extremely rare in Windows paths.
+//! letters with Unicode case (É/Ö/ü) compare bytewise. Extremely rare in
+//! Windows paths.
 
 use std::cmp::Ordering;
 use std::fs::File;
@@ -28,13 +26,10 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail};
-#[cfg(feature = "sqlite")]
-use rusqlite::Connection;
 
 use crate::EntryMeta;
 use crate::Hit;
 use crate::basename;
-use crate::fold_lower;
 use crate::lower_rev;
 use crate::query::{Query, Term};
 
@@ -115,22 +110,35 @@ impl MemBuilder {
     pub fn push(&mut self, path: &str, meta: EntryMeta) {
         let id = self.entries.len() as u32;
         let name = basename(path);
-        let name_l = fold_lower(name);
-        let rev = lower_rev(&name_l);
         let po = self.paths.len() as u32;
         self.paths.extend_from_slice(path.as_bytes());
         let no = self.names.len() as u32;
-        self.names.extend_from_slice(name_l.as_bytes());
         let ro = self.revs.len() as u32;
-        self.revs.extend_from_slice(rev.as_bytes());
+        let (name_len, rev_len) = if name.is_ascii() {
+            // ASCII is the common path: fold and reverse directly into the
+            // arenas, avoiding two temporary Strings per indexed entry.
+            self.names
+                .extend(name.as_bytes().iter().map(u8::to_ascii_lowercase));
+            self.revs
+                .extend(name.as_bytes().iter().rev().map(u8::to_ascii_lowercase));
+            (name.len(), name.len())
+        } else {
+            // Preserve the existing Unicode case/reversal semantics for the
+            // uncommon non-ASCII path.
+            let name_l = name.to_lowercase();
+            let rev = lower_rev(&name_l);
+            self.names.extend_from_slice(name_l.as_bytes());
+            self.revs.extend_from_slice(rev.as_bytes());
+            (name_l.len(), rev.len())
+        };
         self.entries.push(Entry {
             id,
             path_off: po,
             path_len: path.len() as u16,
             name_off: no,
-            name_len: name_l.len() as u16,
+            name_len: name_len as u16,
             rev_off: ro,
-            rev_len: rev.len() as u16,
+            rev_len: rev_len as u16,
             size: meta.size,
             mtime: meta.mtime,
             ctime: meta.ctime,
@@ -179,10 +187,6 @@ impl MemBuilder {
 pub struct MemIndex {
     _keep: Keep,
     sec: Sections,
-    /// True when entry ids are exactly 0..n (dump/owned builds): `hits()`
-    /// then indexes entries directly instead of binary-searching per hit.
-    /// False for the SQLite oracle path (1-based rowids, possible gaps).
-    dense: bool,
     /// Lazily computed byte histograms of the name/path arenas — the glob
     /// prefilter picks the rarest literal byte as its seed so 1-byte-run
     /// patterns (`a?c`) scan the fewest candidates. Computed once per process
@@ -409,50 +413,6 @@ impl SortKey {
 }
 
 impl MemIndex {
-    #[cfg(feature = "sqlite")]
-    pub fn load(conn: &Connection) -> Result<Self> {
-        let mut stmt = conn.prepare(
-            "SELECT id, path, name_l, size, mtime, ctime, flags, is_dir, frn FROM files ORDER BY id",
-        )?;
-        let mut rows = stmt.query([])?;
-        let mut entries: Vec<Entry> = Vec::new();
-        let mut paths: Vec<u8> = Vec::new();
-        let mut names: Vec<u8> = Vec::new();
-        let mut revs: Vec<u8> = Vec::new();
-        while let Some(row) = rows.next()? {
-            let id: i64 = row.get(0)?;
-            if id < 0 || id > u32::MAX as i64 {
-                anyhow::bail!("file id {id} out of u32 range");
-            }
-            let path: String = row.get(1)?;
-            let name_l: String = row.get(2)?;
-            let rev = lower_rev(&name_l);
-            let po = paths.len() as u32;
-            paths.extend_from_slice(path.as_bytes());
-            let no = names.len() as u32;
-            names.extend_from_slice(name_l.as_bytes());
-            let ro = revs.len() as u32;
-            revs.extend_from_slice(rev.as_bytes());
-            entries.push(Entry {
-                id: id as u32,
-                path_off: po,
-                path_len: path.len() as u16,
-                name_off: no,
-                name_len: name_l.len() as u16,
-                rev_off: ro,
-                rev_len: rev.len() as u16,
-                size: row.get::<_, i64>(3)? as u64,
-                mtime: row.get(4)?,
-                ctime: row.get(5)?,
-                flags: row.get::<_, i64>(6)? as u8,
-                is_dir: row.get::<_, i64>(7)? as u8,
-                frn: row.get::<_, Option<i64>>(8)?.map(|f| f as u64).unwrap_or(0),
-            });
-        }
-        let alloc = vec![0u64; entries.len()];
-        Ok(finalize(entries, paths, names, revs, alloc))
-    }
-
     /// Serialize the finished index (packed entries + arenas + permutations)
     /// as one contiguous dump. Written to a temp file then renamed, so a crash
     /// either leaves the previous dump or no dump at all.
@@ -471,9 +431,35 @@ impl MemIndex {
         }
         let mut tmp = std::ffi::OsString::from(path.as_os_str());
         tmp.push(".tmp");
-        let tmp = PathBuf::from(tmp);
-        let file =
-            File::create(&tmp).with_context(|| format!("creating temp dump {}", tmp.display()))?;
+        let mut tmp = PathBuf::from(tmp);
+        let file = match File::create(&tmp) {
+            Ok(f) => f,
+            Err(e) => {
+                // A stale temp file held open by a crashed run makes the fixed
+                // ".tmp" name unusable, and Windows reports that as a plain
+                // ACCESS_DENIED. Say exactly what the path looks like, then fall
+                // back to a pid-unique name so one leftover file cannot block
+                // every future index run.
+                eprintln!(
+                    "[save] File::create({}) failed: {e:?}; exists={} is_file={} is_dir={} \
+                     parent_exists={} cwd={:?} pid={} elevated={}",
+                    tmp.display(),
+                    tmp.exists(),
+                    tmp.is_file(),
+                    tmp.is_dir(),
+                    tmp.parent().map(|p| p.exists()).unwrap_or(false),
+                    std::env::current_dir().ok(),
+                    std::process::id(),
+                    crate::is_elevated()
+                );
+                let mut alt = tmp.clone().into_os_string();
+                alt.push(format!(".{}", std::process::id()));
+                tmp = PathBuf::from(alt);
+                eprintln!("[save] retrying with {}", tmp.display());
+                File::create(&tmp)
+                    .with_context(|| format!("creating temp dump (retry) {}", tmp.display()))?
+            }
+        };
         let mut w = BufWriter::with_capacity(1 << 21, file);
         let mut offs = [0u64; SEC + 1];
         w.write_all(&[0u8; HDR_LEN])?; // header placeholder, rewritten below
@@ -640,6 +626,11 @@ impl MemIndex {
             let names_len = (offs[3] - offs[2]) as usize;
             let revs_len = (offs[4] - offs[3]) as usize;
             anyhow::ensure!(
+                entries.iter().enumerate().all(|(i, e)| e.id == i as u32),
+                "dump entry ids are not dense: {}",
+                path.display()
+            );
+            anyhow::ensure!(
                 entries.iter().all(|e| {
                     e.path_off as usize + e.path_len as usize <= paths_len
                         && e.name_off as usize + e.name_len as usize <= names_len
@@ -723,11 +714,9 @@ impl MemIndex {
             trig_posts,
             alloc,
         };
-        let dense = is_dense(sec.entries.slice());
         Ok(MemIndex {
             _keep: Keep::Mapped(MappedData { mmap, aux }),
             sec,
-            dense,
             name_freq: OnceLock::new(),
             path_freq: OnceLock::new(),
         })
@@ -1018,39 +1007,22 @@ impl MemIndex {
                 flags: e.flags,
             });
         };
-        if self.dense {
-            // Dense ids (dump/mem builds: id == index) → direct indexing, no
-            // binary search per hit.
-            for &id in ids.iter().take(limit) {
-                let idx = id as usize;
-                if idx < self.entries.len() {
-                    push(&mut out, idx);
-                }
-            }
-        } else {
-            // The SQL-loaded oracle index carries SQLite rowids (1-based,
-            // possibly with gaps) → binary search per hit.
-            for &id in ids.iter().take(limit) {
-                let Ok(idx) = self.entries.binary_search_by_key(&id, |e| e.id) else {
-                    continue;
-                };
+        // Dump and in-memory builder ids are dense (id == entry index), so
+        // materializing a page needs no per-hit binary search.
+        for &id in ids.iter().take(limit) {
+            let idx = id as usize;
+            if idx < self.entries.len() {
                 push(&mut out, idx);
             }
         }
         out
     }
 
-    /// Entry index of an id: direct for dense dumps (id == index), a binary
-    /// search for the SQL-loaded oracle. `None` when the index does not know
-    /// the id (impossible for ids produced by [`MemIndex::search`]; the oracle
-    /// path carries rowid gaps).
+    /// Entry index of an id. Dump and in-memory builder ids are dense, so
+    /// direct indexing is sufficient; `None` protects callers from stale ids.
     fn idx_of(&self, id: u32) -> Option<usize> {
-        if self.dense {
-            let i = id as usize;
-            (i < self.entries.len()).then_some(i)
-        } else {
-            self.entries.binary_search_by_key(&id, |e| e.id).ok()
-        }
+        let i = id as usize;
+        (i < self.entries.len()).then_some(i)
     }
 
     /// Allocated bytes of entry `i`, with the same pre-v6 fallback
@@ -1122,18 +1094,10 @@ impl MemIndex {
 
     /// Exclusive upper bound of an entry id in this index.
     ///
-    /// Dense dumps and in-memory builds have `id == index`, so the entry count
-    /// is the bound. The SQL oracle loads 1-based rowids with gaps, where the
-    /// count is *not* a bound: sizing a bitmap by it silently drops the highest
-    /// id from every bitmap-based evaluation (the no-include start set,
-    /// `!flag:` complements, big sorted×sorted intersections), which is exactly
-    /// what `consistency_with_sql` caught for `!hidden:true`.
+    /// Dump and in-memory builder ids are dense, so the entry count is the
+    /// exclusive upper bound for every bitmap operation.
     fn id_cap(&self) -> u32 {
-        if self.dense {
-            self.entries.len() as u32
-        } else {
-            self.entries.last().map_or(0, |e| e.id + 1)
-        }
+        self.entries.len() as u32
     }
 
     fn all_ids(&self) -> Vec<u32> {
@@ -1238,6 +1202,13 @@ impl MemIndex {
                 }
             }
             Term::PathPrefix(p) => IdSet::Owned(self.range_by_path_prefix(p.as_bytes())),
+            Term::PathComponent(list) => {
+                let mut out: Vec<u32> = Vec::new();
+                for c in list {
+                    out = union(&out, &self.scan_path_component(c.as_bytes()));
+                }
+                IdSet::Owned(out)
+            }
             Term::Regex(pat) => IdSet::Owned(self.scan_regex(pat)),
         }
     }
@@ -1410,6 +1381,20 @@ impl MemIndex {
             .collect()
     }
 
+    /// ASCII-case-insensitive scan for `name` occupying a **whole path
+    /// component** (a leading `name` + separator, a separator-delimited middle
+    /// component, or a trailing separator + `name`). `node_modules_old` does
+    /// not match — that is the difference from [`Self::scan_paths_ci`].
+    fn scan_path_component(&self, name: &[u8]) -> Vec<u32> {
+        if name.is_empty() {
+            return Vec::new();
+        }
+        self.scan_paths_hits_bounded(name, true)
+            .iter()
+            .map(|&i| self.entries[i as usize].id)
+            .collect()
+    }
+
     /// Whole-arena CI seed scan over the path arena returning entry INDICES:
     /// one SIMD pass via `memchr2` over both case variants of the folded
     /// first byte (plain `memchr` for non-letters), folded-tail verification
@@ -1417,6 +1402,14 @@ impl MemIndex {
     /// `scan_name_hits`. Shared by the path-substring term and the glob
     /// prefilter.
     fn scan_paths_hits(&self, needle: &[u8]) -> Vec<u32> {
+        self.scan_paths_hits_bounded(needle, false)
+    }
+
+    /// Same scan, optionally requiring the hit to sit on whole path-component
+    /// boundaries (used by `skip:`). `boundary` only changes *which* hits are
+    /// accepted; the arena pass, the entry cursor and the cross-entry
+    /// false-positive handling are identical.
+    fn scan_paths_hits_bounded(&self, needle: &[u8], boundary: bool) -> Vec<u32> {
         let mut out = Vec::new();
         let arena = self.paths.slice();
         let n = self.entries.len();
@@ -1448,8 +1441,12 @@ impl MemIndex {
                 e_idx += 1;
             }
             let e = &self.entries[e_idx];
-            let end = e.path_off as usize + e.path_len as usize;
-            if abs + needle.len() <= end && ci_eq_at(arena, abs, needle) {
+            let start = e.path_off as usize;
+            let end = start + e.path_len as usize;
+            if abs + needle.len() <= end
+                && ci_eq_at(arena, abs, needle)
+                && (!boundary || path_component_at(arena, abs, needle.len(), start, end))
+            {
                 out.push(e_idx as u32);
                 from = end;
             } else {
@@ -1690,6 +1687,12 @@ fn finalize(
     let mut system_ids: Vec<u32> = Vec::new();
     let mut readonly_ids: Vec<u32> = Vec::new();
     let mut reparse_ids: Vec<u32> = Vec::new();
+    // Accelerator arrays: arena offsets in id order (monotone by construction),
+    // used to map whole-arena scan hits back to entries. They are filled by the
+    // attribute pass below — that walk already touches every entry, so a second
+    // traversal (two more 4 MB collects) is pure waste.
+    let mut name_offs: Vec<u32> = Vec::with_capacity(n);
+    let mut path_offs: Vec<u32> = Vec::with_capacity(n);
     let e: &[Entry] = &entries;
     // The trigram build is independent of the sorts/attribute pass — run it in
     // the same scope so finalize stays one parallel phase.
@@ -1705,9 +1708,12 @@ fn finalize(
             by_rev.sort_unstable_by(|&a, &b| rev_of(e, &revs, a).cmp(rev_of(e, &revs, b)));
         });
         s.spawn(|| by_size.sort_unstable_by_key(|&i| e[i as usize].size));
+        // One thread per permutation: the three time/FRN sorts used to share a
+        // single thread, which left the slowest one (by_frn, on a tuple key)
+        // gating the whole finalize phase on a machine with threads to spare.
+        s.spawn(|| by_mtime.sort_unstable_by_key(|&i| e[i as usize].mtime));
+        s.spawn(|| by_ctime.sort_unstable_by_key(|&i| e[i as usize].ctime));
         s.spawn(|| {
-            by_mtime.sort_unstable_by_key(|&i| e[i as usize].mtime);
-            by_ctime.sort_unstable_by_key(|&i| e[i as usize].ctime);
             // id tiebreak keeps the sort deterministic (dump bytes stable).
             by_frn.sort_unstable_by_key(|&i| (e[i as usize].frn, e[i as usize].id));
         });
@@ -1731,6 +1737,8 @@ fn finalize(
                 if t.flags & 8 != 0 {
                     reparse_ids.push(id);
                 }
+                name_offs.push(t.name_off);
+                path_offs.push(t.path_off);
             }
         });
         s.spawn(|| {
@@ -1738,10 +1746,6 @@ fn finalize(
         });
     });
     let (trigrams, trig_offs, trig_posts) = trig.expect("trigram build thread");
-    // Accelerator arrays: arena offsets in id order (monotone by
-    // construction), used to map whole-arena scan hits back to entries.
-    let name_offs: Vec<u32> = e.iter().map(|t| t.name_off).collect();
-    let path_offs: Vec<u32> = e.iter().map(|t| t.path_off).collect();
     MemIndex::from_owned(OwnedData {
         entries,
         paths,
@@ -1874,20 +1878,13 @@ impl MemIndex {
             trig_posts: View::from_slice(&o.trig_posts),
             alloc: Some(View::from_slice(&o.alloc)),
         };
-        let dense = is_dense(&o.entries);
         MemIndex {
             _keep: Keep::Owned(o),
             sec,
-            dense,
             name_freq: OnceLock::new(),
             path_freq: OnceLock::new(),
         }
     }
-}
-
-/// True when entry ids are exactly 0..n (id == index for every entry).
-fn is_dense(entries: &[Entry]) -> bool {
-    entries.iter().enumerate().all(|(i, e)| e.id == i as u32)
 }
 
 /// Byte view of a POD slice — Entry/u32/u8 are plain integers with no invalid
@@ -1898,7 +1895,7 @@ fn pod_bytes<T>(v: &[T]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr().cast(), std::mem::size_of_val(v)) }
 }
 
-/// Dump file path companion to the SQLite db ("index.db" → "index.db.feridx").
+/// Dump file path companion to the index base path ("index.db" → "index.db.feridx").
 pub fn dump_path(db: &Path) -> PathBuf {
     let mut p = std::ffi::OsString::from(db.as_os_str());
     p.push(".feridx");
@@ -1942,6 +1939,17 @@ fn ci_eq_at(hay: &[u8], pos: usize, needle: &[u8]) -> bool {
         .iter()
         .zip(needle)
         .all(|(h, n)| fold(*h) == *n)
+}
+
+/// True when a CI match at `[pos, pos+len)` inside the path span
+/// `[start, end)` is delimited by path separators (or the span edges) on both
+/// sides — i.e. the match covers a whole path component.
+#[inline]
+fn path_component_at(hay: &[u8], pos: usize, len: usize, start: usize, end: usize) -> bool {
+    let left_ok = pos == start || matches!(hay[pos - 1], b'\\' | b'/');
+    let right = pos + len;
+    let right_ok = right >= end || matches!(hay[right], b'\\' | b'/');
+    left_ok && right_ok
 }
 
 /// ASCII-case-insensitive byte comparison (non-ASCII compares raw).
@@ -2602,6 +2610,18 @@ mod tests {
     }
 
     #[test]
+    fn builder_folds_and_reverses_ascii_names_in_place() {
+        let mut b = MemBuilder::default();
+        b.push(r"D:\docs\ReadMe.TXT", EntryMeta::default());
+        b.push(r"D:\docs\年度报告.md", EntryMeta::default());
+        let mem = b.finish();
+
+        assert_eq!(mem.name_l_bytes(0), b"readme.txt");
+        assert_eq!(mem.rev_bytes(0), b"txt.emdaer");
+        assert_eq!(mem.name_l_bytes(1), "年度报告.md".as_bytes());
+    }
+
+    #[test]
     fn bitset_roundtrip_and_ops() {
         let n = 130u32; // spans 3 words with a masked tail
         let mut b = Bitset::new(n);
@@ -2659,63 +2679,6 @@ mod tests {
             panic!("expected Owned result")
         };
         assert_eq!(got, expect);
-    }
-
-    #[cfg(feature = "sqlite")]
-    fn build_sql() -> (tempfile::TempDir, crate::store::Store) {
-        let dir = tempfile::tempdir().unwrap();
-        let store = crate::store::Store::open(&dir.path().join("t.db")).unwrap();
-        let mut rb = store.begin_rebuild().unwrap();
-        for (path, meta) in rows() {
-            rb.insert(path, meta).unwrap();
-        }
-        rb.commit().unwrap();
-        (dir, store)
-    }
-
-    #[cfg(feature = "sqlite")]
-    #[test]
-    fn consistency_with_sql() {
-        let (_d, store) = build_sql();
-        let mem = MemIndex::load(store.conn()).unwrap();
-        let queries = [
-            "报告",
-            "rs",
-            "*.rs",
-            "ext:rs",
-            "ext:jpg",
-            "size:>1mb",
-            "size:1mb-10mb",
-            "type:dir",
-            "type:file",
-            "hidden:true",
-            "dm:thismonth",
-            r"parent:D:\proj",
-            r"path:D:\proj\src",
-            r"D:\proj\src", // bare path token → CI path-substring scan
-            "main*",
-            "*.jpg",
-            "ext:rs size:>1mb",
-            "!hidden:true",
-            "年度报告",
-        ];
-        for q in queries {
-            eprintln!("QUERY: {q}");
-            let parsed = Query::parse(q).unwrap();
-            let mem_ids = mem.search(&parsed);
-            let mem_paths: Vec<String> = mem
-                .hits(&mem_ids, 1000)
-                .into_iter()
-                .map(|h| h.path)
-                .collect();
-            let sql_hits = store.search_query(&parsed, None).unwrap();
-            let sql_paths: Vec<String> = sql_hits.hits.into_iter().map(|h| h.path).collect();
-            let mut m = mem_paths.clone();
-            let mut s = sql_paths.clone();
-            m.sort();
-            s.sort();
-            assert_eq!(m, s, "query {q}: mem vs sql mismatch");
-        }
     }
 
     #[test]

@@ -12,7 +12,7 @@ use std::ptr::null_mut;
 use anyhow::{Result, bail};
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_HANDLE_EOF, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE,
-    INVALID_HANDLE_VALUE,
+    INVALID_HANDLE_VALUE, SetLastError,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_SHARE_READ, FILE_SHARE_WRITE, GetDriveTypeW,
@@ -99,26 +99,50 @@ pub struct UsnVolume {
 }
 
 impl UsnVolume {
-    pub fn open(drive: char) -> Result<Self> {        let wide: Vec<u16> = format!(r"\\.\{drive}:")
+    pub fn open(drive: char) -> Result<Self> {
+        let wide: Vec<u16> = format!(r"\\.\{drive}:")
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
-        let handle = unsafe {
-            CreateFileW(
-                wide.as_ptr(),
-                GENERIC_READ | GENERIC_WRITE,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                null_mut(),
-                OPEN_EXISTING,
-                0,
-                null_mut(),
-            )
+        // The handle is only ever used for reads (USN journal, $MFT bitmap,
+        // ENUM_USN_DATA), yet the access mask historically asked for write
+        // access as well. When something denies that write share the whole
+        // handle fails with ERROR_ACCESS_DENIED and every reader (fer index /
+        // fer monitor) dies even though read access is available. Ask for
+        // read+write first (unchanged behaviour), then fall back to read-only
+        // and say exactly what happened.
+        let attempt = |access: u32| -> HANDLE {
+            unsafe {
+                SetLastError(0);
+                CreateFileW(
+                    wide.as_ptr(),
+                    access,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    null_mut(),
+                    OPEN_EXISTING,
+                    0,
+                    null_mut(),
+                )
+            }
         };
+        let mut handle = attempt(GENERIC_READ | GENERIC_WRITE);
         if handle == INVALID_HANDLE_VALUE {
-            bail!(
-                "cannot open volume {drive}: (error {}) — requires an elevated shell",
-                unsafe { GetLastError() }
+            let rw_err = unsafe { GetLastError() };
+            let read_only = attempt(GENERIC_READ);
+            if read_only == INVALID_HANDLE_VALUE {
+                let r_err = unsafe { GetLastError() };
+                bail!(
+                    "cannot open volume {drive}: read+write failed (error {rw_err}), \
+                     read-only failed (error {r_err}) — requires an elevated shell \
+                     (elevated={})",
+                    crate::is_elevated()
+                );
+            }
+            eprintln!(
+                "[usn] volume {drive}: read+write open failed (error {rw_err}); \
+                 continuing with a read-only handle"
             );
+            handle = read_only;
         }
         Ok(UsnVolume {
             handle,
@@ -236,10 +260,15 @@ impl UsnVolume {
             .map(|r| (r.parent_frn, r.name, r.is_dir))
     }
 
-    /// Query the USN change journal: returns `(journal_id, next_usn)`.
+    /// Query the USN change journal: `(journal_id, first_usn, next_usn)`.
     /// `FSCTL_READ_USN_JOURNAL` requires the real journal ID — passing 0
     /// fails with ERROR_INVALID_PARAMETER (87).
-    pub fn query_journal(&self) -> Result<(u64, i64)> {
+    ///
+    /// `FirstUsn` is the oldest record the journal still holds, i.e. the
+    /// **replay floor**: a stored position below it can no longer be read
+    /// (FSCTL_READ_USN_JOURNAL fails with 1181), so the changes between the two
+    /// are gone. `NextUsn` is the position to resume from.
+    pub fn journal_bounds(&self) -> Result<(u64, i64, i64)> {
         let mut jd: USN_JOURNAL_DATA_V0 = unsafe { std::mem::zeroed() };
         let mut returned = 0u32;
         let ok = self.ioctl(
@@ -257,7 +286,13 @@ impl UsnVolume {
                 unsafe { GetLastError() }
             );
         }
-        Ok((jd.UsnJournalID, jd.NextUsn))
+        Ok((jd.UsnJournalID, jd.FirstUsn, jd.NextUsn))
+    }
+
+    /// Query the USN change journal: `(journal_id, next_usn)`.
+    pub fn query_journal(&self) -> Result<(u64, i64)> {
+        let (id, _first, next) = self.journal_bounds()?;
+        Ok((id, next))
     }
 
     /// Non-blocking poll of the USN journal for changes since `start_usn`.
@@ -399,7 +434,7 @@ pub fn parse_usn_buffer(buf: &[u8]) -> Vec<UsnRecord> {
 /// (~24 bytes/record), so a 2.8M-record volume costs ~220 MB instead of the
 /// gigabytes a `Vec<String>` + `HashMap` layout would. Paths are materialized
 /// into a single reusable buffer during a DFS and handed to `on_entry`
-/// immediately (the store binds them into SQLite without keeping them).
+/// immediately (the caller consumes them without keeping a second index).
 pub struct TreeBuilder {
     drive: char,
     frn: Vec<u64>,

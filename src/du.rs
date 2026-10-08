@@ -18,8 +18,8 @@
 //!   byte pass;
 //! * aggregation runs on scoped threads over contiguous, evenly sized file
 //!   chunks and accumulates into dense per-dir atomic counters (one slot per
-//!   directory id): no per-thread maps, no merge phase, balanced load even
-//!   when one top-level directory dominates the volume.
+//!   directory in the requested subtree): no per-thread maps, no merge phase,
+//!   balanced load even when one top-level directory dominates the volume.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -91,22 +91,26 @@ pub fn scan(
 
     // --- Pass A: FRN dedup + directory index. ---
     let mut seen: HashSet<u64> = HashSet::with_capacity(ids.len());
+    // Directory ids are global entry ids and can be sparse within a subtree.
+    // Keep a compact slot-to-id map so the counters below scale with the
+    // queried subtree rather than the largest matching global id.
+    let mut dir_ids: Vec<u32> = Vec::new();
     let mut dir_hash: HashMap<u64, Vec<u32>> = HashMap::new();
     let mut uniq: Vec<(u32, u64, u64)> = Vec::new();
     let mut total: u64 = 0;
     let mut total_allocated: u64 = 0;
     let mut files: u64 = 0;
     let mut dirs_seen: u64 = 0;
-    let mut dir_max: u32 = 0;
     let mut root_present = false;
 
     for &id in &ids {
         let meta = mem.meta_at(id as usize);
         if meta.is_dir {
             let raw = mem.path_bytes(id as usize);
-            dir_hash.entry(ci_fnv(raw)).or_default().push(id);
+            let slot = dir_ids.len() as u32;
+            dir_ids.push(id);
+            dir_hash.entry(ci_fnv(raw)).or_default().push(slot);
             dirs_seen += 1;
-            dir_max = dir_max.max(id);
             root_present |= ci_eq(raw, root_bytes);
             continue;
         }
@@ -123,25 +127,42 @@ pub fn scan(
     }
 
     // --- Pass B: parallel aggregation into dense per-dir atomic counters. ---
-    // One slot per directory id — at most the largest dir id in the subtree,
-    // so small subtrees stay small. Contiguous chunks keep every thread busy
-    // even when one top-level directory dominates the volume.
+    // One compact slot per directory in this subtree. Contiguous chunks keep
+    // every thread busy even when one top-level directory dominates the volume.
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
         .min(16);
-    let dir_sizes: Vec<AtomicU64> = (0..=dir_max).map(|_| AtomicU64::new(0)).collect();
-    let dir_counts: Vec<AtomicU64> = (0..=dir_max).map(|_| AtomicU64::new(0)).collect();
-    let dir_allocs: Vec<AtomicU64> = (0..=dir_max).map(|_| AtomicU64::new(0)).collect();
+    let dir_sizes: Vec<AtomicU64> = (0..dir_ids.len()).map(|_| AtomicU64::new(0)).collect();
+    let dir_counts: Vec<AtomicU64> = (0..dir_ids.len()).map(|_| AtomicU64::new(0)).collect();
+    let dir_allocs: Vec<AtomicU64> = (0..dir_ids.len()).map(|_| AtomicU64::new(0)).collect();
     if uniq.len() < 4096 {
-        aggregate(&uniq, &dir_hash, mem, &dir_sizes, &dir_counts, &dir_allocs);
+        aggregate(
+            &uniq,
+            &dir_hash,
+            &dir_ids,
+            mem,
+            &dir_sizes,
+            &dir_counts,
+            &dir_allocs,
+        );
     } else {
         let chunk = uniq.len().div_ceil(threads).max(1);
         std::thread::scope(|s| {
             let handles: Vec<_> = uniq
                 .chunks(chunk)
                 .map(|c| {
-                    s.spawn(|| aggregate(c, &dir_hash, mem, &dir_sizes, &dir_counts, &dir_allocs))
+                    s.spawn(|| {
+                        aggregate(
+                            c,
+                            &dir_hash,
+                            &dir_ids,
+                            mem,
+                            &dir_sizes,
+                            &dir_counts,
+                            &dir_allocs,
+                        )
+                    })
                 })
                 .collect();
             for h in handles {
@@ -153,32 +174,27 @@ pub fn scan(
     // --- Assemble the child list: distinct dirs below the root, depth
     // limited, most space first. ---
     let mut children: Vec<DuEntry> = Vec::new();
-    for cands in dir_hash.values() {
-        for &did in cands {
-            let size = dir_sizes[did as usize].load(Relaxed);
-            let allocated = dir_allocs[did as usize].load(Relaxed);
-            let files = dir_counts[did as usize].load(Relaxed);
-            if size == 0 && allocated == 0 && files == 0 {
-                continue;
-            }
-            let display = mem.path_at(did as usize);
-            let raw = display.as_bytes();
-            let rel = &raw[root_bytes.len()..];
-            let depth = rel
-                .iter()
-                .filter(|&&b| b == b'\\' || b == b'/')
-                .count();
-            if depth == 0 {
-                continue; // the measured root itself
-            }
-            children.push(DuEntry {
-                path: display,
-                size,
-                allocated,
-                files,
-                depth,
-            });
+    for (slot, &did) in dir_ids.iter().enumerate() {
+        let size = dir_sizes[slot].load(Relaxed);
+        let allocated = dir_allocs[slot].load(Relaxed);
+        let files = dir_counts[slot].load(Relaxed);
+        if size == 0 && allocated == 0 && files == 0 {
+            continue;
         }
+        let display = mem.path_at(did as usize);
+        let raw = display.as_bytes();
+        let rel = &raw[root_bytes.len()..];
+        let depth = rel.iter().filter(|&&b| b == b'\\' || b == b'/').count();
+        if depth == 0 {
+            continue; // the measured root itself
+        }
+        children.push(DuEntry {
+            path: display,
+            size,
+            allocated,
+            files,
+            depth,
+        });
     }
     children.sort_unstable_by(|a, b| {
         let (ka, kb) = if by_allocated {
@@ -215,6 +231,7 @@ pub fn scan(
 fn aggregate(
     chunk: &[(u32, u64, u64)],
     dir_hash: &HashMap<u64, Vec<u32>>,
+    dir_ids: &[u32],
     mem: &MemIndex,
     dir_sizes: &[AtomicU64],
     dir_counts: &[AtomicU64],
@@ -233,11 +250,11 @@ fn aggregate(
             h = h.wrapping_mul(FNV_PRIME);
             i += 1;
             if (b == b'\\' || b == b'/')
-                && let Some(did) = lookup_dir(dir_hash, mem, &raw[..i - 1], before)
+                && let Some(slot) = lookup_dir(dir_hash, dir_ids, mem, &raw[..i - 1], before)
             {
-                dir_sizes[did as usize].fetch_add(size, Relaxed);
-                dir_counts[did as usize].fetch_add(1, Relaxed);
-                dir_allocs[did as usize].fetch_add(allocated, Relaxed);
+                dir_sizes[slot].fetch_add(size, Relaxed);
+                dir_counts[slot].fetch_add(1, Relaxed);
+                dir_allocs[slot].fetch_add(allocated, Relaxed);
             }
         }
     }
@@ -246,12 +263,19 @@ fn aggregate(
 /// Directory lookup by folded-path hash: the hash is only a prefilter, exact
 /// equality re-checks the bytes (ASCII-folded) — hash collisions cannot
 /// corrupt results.
-fn lookup_dir(map: &HashMap<u64, Vec<u32>>, mem: &MemIndex, prefix: &[u8], hash: u64) -> Option<u32> {
+fn lookup_dir(
+    map: &HashMap<u64, Vec<u32>>,
+    dir_ids: &[u32],
+    mem: &MemIndex,
+    prefix: &[u8],
+    hash: u64,
+) -> Option<usize> {
     let cands = map.get(&hash)?;
     cands
         .iter()
         .copied()
-        .find(|&did| ci_eq(mem.path_bytes(did as usize), prefix))
+        .find(|&slot| ci_eq(mem.path_bytes(dir_ids[slot as usize] as usize), prefix))
+        .map(|slot| slot as usize)
 }
 
 /// FNV-1a over ASCII-folded bytes (non-ASCII compares raw, matching the
@@ -435,6 +459,41 @@ mod tests {
         assert_eq!(r.files, 1);
         assert_eq!(r.children.len(), 1); // only "a" holds the file
         assert!(r.children[0].path.ends_with("a"));
+    }
+
+    #[test]
+    fn late_small_subtree_uses_sparse_global_ids() {
+        const UNRELATED: usize = 25_000;
+        let mut b = MemBuilder::default();
+        for i in 0..UNRELATED {
+            b.push(&format!(r"D:\unrelated\{i}.bin"), file(1, i as u64 + 1));
+        }
+        b.push(r"D:\target", dir());
+        b.push(r"D:\target\sub", dir());
+        b.push(r"D:\target\sub\payload.bin", file_alloc(7, 3, 99_999));
+        let mem = b.finish();
+
+        let report = scan(&mem, r"D:\target", None, 10, false).unwrap();
+        assert_eq!(report.total_bytes, 7);
+        assert_eq!(report.total_allocated, 3);
+        assert_eq!(report.files, 1);
+        assert_eq!(report.dirs, 1);
+        assert_eq!(report.entries, 3);
+        assert_eq!(report.children.len(), 1);
+        assert_eq!(report.children[0].path, r"D:\target\sub");
+        assert_eq!(report.children[0].size, 7);
+        assert_eq!(report.children[0].allocated, 3);
+        assert_eq!(report.children[0].files, 1);
+        assert!(mem.find_path_idx(r"D:\target").unwrap() >= UNRELATED);
+        let old_slots = mem.find_path_idx(r"D:\target\sub").unwrap() + 1;
+        let compact_slots = report.dirs as usize + 1; // include the measured root
+        let counter_bytes = 3 * std::mem::size_of::<AtomicU64>();
+        eprintln!(
+            "du counter storage estimate: {old} B by global id -> {new} B by subtree slots",
+            old = old_slots * counter_bytes,
+            new = compact_slots * counter_bytes,
+        );
+        assert!(compact_slots < old_slots);
     }
 
     #[test]

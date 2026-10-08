@@ -1,7 +1,6 @@
 //! Index build orchestration: raw $MFT scan (full parity, admin) with USN and
 //! walk as *explicit* degraded alternatives. The build streams straight into
-//! the in-memory engine — SQLite is no longer on the build path (it survives
-//! only as a dev-time query oracle in the test suite).
+//! the in-memory engine.
 
 use std::time::Instant;
 
@@ -101,13 +100,20 @@ pub fn build(volumes: &[VolumeInfo], method: Method) -> Result<(BuildReport, Mem
             stats.method, vol.drive, vol.label.trim(), stats.files, stats.dirs, stats.skipped
         );
     }
-    report.elapsed_ms = start.elapsed().as_millis();
     report.method = if methods.len() == 1 {
         methods[0].to_string()
     } else {
         "mixed".to_string()
     };
+    let finalize_start = Instant::now();
     let mem = mb.finish();
+    let finalize_ms = finalize_start.elapsed().as_millis();
+    report.elapsed_ms = start.elapsed().as_millis();
+    eprintln!(
+        "[index] finalized {} entries in {finalize_ms} ms (total {} ms)",
+        mem.len(),
+        report.elapsed_ms
+    );
     Ok((report, mem))
 }
 

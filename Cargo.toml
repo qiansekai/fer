@@ -26,10 +26,6 @@ regex = { version = "1.12", default-features = false, features = ["std", "perf"]
 # Already a transitive dep of `regex` (same version from the lockfile cache):
 # used only for literal extraction in the regex prefilter (regex_literal_seeds).
 regex-syntax = "0.8"
-# SQLite survives only as a dev/test cross-validation oracle (feature `sqlite`).
-# It is NOT on the production path — gating it means `cargo build`/`check`
-# never compiles the bundled C at all (fat LTO also keeps it out of fer.exe).
-rusqlite = { version = "0.40.2", features = ["bundled"], optional = true }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 # Only rt-multi-thread (Runtime::new/block_on) + net (TcpListener) are used;
@@ -47,12 +43,6 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
-
-[features]
-default = []
-# Test-only SQL oracle: store.rs, MemIndex::load, and the integration test.
-# `cargo test --features sqlite` runs the full suite incl. mem-vs-SQL checks.
-sqlite = ["dep:rusqlite"]
 
 [dev-dependencies]
 tempfile = "3"

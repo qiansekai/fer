@@ -26,7 +26,9 @@
   启动后台预热线程（首查不付 mmap 缺页税）与 **dump 热重载**——`fer monitor` /
   `fer index` 重写 dump 后 2 秒内自动换引擎，常驻进程无需重启
 - **过滤查询语言**：`ext: size: dm: dc: type: hidden: parent: path: name:` + 取反（`!`）
-- **实时监控**：`fer monitor` 轮询 USN 日志增量更新（删除按 FRN 直删）
+- **实时监控**：`fer monitor` 轮询 USN 日志增量更新（删除按 FRN 直删，内容写大即时刷新
+  元数据）；变更经推送 overlay **秒级**出现在 CLI 与网页；停机重启自动从 pending 快照续跑，
+  不必手工 `fer index`
 - **HTTP API + 网页 UI** + **CLI --json**（稳定 JSON 输出，面向 agent）
 - **Everything 架构**：`fer index` 一次性把全盘扫进内存引擎并写成
   **FERIDX01 dump**（~1.2GB）；查询全靠内存的排序数组 + **整 arena 单遍 SIMD 扫描**
@@ -35,8 +37,7 @@
   **mmap 零拷贝加载**（serve 启动 ~135ms，CLI 全查询 17-336ms）
 - **USN 实时监控**（需管理员）：monitor 常驻内存增量追平 + 防抖写回 dump，
   崩溃后从 USN 日志回放，无需重建
-- 测试闭环：单元 + 端到端 + 真实卷（`#[ignore]`）+ SQLite 交叉验证
-  （store.rs 保留为测试参照 oracle，不进生产路径）
+- 测试闭环：单元 + 端到端 + 真实卷（`#[ignore]`）
 
 ## 构建
 
@@ -51,7 +52,7 @@ npm install
 npm run build                       # vite-plugin-singlefile → 单文件 dist/index.html（供 include_str! 嵌入）
 cd ..
 cargo build --release               # 产物 target-gnu/release/fer.exe（独立 exe，无运行时依赖）
-cargo build --profile min-size      # 精简编译（opt-level="z"；默认构建不编译 SQLite）
+cargo build --profile min-size      # 精简编译（opt-level="z"）
 ```
 
 没有 MSVC 链接器时可走 GNU 工具链：
@@ -109,6 +110,7 @@ fer --db <path> <cmd>                # 自定义索引库（默认 %LOCALAPPDATA
 | `hidden:` `system:` `readonly:` `reparse:` | 属性过滤（后接 true/false/1/0） |
 | `parent:D:\proj` | 该目录**子树**（前缀匹配） |
 | `path:D:\proj\src` | 全路径前缀 |
+| `skip:.git,node_modules` | 排除路径中含该**完整组件**的条目（`skip:.git` 不匹配 `a.gitb`）；恒为排除，带不带 `!` 都一样 |
 | `!term` | 取反（与其它 term 为 AND 关系） |
 
 > 注意：`parent:`/`path:` 是**朴素前缀**——`parent:D:\proj` 也会匹配 `D:\proj2`。
@@ -204,7 +206,6 @@ src/
 │               加载，多 term 并行求值；子串/正则走整 arena 单遍 SIMD 扫描
 │               （跨 entry 边界伪命中过滤 + 命中后跳到 entry 尾），≥3 字节
 │               子串先走 trigram posting 交集（候选超集，逐候选 memmem 校验）
-├── store.rs    SQLite + FTS5 oracle（feature `sqlite`，仅测试交叉验证，不进生产路径）
 ├── query.rs    查询语言解析（纯函数 + 单测）
 ├── indexer.rs  build 编排：auto = 纯 MFT；usn/walk 仅显式可选（非提权硬拒绝）
 ├── monitor.rs  USN 日志轮询 → 内存增量（FRN 直删）+ 防抖写回 dump
@@ -216,8 +217,7 @@ src/
 ## 测试
 
 ```bash
-cargo test                                        # 单元 + 端到端（默认不含 SQLite）
-cargo test --features sqlite                      # 追加 SQL 交叉验证 oracle（store.rs / mem 一致性）
+cargo test                                        # 单元 + 端到端
 cargo test --test live_volume -- --ignored --nocapture   # 真实卷（需管理员）
 # 自定义盘符：$env:FER_TEST_DRIVE='D'
 ```
@@ -256,7 +256,7 @@ CLI 全查询 3 轮取 min/median（每项均含进程启动 + dump mmap 加载�
 - **serve**：mmap 零拷贝加载，**进程启动→listening 86ms**；HTTP 查询（热页）：
   `ext:rs` 2ms、`type:dir` 1ms、`dm:thisweek type:file` 34ms；逻辑内存 1021MB /
   RSS 350MB（mmap 按需缺页，OS 可回收）
-- **CLI**：全查询 **0-294ms**（含进程启动 + dump 加载），无 SQLite、无门控
+- **CLI**：全查询 **0-294ms**（含进程启动 + dump 加载）
 - **du**（2026-09 新增，v2 并行化）：子树 `D:\proj`（9.5 万条目/1.8 万目录）
   **35ms**；整卷 `D:\`（300 万条目/57 万目录）聚合 **~1.2s**（v1 顺序版 2.9s）。实现 =
   FRN 去重 → 连续均分块 scoped 线程并行 → 稠密 per-dir 原子计数（无 merge 阶段），
@@ -310,7 +310,7 @@ serve 稳态（引擎侧 took_ms，预热线程 + TTL 缓存）：`ext:rs` 0ms�
 单次调用 ~1-5ms（无 serve 自动回退本地）。
 - **monitor**：USN 增量进内存（by_frn 二分 + 删除影子集），默认每 60s 防抖写回 dump
   （`--flush-secs` 可调）；flush 走 arena 直达复用（零 String 分配）
-- **编译**：`cargo check` 6.9s（不编 SQLite）；release ~3.3MB / `--profile min-size`
+- **编译**：`cargo check` 6.9s；release ~3.3MB / `--profile min-size`
   （opt-level="z" 体积更小）；clippy 0 警告（含 `--all-targets`）
 
 ### 2026-09-08 本机复测（7 卷 · 457.8 万条 · dump v6 · serve 常驻）
@@ -337,8 +337,7 @@ serve 稳态（引擎侧 took_ms，预热线程 + TTL 缓存）：`ext:rs` 0ms�
 - **转发结果与本地加载逐条一致**：`--db` 强制绕过转发对照三组查询，total 完全相同
 - 索引重建不中断查询：`fer index` 原子替换 dump，serve 的 mtime 轮询 2 s 内热重载
   新引擎（实测日志 `dump changed on disk — reloaded 4577969 entries`），无需重启
-- 测试/静态检查：`cargo test` 132 passed / 0 failed（+3 ignored 需管理员；
-  `--features sqlite` 追加 SQL 交叉验证后 144 passed / 0 failed），
+- 测试/静态检查：`cargo test` 库测试 146 passed、集成测试 1 passed（+3 ignored 需管理员），
   `cargo clippy --all-targets -- -D warnings` 0 警告
 
 ### 2026-09-29 索引质量大修后复测（本机 6 卷 · 4,223,028 条 · dump v6）
@@ -373,12 +372,15 @@ serve 稳态（引擎侧 took_ms，预热线程 + TTL 缓存）：`ext:rs` 0ms�
   （报错退出，可用 `--method usn|walk` 显式降级，会丢失硬链接别名与大小/时间元数据）
 - FAT/exFAT 卷不支持（监控需 ReadDirectoryChangesW，列为 TODO）
 - 多卷监控：`fer monitor --volume D,H`（逗号列表或重复传参），每卷独立 journal 与位置边车；
-  单卷打不开只记日志并每 60 s 重试。USN 日志回卷会报错并提示重建（期间的变更靠
-  `fer index` 补；重启后从边车位置重放，边车不领先 dump 是刻意取舍）
-- 原地写大不更新 size：USN mask 未含 `DATA_OVERWRITE`/`DATA_EXTEND`，文件被写大后
-  `size:` 过滤与 du 要等下次 flush（≤`--flush-secs`）或 `fer rebuild` 才反映
-- 变更推送带自适应节流（单批 >2000 条或距上次 >30 s 时合并发送）：磁盘并发写入量大时
-  overlay 最迟约 30 s 刷新一次（小 pending 时 <15 s）
+  单卷打不开只记日志并每 60 s 重试。**停机重启不再需要手工 `fer index`**：monitor 每轮把
+  未落盘的变更集与内存位置写成 `<dump>.pending` 快照（内容变化即写，写速率按集合大小自适应
+  限流），重启时先恢复它、再从该位置重放 journal；只有连快照位置都被日志回收时才自动重扫
+  $MFT 重建（实测 24 s），日志逐条明示
+- USN 日志窗口很短：本机 D: 的 32 MB 日志在忙时约 20-30 s 绕一圈（实测窗口 ≈ 3600 万 USN
+  单位）。因此「dump 位置」通常落后于日志，这是刻意的——dump 每 `--flush-secs` 才重写一次，
+  重启靠 pending 快照而非 dump 位置；任何「危险就提前重写 dump」的策略都会变成每轮写 1.6 GB
+- 变更推送无节流：每轮序列化整个 pending 集并与上次发送的字节比较，有变化立即发、无变化不发
+  （≈空闲不写，忙时每轮都发）；新接收方接入时清空记忆，必定收到一份全量快照
 - `desc` 只认小写字面量（`desc=TRUE` 报 `ok:false`；`sort` 键本身大小写不敏感）
 - release 构建开 `target-cpu=native`（本机专用，exe 不可分发）
 

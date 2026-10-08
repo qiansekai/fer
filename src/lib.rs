@@ -11,8 +11,6 @@
 //! * `control` — loopback control channel: on-demand flush / rebuild of a running monitor
 //! * `meta`    — index-quality sidecar (`<dump>.meta`: method, volumes, built_at)
 //! * `server`  — HTTP API (axum) with a minimal web UI
-//! * `store`   — SQLite + FTS5 (feature `sqlite`, dev/test oracle only —
-//!   production queries never touch it)
 
 pub mod control;
 pub mod du;
@@ -25,8 +23,6 @@ pub mod monitor;
 pub mod push;
 pub mod query;
 pub mod server;
-#[cfg(feature = "sqlite")]
-pub mod store;
 pub mod usn;
 pub mod walk;
 
