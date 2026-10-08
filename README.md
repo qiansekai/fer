@@ -337,7 +337,7 @@ serve 稳态（引擎侧 took_ms，预热线程 + TTL 缓存）：`ext:rs` 0ms�
 - **转发结果与本地加载逐条一致**：`--db` 强制绕过转发对照三组查询，total 完全相同
 - 索引重建不中断查询：`fer index` 原子替换 dump，serve 的 mtime 轮询 2 s 内热重载
   新引擎（实测日志 `dump changed on disk — reloaded 4577969 entries`），无需重启
-- 测试/静态检查：`cargo test` 库测试 146 passed、集成测试 1 passed（+3 ignored 需管理员），
+- 测试/静态检查：`cargo test` 库测试 147 passed、集成测试 1 passed（+3 ignored 需管理员），
   `cargo clippy --all-targets -- -D warnings` 0 警告
 
 ### 2026-09-29 索引质量大修后复测（本机 6 卷 · 4,223,028 条 · dump v6）
