@@ -312,7 +312,7 @@ pub async fn serve(
     // single-shot runs skip this (warm-up would exceed the query cost), and
     // `--no-warm` skips it here as well.
     if warm {
-        let warm_mem = state.mem.read().unwrap().clone();
+        let warm_mem = state.mem.read().unwrap_or_else(|e| e.into_inner()).clone();
         std::thread::spawn(move || warm_mem.warm());
     }
     // Real-time change feed: `fer monitor` broadcasts the changes it has already
@@ -332,15 +332,15 @@ pub async fn serve(
                         // Lock order: overlay, then mem. `apply` resolves the
                         // removal paths against this engine, so both are read
                         // under one lock (see AppState::overlay).
-                        let mut g = ov.write().unwrap();
-                        let mem = feed_mem.read().unwrap().clone();
+                        let mut g = ov.write().unwrap_or_else(|e| e.into_inner());
+                        let mem = feed_mem.read().unwrap_or_else(|e| e.into_inner()).clone();
                         for b in batches {
                             g.apply(b, &mem);
                         }
                     }
                     // Results changed: drop cached responses so the next query
                     // reflects the new state instead of a 3 s-old answer.
-                    drain_cache.lock().unwrap().clear();
+                    drain_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
                 }
                 std::thread::sleep(Duration::from_millis(500));
             }
@@ -385,14 +385,14 @@ pub async fn serve(
                     // of the *old* engine, and a query must never observe the
                     // new engine paired with those ids (or the reverse).
                     if let Ok(mut o) = reload_overlay.write() {
-                        *reload_slot.write().unwrap() = Arc::new(fresh);
+                        *reload_slot.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(fresh);
                         // The reloaded dump already contains every change the
                         // overlay was carrying; keeping them would shadow the
                         // fresh snapshot (and permanently pin entries the dump
                         // has since dropped).
                         o.reset();
                     }
-                    reload_cache.lock().unwrap().clear();
+                    reload_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
                     eprintln!("[server] dump changed on disk — reloaded {n} entries");
                 }
                 Err(e) => eprintln!("[server] dump reload failed (keeping old engine): {e:#}"),
@@ -672,7 +672,7 @@ async fn search(State(st): State<AppState>, Query(q): Query<SearchQuery>) -> Jso
         None => format!("{}|{}", q.q, limit),
         Some(k) => format!("{}|{}|{}|{}", q.q, limit, k.as_str(), desc),
     };
-    if let Some(mut hit) = st.cache.lock().unwrap().get(&cache_key) {
+    if let Some(mut hit) = st.cache.lock().unwrap_or_else(|e| e.into_inner()).get(&cache_key) {
         // The cached payload carries the ORIGINAL computation's took_ms —
         // refresh it so the field reflects this request (near-zero on a hit).
         if let Some(obj) = hit.as_object_mut() {
@@ -691,8 +691,8 @@ async fn search(State(st): State<AppState>, Query(q): Query<SearchQuery>) -> Jso
     // Both locks are taken here, overlay first (see AppState::overlay), so the
     // engine and the overlay's removal ids are one consistent generation.
     let (mem, delta, removed_ids) = {
-        let ov = st.overlay.read().unwrap();
-        let mem = st.mem.read().unwrap().clone();
+        let ov = st.overlay.read().unwrap_or_else(|e| e.into_inner());
+        let mem = st.mem.read().unwrap_or_else(|e| e.into_inner()).clone();
         let (delta, removed_ids) = ov.snapshot();
         (mem, delta, removed_ids)
     };
@@ -713,7 +713,7 @@ async fn search(State(st): State<AppState>, Query(q): Query<SearchQuery>) -> Jso
         }),
         Err(e) => json!({ "ok": false, "error": e.to_string() }),
     };
-    st.cache.lock().unwrap().insert(cache_key, resp.clone());
+    st.cache.lock().unwrap_or_else(|e| e.into_inner()).insert(cache_key, resp.clone());
     Json(resp)
 }
 
@@ -730,7 +730,7 @@ async fn du(State(st): State<AppState>, Query(q): Query<DuQuery>) -> Json<Value>
     let t = std::time::Instant::now();
     // Bind the Arc clone to a local first: the whole-volume scan can take
     // ~1s, so it runs off the executor via spawn_blocking.
-    let mem = st.mem.read().unwrap().clone();
+    let mem = st.mem.read().unwrap_or_else(|e| e.into_inner()).clone();
     let path = q.path.clone();
     let outcome = tokio::task::spawn_blocking(move || {
         crate::du::scan(
@@ -756,7 +756,7 @@ async fn du(State(st): State<AppState>, Query(q): Query<DuQuery>) -> Json<Value>
 }
 
 async fn stats(State(st): State<AppState>) -> Json<Value> {
-    let mem = st.mem.read().unwrap().clone();
+    let mem = st.mem.read().unwrap_or_else(|e| e.into_inner()).clone();
     let files = mem.file_count() as u64;
     let dirs = mem.dir_count() as u64;
     let dump = dump_path(&st.db);
@@ -787,15 +787,15 @@ async fn rescan(State(st): State<AppState>) -> Json<Value> {
         // write lock. The rebuilt dump already contains the pending changes,
         // and the overlay's removal ids name entries of the old engine.
         {
-            let mut o = overlay.write().unwrap();
-            *slot.write().unwrap() = Arc::new(mem);
+            let mut o = overlay.write().unwrap_or_else(|e| e.into_inner());
+            *slot.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(mem);
             o.reset();
         }
         Ok(json!({ "report": report, "dump": dump.to_string_lossy() }))
     })
     .await;
     // The index changed under the cache — drop every cached response.
-    st.cache.lock().unwrap().clear();
+    st.cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
     match outcome {
         Ok(Ok(v)) => Json(json!({ "ok": true, "result": v })),
         Ok(Err(e)) => Json(json!({ "ok": false, "error": format!("{e:#}") })),

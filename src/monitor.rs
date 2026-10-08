@@ -983,156 +983,215 @@ fn revive_down(vols: &mut Vec<Watched>, down: &mut Vec<Down>, sidecar: &Path) {
 /// When push_addr is set a [crate::push::Broadcaster] is bound there and every
 /// applied batch is broadcast to connected fer serve receivers, so a long-lived
 /// server can show newly created files without waiting for a flush.
-pub fn run(
-    mut mem: MemIndex,
+/// Everything one monitor run owns.
+///
+/// This used to be one ~500-line function where the startup path, the per-volume
+/// round, the broadcast/persist step, the flush decision and the control commands
+/// all shared forty locals — which buried the ordering rules (broadcast and
+/// snapshot BEFORE the flush; pending cleared only after it) in a very long body.
+/// The split changes no behaviour: the same statements run in the same order.
+struct Monitor {
+    mem: MemIndex,
+    vols: Vec<Watched>,
+    down: Vec<Down>,
     drives: Vec<char>,
     dump: PathBuf,
+    usn_sidecar: PathBuf,
+    snap_path: PathBuf,
     interval: Duration,
     flush_every: Duration,
-    push_addr: Option<String>,
-    control_addr: Option<String>,
-) -> Result<()> {
-    // Hard gate: the USN journal needs an elevated token; failing 10 minutes
-    // into a watch (or worse, flushing a broken index) is worse than refusing
-    // up front.
-    if !crate::is_elevated() {
-        bail!("fer monitor needs an elevated process (USN journal access)");
-    }
-    let drives = normalize_drives(&drives);
-    if drives.is_empty() {
-        bail!("fer monitor needs at least one volume to watch (--volume D,H)");
-    }
-    let feed = push_addr.as_deref().and_then(crate::push::Broadcaster::bind);
-    // Control channel: lets fer flush / fer rebuild poke this loop instead of
-    // waiting out --flush-secs. Optional — a monitor without it still watches
-    // the journal.
-    let control = control_addr.as_deref().and_then(crate::control::bind);
-    let usn_sidecar = usn_sidecar_path(&dump);
+    feed: Option<crate::push::Broadcaster>,
+    control: Option<std::sync::mpsc::Receiver<crate::control::Request>>,
+    /// Position the *dump on disk* was stamped with, per volume. Every flush and
+    /// rebuild moves it; while it lags the journal's FirstUsn a crash would leave
+    /// a hole a replay cannot fill.
+    durable: HashMap<char, i64>,
+    last_flush: std::time::Instant,
+    last_report: std::time::Instant,
+    /// Armed so the first round with changes writes a snapshot immediately.
+    last_snapshot: std::time::Instant,
+    /// Set when a round had something to broadcast but could not (catch-up), so
+    /// the first live round pushes the accumulated set even if it applied nothing.
+    push_stale: bool,
+    push_stale_since: Option<std::time::Instant>,
+    any_catching_up: bool,
+    catchup_rounds: u32,
+}
 
-    // Open every requested volume up front. A volume that cannot be opened is
-    // logged and retried in the background instead of aborting the run: one
-    // unplugged stick must not cost the other volumes their real-time index.
-    // Only a run with nothing to watch at all is an error.
-    let mut vols: Vec<Watched> = Vec::new();
-    let mut down: Vec<Down> = Vec::new();
-    for &drive in &drives {
-        match open_watched(drive, &usn_sidecar) {
-            Ok(w) => vols.push(w),
-            Err(e) => {
-                eprintln!(
-                    "[monitor] cannot watch {drive}: {e} — continuing with the other volumes \
-                     (retrying every {OPEN_RETRY:?})"
-                );
-                down.push(Down { drive, reason: e.to_string(), last_try: std::time::Instant::now() });
+impl Monitor {
+    /// Elevation gate, optional feeds, open every requested volume, then restore
+    /// the pending snapshot and heal a journal recycled while we were down.
+    fn open(
+        mem: MemIndex,
+        drives: Vec<char>,
+        dump: PathBuf,
+        interval: Duration,
+        flush_every: Duration,
+        push_addr: Option<String>,
+        control_addr: Option<String>,
+    ) -> Result<Self> {
+        // Hard gate: the USN journal needs an elevated token; failing 10 minutes
+        // into a watch (or worse, flushing a broken index) is worse than refusing
+        // up front.
+        if !crate::is_elevated() {
+            bail!("fer monitor needs an elevated process (USN journal access)");
+        }
+        let drives = normalize_drives(&drives);
+        if drives.is_empty() {
+            bail!("fer monitor needs at least one volume to watch (--volume D,H)");
+        }
+        let feed = push_addr.as_deref().and_then(crate::push::Broadcaster::bind);
+        // Control channel: lets fer flush / fer rebuild poke this loop instead of
+        // waiting out --flush-secs. Optional — a monitor without it still watches
+        // the journal.
+        let control = control_addr.as_deref().and_then(crate::control::bind);
+        let usn_sidecar = usn_sidecar_path(&dump);
+
+        // Open every requested volume up front. A volume that cannot be opened is
+        // logged and retried in the background instead of aborting the run: one
+        // unplugged stick must not cost the other volumes their real-time index.
+        // Only a run with nothing to watch at all is an error.
+        let mut vols: Vec<Watched> = Vec::new();
+        let mut down: Vec<Down> = Vec::new();
+        for &drive in &drives {
+            match open_watched(drive, &usn_sidecar) {
+                Ok(w) => vols.push(w),
+                Err(e) => {
+                    eprintln!(
+                        "[monitor] cannot watch {drive}: {e} — continuing with the other volumes \
+                         (retrying every {OPEN_RETRY:?})"
+                    );
+                    down.push(Down { drive, reason: e.to_string(), last_try: std::time::Instant::now() });
+                }
             }
         }
-    }
-    if vols.is_empty() {
-        bail!(
-            "cannot watch any of the requested volumes ({}) — {}",
-            drive_list(&drives),
-            down.iter().map(|d| format!("{}: {}", d.drive, d.reason)).collect::<Vec<_>>().join("; ")
-        );
-    }
-    let positions: Vec<(char, i64)> = vols.iter().map(|v| (v.drive, v.start)).collect();
-    eprintln!("[monitor] watching {} (dump: {})", watch_summary(&positions), dump.display());
-    // A restart replays from the last *flush* position, which on this machine is
-    // up to --flush-secs (1800 s) of disk churn — about 8.6M USN units measured.
-    // Say so up front: "my new file is not searchable" otherwise looks like a
-    // broken feed instead of a queue that is still draining.
-    for v in vols.iter() {
-        if v.lag > CATCHUP_LAG {
-            eprintln!(
-                "[monitor] {}: {} USN units behind the journal — replaying the backlog first; \
-                 change push stays off until caught up",
-                v.drive, v.lag
+        if vols.is_empty() {
+            bail!(
+                "cannot watch any of the requested volumes ({}) — {}",
+                drive_list(&drives),
+                down.iter().map(|d| format!("{}: {}", d.drive, d.reason)).collect::<Vec<_>>().join("; ")
             );
-        }
-    }
-    // Periodic self-report. The monitor once ballooned to 20 GB of private
-    // commit within a minute of starting while applied counts and the push
-    // batch both looked normal, and nothing in the logs said which structure was
-    // growing. These are the only per-round collections that can; printing their
-    // sizes makes the culprit identifiable the next time it happens.
-    let mut last_flush = std::time::Instant::now();
-    let mut last_report = std::time::Instant::now();
-    let mut any_catching_up = vols.iter().any(|v| v.catching_up);
-    let mut catchup_rounds: u32 = 0;
-    // Set when a round had something to broadcast but could not (catch-up), so
-    // the first live round pushes the accumulated set even if it applied nothing
-    // itself. push_stale_since bounds how long that hold-back may last.
-    let mut push_stale = false;
-    let mut push_stale_since: Option<std::time::Instant> = None;
-    let snap_path = snapshot_path(&dump);
-    // Armed so the first round with changes writes a snapshot immediately: the
-    // window between a change and its first snapshot is the only part a restart
-    // can still lose to a recycled journal.
-    let mut last_snapshot = std::time::Instant::now() - SNAPSHOT_MIN_GAP;
-    // Position the *dump on disk* was stamped with, per volume. Every flush and
-    // rebuild moves it; while it lags the journal's FirstUsn a crash would leave
-    // a hole a replay cannot fill — see the loop below.
-    let mut durable: HashMap<char, i64> = vols
-        .iter()
-        .map(|w| (w.drive, read_usn(&usn_sidecar, w.drive).unwrap_or(w.start)))
-        .collect();
-    // Restore the change set the previous run had not flushed yet, and resume
-    // from the position it recorded instead of the dump position — the journal
-    // has usually recycled the latter long before the next flush is due.
-    if let Some(snap) = read_snapshot(&snap_path) {
-        let mut appends = 0usize;
-        let mut removals = 0usize;
-        for w in vols.iter_mut() {
-            if let Some(&(_, pos)) = snap.positions.iter().find(|(d, _)| *d == w.drive) {
-                w.start = pos;
-                w.lag = journal_lag(&w.vol, w.start);
-                w.catching_up = w.lag > CATCHUP_LAG;
-            }
-            let (a, r) = apply_snapshot(
-                &snap,
-                w.drive,
-                |path| mem.find_path_idx(path).map(|i| i as u32),
-                &mut w.pending,
-            );
-            appends += a;
-            removals += r;
         }
         let positions: Vec<(char, i64)> = vols.iter().map(|v| (v.drive, v.start)).collect();
+        eprintln!("[monitor] watching {} (dump: {})", watch_summary(&positions), dump.display());
+        // A restart replays from the last *flush* position, which on this machine
+        // is up to --flush-secs (1800 s) of disk churn — about 8.6M USN units
+        // measured. Say so up front: "my new file is not searchable" otherwise
+        // looks like a broken feed instead of a queue that is still draining.
+        for v in vols.iter() {
+            if v.lag > CATCHUP_LAG {
+                eprintln!(
+                    "[monitor] {}: {} USN units behind the journal — replaying the backlog first; \
+                     change push stays off until caught up",
+                    v.drive, v.lag
+                );
+            }
+        }
+
+        let mut m = Monitor {
+            mem,
+            vols,
+            down,
+            drives,
+            usn_sidecar,
+            snap_path: snapshot_path(&dump),
+            dump,
+            interval,
+            flush_every,
+            feed,
+            control,
+            durable: HashMap::new(),
+            last_flush: std::time::Instant::now(),
+            last_report: std::time::Instant::now(),
+            last_snapshot: std::time::Instant::now() - SNAPSHOT_MIN_GAP,
+            push_stale: false,
+            push_stale_since: None,
+            any_catching_up: false,
+            catchup_rounds: 0,
+        };
+        let durable: HashMap<char, i64> = m
+            .vols
+            .iter()
+            .map(|w| (w.drive, read_usn(&m.usn_sidecar, w.drive).unwrap_or(w.start)))
+            .collect();
+        m.durable = durable;
+        m.any_catching_up = m.vols.iter().any(|v| v.catching_up);
+        m.restore_snapshot();
+        m.heal_gaps();
+        Ok(m)
+    }
+
+    /// Restore the change set the previous run had not flushed yet, and resume
+    /// from the position it recorded instead of the dump position — the journal
+    /// has usually recycled the latter long before the next flush is due.
+    fn restore_snapshot(&mut self) {
+        let Some(snap) = read_snapshot(&self.snap_path) else {
+            return;
+        };
+        let mut appends = 0usize;
+        let mut removals = 0usize;
+        {
+            let mem = &self.mem;
+            for w in self.vols.iter_mut() {
+                if let Some(&(_, pos)) = snap.positions.iter().find(|(d, _)| *d == w.drive) {
+                    w.start = pos;
+                    w.lag = journal_lag(&w.vol, w.start);
+                    w.catching_up = w.lag > CATCHUP_LAG;
+                }
+                let (a, r) = apply_snapshot(
+                    &snap,
+                    w.drive,
+                    |path| mem.find_path_idx(path).map(|i| i as u32),
+                    &mut w.pending,
+                );
+                appends += a;
+                removals += r;
+            }
+        }
+        let positions: Vec<(char, i64)> = self.vols.iter().map(|v| (v.drive, v.start)).collect();
         eprintln!(
             "[monitor] restored {appends} appended + {removals} removed pending changes from {} \
              (resuming at {})",
-            snap_path.display(),
+            self.snap_path.display(),
             pos_summary(&positions)
         );
-        // The restored entries are not in the dump the server loaded, so the
-        // first live round must broadcast them even if it applies nothing new.
-        push_stale = true;
-        push_stale_since = Some(std::time::Instant::now());
+        // The restored entries are not in the dump the server loaded, so the first
+        // live round must broadcast them even if it applies nothing new.
+        self.push_stale = true;
+        self.push_stale_since = Some(std::time::Instant::now());
     }
-    // A restart normally replays from `durable`. When the journal was recycled
-    // while the monitor was down that position is gone and the changes in
-    // between would stay invisible forever ("files created last night are not
-    // searchable, and waiting does not help"). Rebuild those volumes up front
-    // instead of replaying a hole.
-    if let Some(msg) = auto_heal_gaps(&mut mem, &mut vols, &drives, &dump, &usn_sidecar) {
-        last_flush = std::time::Instant::now();
-        for v in vols.iter() {
-            durable.insert(v.drive, v.start);
+
+    /// A restart normally replays from `durable`. When the journal was recycled
+    /// while the monitor was down that position is gone and the changes in between
+    /// would stay invisible forever ("files created last night are not searchable,
+    /// and waiting does not help"). Rebuild those volumes up front instead of
+    /// replaying a hole.
+    fn heal_gaps(&mut self) {
+        let healed = auto_heal_gaps(
+            &mut self.mem,
+            &mut self.vols,
+            &self.drives,
+            &self.dump,
+            &self.usn_sidecar,
+        );
+        if let Some(msg) = healed {
+            self.last_flush = std::time::Instant::now();
+            for v in self.vols.iter() {
+                self.durable.insert(v.drive, v.start);
+            }
+            eprintln!("[monitor] {msg}");
         }
-        eprintln!("[monitor] {msg}");
     }
-    loop {
-        // Wait out the poll interval, or wake immediately for a control command:
-        // recv_timeout replaces the plain sleep so fer rebuild is served at once
-        // rather than on the next tick.
-        //
-        // While any volume is far behind, skip the wait so its backlog drains at
-        // back-to-back round rate instead of one round per interval (the
-        // 5-minute catch-up measured on this machine). A burst budget plus a
-        // short breather keep a permanently lagging journal from spinning the
-        // CPU for hours, and the breather still polls the control channel, so
-        // neither fer flush nor fer rebuild can be starved by catch-up.
-        let wait = poll_wait(any_catching_up, &mut catchup_rounds, interval);
-        let mut command: Option<crate::control::Request> = match &control {
+
+    /// Wait out the poll interval, or wake immediately for a control command:
+    /// `recv_timeout` replaces the plain sleep so `fer rebuild` is served at once
+    /// rather than on the next tick. The caller passes a zero wait while a volume
+    /// is far behind, so its backlog drains back-to-back; the burst budget plus
+    /// breather (see poll_wait) keep that from spinning the CPU for hours, and the
+    /// breather still polls the control channel, so neither `fer flush` nor
+    /// `fer rebuild` can be starved by catch-up.
+    fn wait_for_command(&self, wait: Duration) -> Option<crate::control::Request> {
+        match &self.control {
             Some(rx) => match rx.recv_timeout(wait) {
                 Ok(req) => Some(req),
                 Err(RecvTimeoutError::Timeout) => None,
@@ -1145,17 +1204,16 @@ pub fn run(
                 thread::sleep(wait);
                 None
             }
-        };
-        // A volume that was unplugged when the monitor started (or went away
-        // since) is retried here, so it rejoins the watch set on its own.
-        revive_down(&mut vols, &mut down, &usn_sidecar);
+        }
+    }
 
-        // One round over every watched volume. The catch-up timers are taken per
-        // volume so the estimate measures that volume's replay rate rather than
-        // the round as a whole.
+    /// One round over every watched volume. The catch-up timers are taken per
+    /// volume so the estimate measures that volume's replay rate rather than the
+    /// round as a whole.
+    fn poll_volumes(&mut self) -> ApplyStats {
         let mut round_stats = ApplyStats::default();
         let mut failed: Vec<(usize, String)> = Vec::new();
-        for (i, w) in vols.iter_mut().enumerate() {
+        for (i, w) in self.vols.iter_mut().enumerate() {
             let round_t0 = std::time::Instant::now();
             let round_from = w.start;
             let (next, records) = match poll_volume(w) {
@@ -1167,10 +1225,9 @@ pub fn run(
             };
             // A wrapped journal (NextUsn behind the position we started from) was
             // deleted and recreated: the records just read belong to a different
-            // journal generation, so they are dropped and the volume resyncs.
-            // The single-volume monitor used to abort here, which in a
-            // multi-volume run would take the healthy volumes down with the
-            // broken one.
+            // journal generation, so they are dropped and the volume resyncs. The
+            // single-volume monitor used to abort here, which in a multi-volume run
+            // would take the healthy volumes down with the broken one.
             if !records.is_empty() && next < w.start {
                 eprintln!(
                     "[monitor] {}: USN journal wrapped (next={next} < start={}) — syncing to the \
@@ -1187,19 +1244,19 @@ pub fn run(
                 // Path resolution and the metadata stat are the only things that
                 // need the volume, so they are injected here and apply_records
                 // itself stays a pure function of the records + the index + the
-                // change set of *this* volume.
+                // change set of *this* volume. Only the kernel fallback is
+                // injected: the index and the pending appends are consulted first
+                // (resolve_parent). The walk gets a throwaway map because
+                // kernel_parent owns the validated per-volume memo — a poisoned
+                // entry has to be droppable.
                 let Watched { drive, vol, cache, pending, .. } = &mut *w;
-                // Only the kernel fallback is injected: the index and the
-                // pending appends are consulted first (resolve_parent). The walk
-                // gets a throwaway map because kernel_parent owns the validated
-                // per-volume memo — a poisoned entry has to be droppable.
                 let mut stat_fn = |path: &str, is_dir: bool, frn: u64| stat_meta(path, is_dir, frn);
                 let mut kernel = |frn: u64| {
                     let mut walk = |f: u64| resolve_path(vol, *drive, f, &mut HashMap::new());
                     kernel_parent(frn, cache, &mut walk, &mut stat_fn)
                 };
                 let mut stat = |path: &str, is_dir: bool, frn: u64| stat_meta(path, is_dir, frn);
-                stats = apply_records(&mem, *drive, &records, pending, &mut kernel, &mut stat);
+                stats = apply_records(&self.mem, *drive, &records, pending, &mut kernel, &mut stat);
             }
             if next != w.start {
                 w.start = next;
@@ -1215,11 +1272,11 @@ pub fn run(
                     w.drive, stats.applied, w.start
                 );
             }
-            // Measure the backlog *after* applying: NextUsn minus the position
-            // just applied is exactly what is left to replay. While it stays
-            // above the threshold this volume (and therefore the round) does not
-            // wait out interval and the change feed is paused — see should_push
-            // for why that pause is bounded.
+            // Measure the backlog *after* applying: NextUsn minus the position just
+            // applied is exactly what is left to replay. While it stays above the
+            // threshold this volume (and therefore the round) does not wait out
+            // interval and the change feed is paused — see should_push for why that
+            // pause is bounded.
             w.lag = journal_lag(&w.vol, w.start);
             let was_catching_up = w.catching_up;
             w.catching_up = w.lag > CATCHUP_LAG;
@@ -1228,8 +1285,8 @@ pub fn run(
                     w.last_catchup_log = std::time::Instant::now() - CATCHUP_LOG_EVERY;
                 }
                 if w.last_catchup_log.elapsed() >= CATCHUP_LOG_EVERY {
-                    // Replay rate of the round that just finished, so the
-                    // estimate tracks the machine instead of a hardcoded guess.
+                    // Replay rate of the round that just finished, so the estimate
+                    // tracks the machine instead of a hardcoded guess.
                     let secs = round_t0.elapsed().as_secs_f64().max(0.001);
                     let rate = ((w.start - round_from).max(0) as f64 / secs).max(1.0);
                     eprintln!(
@@ -1246,238 +1303,286 @@ pub fn run(
             if w.cache.len() > 1_000_000 {
                 w.cache.clear();
             }
-            // The refresh memo is per round: a file written again next round
-            // must be re-stat'ed.
+            // The refresh memo is per round: a file written again next round must
+            // be re-stat'ed.
             w.pending.refreshed.clear();
         }
         // Volumes that could not be read are taken out of the watch set (their
         // dump entries stay untouched) and retried by revive_down.
         for (i, reason) in failed.into_iter().rev() {
-            let w = vols.remove(i);
+            let w = self.vols.remove(i);
             eprintln!(
                 "[monitor] {}: reading the USN journal failed ({reason}) — dropping it from the \
                  watch set; its entries stay indexed and it is retried every {OPEN_RETRY:?}",
                 w.drive
             );
-            down.push(Down { drive: w.drive, reason, last_try: std::time::Instant::now() });
+            self.down.push(Down { drive: w.drive, reason, last_try: std::time::Instant::now() });
         }
-        any_catching_up = vols.iter().any(|v| v.catching_up);
-        if any_catching_up {
-            catchup_rounds = catchup_rounds.saturating_add(1);
+        self.any_catching_up = self.vols.iter().any(|v| v.catching_up);
+        if self.any_catching_up {
+            self.catchup_rounds = self.catchup_rounds.saturating_add(1);
         } else {
-            catchup_rounds = 0;
+            self.catchup_rounds = 0;
         }
+        round_stats
+    }
 
-        let mut flushed = false;
-        // kept, written, removed, appended — for the flush log line, which is
-        // printed after the borrow of the per-volume pending sets has ended.
-        let mut flush_report = (0usize, 0usize, 0usize, 0usize);
-        {
-            // The flush and the broadcast both treat the per-volume change sets
-            // as one batch. Borrowed, never copied — this is re-read every round.
-            let refs: Vec<&Pending> = vols.iter().map(|v| &v.pending).collect();
-            let merged = MergedPending::new(&refs);
-            if last_report.elapsed() >= Duration::from_secs(60) {
-                let lags: Vec<(char, i64)> = vols.iter().map(|v| (v.drive, v.lag)).collect();
-                let cache_len: usize = vols.iter().map(|v| v.cache.len()).sum();
-                eprintln!(
-                    "[monitor] stats: mem={} appended={} removed={} frns={} cache={} \
-                     resolve_fail={} stat_fail={} stat_gone={} alloc_fail={} lag={}",
-                    mem.len(),
-                    merged.appended_len(),
-                    merged.removed_len(),
-                    merged.frns_len(),
-                    cache_len,
-                    round_stats.resolve_fail,
-                    round_stats.stat_fail,
-                    round_stats.stat_gone,
-                    round_stats.alloc_fail,
-                    lag_summary(&lags)
-                );
-                last_report = std::time::Instant::now();
-            }
-            // Broadcast the pending set BEFORE the flush decision: removed holds
-            // indices into the *current* index, so the paths must be resolved
-            // while that index is still the authoritative one (flush rebuilds
-            // it).
-            if let Some(f) = &feed {
-                let dirty = round_stats.applied > 0 || push_stale;
-                let held_for = push_stale_since.map_or(Duration::ZERO, |t| t.elapsed());
-                if dirty && should_push(dirty, any_catching_up, held_for) {
-                    let batch = build_batch(&mem, &merged);
-                    if !batch.is_empty() {
-                        f.send(&batch);
-                        push_stale = false;
-                        push_stale_since = None;
-                    }
-                } else if dirty {
-                    // A set held back during catch-up is carried into the first
-                    // live round, so catching up cannot leave the receiver
-                    // without the changes accumulated while the feed was off.
-                    push_stale = true;
-                    push_stale_since.get_or_insert_with(std::time::Instant::now);
-                }
-            }
-            // Persist the pending set before the flush decision — `removed`
-            // holds indices into the *current* index, which the flush rebuilds.
-            // A successful flush deletes the file again (the dump then holds
-            // everything it described).
-            // Rough serialized size of the snapshot, used to keep its write rate
-            // bounded as the pending set grows.
-            let est_bytes =
-                (merged.appended_len() as u64) * 128 + (merged.removed_len() as u64) * 80;
-            let gap = SNAPSHOT_MIN_GAP.max(Duration::from_secs(est_bytes / SNAPSHOT_BYTES_PER_SEC));
-            if !merged.is_empty()
-                && round_stats.applied > 0
-                && last_snapshot.elapsed() >= gap
-            {
-                let snap = PendingSnapshot {
-                    v: SNAPSHOT_VERSION,
-                    positions: vols.iter().map(|v| (v.drive, v.start)).collect(),
-                    removed: merged
-                        .removed()
-                        .filter_map(|i| {
-                            let i = i as usize;
-                            (i < mem.len())
-                                .then(|| String::from_utf8_lossy(mem.path_bytes(i)).into_owned())
-                        })
-                        .collect(),
-                    appended: merged
-                        .appended()
-                        .map(|(p, m)| crate::push::AppendEntry::new(p.clone(), *m))
-                        .collect(),
-                };
-                match write_snapshot(&snap_path, &snap) {
-                    Ok(()) => eprintln!(
-                        "[monitor] pending snapshot: {} appended + {} removed @ {}",
-                        snap.appended.len(),
-                        snap.removed.len(),
-                        pos_summary(&snap.positions)
-                    ),
-                    Err(e) => eprintln!("[monitor] pending snapshot failed: {e}"),
-                }
-                last_snapshot = std::time::Instant::now();
-            }
-            let pending_changes = !merged.is_empty();
-            // Nothing pending: the dump already holds everything the index has,
-            // so the stored position may advance to the live one without
-            // rewriting the whole dump. That keeps a restart's replay window as
-            // short as possible and makes the automatic-rebuild path rare.
-            if !pending_changes {
-                let positions: Vec<(char, i64)> =
-                    vols.iter().map(|v| (v.drive, v.start)).collect();
-                if positions.iter().any(|&(d, p)| durable.get(&d) != Some(&p)) {
-                    write_usns(&usn_sidecar, &positions)?;
-                    for &(d, p) in &positions {
-                        durable.insert(d, p);
-                    }
-                }
-            }
-            // The only early-flush trigger is an explicit `fer flush`. The
-            // journal's replay window on a busy volume is only tens of seconds,
-            // so "flush before the journal recycles the dump position" would
-            // rewrite the whole dump every round; the pending snapshot is what
-            // keeps a restart from losing changes instead.
-            let force_flush = matches!(
-                command.as_ref().map(|r| r.cmd),
-                Some(crate::control::Cmd::Flush)
+    /// Everything that must run *before* the flush decision, in this order: the
+    /// periodic stats line, the broadcast, then the pending snapshot. The last two
+    /// come first because their `removed` set holds indices into the *current*
+    /// index, which the flush is about to rebuild.
+    fn publish(&mut self, round_stats: ApplyStats) {
+        // Periodic self-report. The monitor once ballooned to 20 GB of private
+        // commit within a minute while applied counts and the push batch both
+        // looked normal, and nothing in the logs said which structure was growing.
+        // These are the only per-round collections that can; printing their sizes
+        // makes the culprit identifiable the next time it happens.
+        let refs: Vec<&Pending> = self.vols.iter().map(|v| &v.pending).collect();
+        let merged = MergedPending::new(&refs);
+        if self.last_report.elapsed() >= Duration::from_secs(60) {
+            let lags: Vec<(char, i64)> = self.vols.iter().map(|v| (v.drive, v.lag)).collect();
+            let cache_len: usize = self.vols.iter().map(|v| v.cache.len()).sum();
+            eprintln!(
+                "[monitor] stats: mem={} appended={} removed={} frns={} cache={} \
+                 resolve_fail={} stat_fail={} stat_gone={} alloc_fail={} lag={}",
+                self.mem.len(),
+                merged.appended_len(),
+                merged.removed_len(),
+                merged.frns_len(),
+                cache_len,
+                round_stats.resolve_fail,
+                round_stats.stat_fail,
+                round_stats.stat_gone,
+                round_stats.alloc_fail,
+                lag_summary(&lags)
             );
-            let due = pending_changes && (last_flush.elapsed() >= flush_every || force_flush);
+            self.last_report = std::time::Instant::now();
+        }
+        if let Some(f) = &self.feed {
+            let dirty = round_stats.applied > 0 || self.push_stale;
+            let held_for = self.push_stale_since.map_or(Duration::ZERO, |t| t.elapsed());
+            if dirty && should_push(dirty, self.any_catching_up, held_for) {
+                let batch = build_batch(&self.mem, &merged);
+                if !batch.is_empty() {
+                    f.send(&batch);
+                    self.push_stale = false;
+                    self.push_stale_since = None;
+                }
+            } else if dirty {
+                // A set held back during catch-up is carried into the first live
+                // round, so catching up cannot leave the receiver without the
+                // changes accumulated while the feed was off.
+                self.push_stale = true;
+                self.push_stale_since.get_or_insert_with(std::time::Instant::now);
+            }
+        }
+        // Persist the pending set before the flush decision. A successful flush
+        // deletes the file again (the dump then holds everything it described).
+        // The rough serialized size keeps the snapshot's write rate bounded as the
+        // pending set grows.
+        let est_bytes = (merged.appended_len() as u64) * 128 + (merged.removed_len() as u64) * 80;
+        let gap = SNAPSHOT_MIN_GAP.max(Duration::from_secs(est_bytes / SNAPSHOT_BYTES_PER_SEC));
+        if !merged.is_empty() && round_stats.applied > 0 && self.last_snapshot.elapsed() >= gap {
+            let snap = PendingSnapshot {
+                v: SNAPSHOT_VERSION,
+                positions: self.vols.iter().map(|v| (v.drive, v.start)).collect(),
+                removed: merged
+                    .removed()
+                    .filter_map(|i| {
+                        let i = i as usize;
+                        (i < self.mem.len())
+                            .then(|| String::from_utf8_lossy(self.mem.path_bytes(i)).into_owned())
+                    })
+                    .collect(),
+                appended: merged
+                    .appended()
+                    .map(|(p, m)| crate::push::AppendEntry::new(p.clone(), *m))
+                    .collect(),
+            };
+            match write_snapshot(&self.snap_path, &snap) {
+                Ok(()) => eprintln!(
+                    "[monitor] pending snapshot: {} appended + {} removed @ {}",
+                    snap.appended.len(),
+                    snap.removed.len(),
+                    pos_summary(&snap.positions)
+                ),
+                Err(e) => eprintln!("[monitor] pending snapshot failed: {e}"),
+            }
+            self.last_snapshot = std::time::Instant::now();
+        }
+    }
+
+    /// Advance the stored position while nothing is pending, then flush if due.
+    /// Returns whether a flush ran, which the control reply needs.
+    ///
+    /// The only early-flush trigger is an explicit `fer flush`: the journal's
+    /// replay window on a busy volume is only tens of seconds, so "flush before the
+    /// journal recycles the dump position" would rewrite the whole dump every round.
+    fn flush_if_due(&mut self, command: Option<&crate::control::Request>) -> Result<bool> {
+        let mut flushed = false;
+        let mut report = (0usize, 0usize, 0usize, 0usize);
+        {
+            let refs: Vec<&Pending> = self.vols.iter().map(|v| &v.pending).collect();
+            let merged = MergedPending::new(&refs);
+            let pending_changes = !merged.is_empty();
+            // Nothing pending: the dump already holds everything the index has, so
+            // the stored position may advance to the live one without rewriting the
+            // whole dump. That keeps a restart's replay window as short as possible
+            // and makes the automatic-rebuild path rare.
+            if !pending_changes {
+                let positions: Vec<(char, i64)> = self.vols.iter().map(|v| (v.drive, v.start)).collect();
+                if positions.iter().any(|&(d, p)| self.durable.get(&d) != Some(&p)) {
+                    write_usns(&self.usn_sidecar, &positions)?;
+                    for &(d, p) in &positions {
+                        self.durable.insert(d, p);
+                    }
+                }
+            }
+            let force_flush = matches!(command.map(|r| r.cmd), Some(crate::control::Cmd::Flush));
+            let due = pending_changes && (self.last_flush.elapsed() >= self.flush_every || force_flush);
             if due {
-                let kept = mem.len() - merged.removed_len() + merged.appended_len();
+                let kept = self.mem.len() - merged.removed_len() + merged.appended_len();
                 let n_removed = merged.removed_len();
                 let n_appended = merged.appended_len();
-                // flush returns the index it just built — a heap Owned copy of
-                // the whole volume (~1.4 GB here). The file it wrote is
-                // byte-identical, so re-map the dump instead of keeping that copy
-                // alive: the old mmap is dropped anyway, the new one costs ~1 ms,
-                // and its pages come straight from the page cache the writer just
-                // populated. On the (unlikely) reload failure keep the owned copy
-                // — correctness first, memory second.
-                let owned = flush(&mem, &merged, &dump)?;
+                // flush returns the index it just built — a heap Owned copy of the
+                // whole volume (~1.4 GB here). The file it wrote is byte-identical,
+                // so re-map the dump instead of keeping that copy alive: the old
+                // mmap is dropped anyway, the new one costs ~1 ms, and its pages
+                // come straight from the page cache the writer just populated. On
+                // the (unlikely) reload failure keep the owned copy — correctness
+                // first, memory second.
+                let owned = flush(&self.mem, &merged, &self.dump)?;
                 // kept is what the loop above *intended* to write; owned.len() is
                 // what the builder actually produced. They diverge when the source
                 // index contains entries the arena writes cannot round-trip (an
                 // inflated or span-corrupt dump), so log both plus the pending-set
-                // sizes: a shrinking mem across flushes with a small removed is
-                // the signature of that, and it was invisible before this line.
+                // sizes: a shrinking mem across flushes with a small removed is the
+                // signature of that, and it was invisible before this line.
                 let written = owned.len();
-                mem = MemIndex::load_dump(&dump).unwrap_or(owned);
-                // Only now — the dump is on disk — may the sidecar move forward:
-                // a position ahead of the dump it was replayed from would lose the
-                // changes between the two. Every watched volume writes its own
-                // line, and none of them overwrites another's.
-                let positions: Vec<(char, i64)> = vols.iter().map(|v| (v.drive, v.start)).collect();
-                write_usns(&usn_sidecar, &positions)?;
+                self.mem = MemIndex::load_dump(&self.dump).unwrap_or(owned);
+                // Only now — the dump is on disk — may the sidecar move forward: a
+                // position ahead of the dump it was replayed from would lose the
+                // changes between the two. Every watched volume writes its own line,
+                // and none of them overwrites another's.
+                let positions: Vec<(char, i64)> = self.vols.iter().map(|v| (v.drive, v.start)).collect();
+                write_usns(&self.usn_sidecar, &positions)?;
                 for &(drive, usn) in &positions {
-                    durable.insert(drive, usn);
+                    self.durable.insert(drive, usn);
                 }
-                flush_report = (kept, written, n_removed, n_appended);
-                clear_snapshot(&snap_path);
+                report = (kept, written, n_removed, n_appended);
+                clear_snapshot(&self.snap_path);
                 flushed = true;
             }
         }
         if flushed {
             // The dump now carries every volume's pending set.
-            for v in vols.iter_mut() {
+            for v in self.vols.iter_mut() {
                 v.pending.clear();
             }
-            push_stale = false;
-            push_stale_since = None;
-            last_flush = std::time::Instant::now();
+            self.push_stale = false;
+            self.push_stale_since = None;
+            self.last_flush = std::time::Instant::now();
             eprintln!(
                 "[monitor] flushed: kept={} written={} (mem={} removed={} appended={}) -> {}",
-                flush_report.0,
-                flush_report.1,
-                mem.len(),
-                flush_report.2,
-                flush_report.3,
-                dump.display()
+                report.0,
+                report.1,
+                self.mem.len(),
+                report.2,
+                report.3,
+                self.dump.display()
             );
         }
-        if let Some(req) = command.take() {
-            let msg = match req.cmd {
-                crate::control::Cmd::Flush => {
-                    if flushed {
-                        format!("ok: flushed {} entries to {}", mem.len(), dump.display())
-                    } else {
-                        "ok: no pending changes (the dump already matches the journal)".to_string()
-                    }
+        Ok(flushed)
+    }
+
+    /// Serve one control request (`fer flush` / `fer status` / `fer rebuild`).
+    fn handle_command(&mut self, req: crate::control::Request, flushed: bool) {
+        let msg = match req.cmd {
+            crate::control::Cmd::Flush => {
+                if flushed {
+                    format!("ok: flushed {} entries to {}", self.mem.len(), self.dump.display())
+                } else {
+                    "ok: no pending changes (the dump already matches the journal)".to_string()
                 }
-                crate::control::Cmd::Status => {
-                    let refs: Vec<&Pending> = vols.iter().map(|v| &v.pending).collect();
-                    let merged = MergedPending::new(&refs);
-                    let positions: Vec<(char, i64)> =
-                        vols.iter().map(|v| (v.drive, v.start)).collect();
-                    format!(
-                        "ok: mem={} appended={} removed={} retired_frns={} usn={} \
-                         last_flush={}s ago",
-                        mem.len(),
-                        merged.appended_len(),
-                        merged.removed_len(),
-                        merged.frns_len(),
-                        pos_summary(&positions),
-                        last_flush.elapsed().as_secs()
-                    )
-                }
-                crate::control::Cmd::Rebuild => {
-                    match rebuild_watched(&mut mem, &mut vols, &drives, &dump, &usn_sidecar) {
-                        Ok(msg) => {
-                            push_stale = false;
-                            push_stale_since = None;
-                            last_flush = std::time::Instant::now();
-                            for v in vols.iter() {
-                                durable.insert(v.drive, v.start);
-                            }
-                            msg
+            }
+            crate::control::Cmd::Status => {
+                let refs: Vec<&Pending> = self.vols.iter().map(|v| &v.pending).collect();
+                let merged = MergedPending::new(&refs);
+                let positions: Vec<(char, i64)> = self.vols.iter().map(|v| (v.drive, v.start)).collect();
+                format!(
+                    "ok: mem={} appended={} removed={} retired_frns={} usn={} last_flush={}s ago",
+                    self.mem.len(),
+                    merged.appended_len(),
+                    merged.removed_len(),
+                    merged.frns_len(),
+                    pos_summary(&positions),
+                    self.last_flush.elapsed().as_secs()
+                )
+            }
+            crate::control::Cmd::Rebuild => {
+                match rebuild_watched(
+                    &mut self.mem,
+                    &mut self.vols,
+                    &self.drives,
+                    &self.dump,
+                    &self.usn_sidecar,
+                ) {
+                    Ok(msg) => {
+                        self.push_stale = false;
+                        self.push_stale_since = None;
+                        self.last_flush = std::time::Instant::now();
+                        for v in self.vols.iter() {
+                            self.durable.insert(v.drive, v.start);
                         }
-                        Err(e) => format!("err: rebuild failed: {e}"),
+                        msg
                     }
+                    Err(e) => format!("err: rebuild failed: {e}"),
                 }
-            };
-            let _ = req.reply.send(msg);
+            }
+        };
+        let _ = req.reply.send(msg);
+    }
+
+    fn run_loop(&mut self) -> Result<()> {
+        loop {
+            let catching_up = self.any_catching_up;
+            let wait = poll_wait(catching_up, &mut self.catchup_rounds, self.interval);
+            let mut command = self.wait_for_command(wait);
+            // A volume that was unplugged when the monitor started (or went away
+            // since) is retried here, so it rejoins the watch set on its own.
+            revive_down(&mut self.vols, &mut self.down, &self.usn_sidecar);
+            let round_stats = self.poll_volumes();
+            self.publish(round_stats);
+            let flushed = self.flush_if_due(command.as_ref())?;
+            if let Some(req) = command.take() {
+                self.handle_command(req, flushed);
+            }
         }
     }
+}
+
+/// Watch one or more volumes forever: every interval each volume's journal is
+/// polled and applied to the in-memory index, and the index is flushed to dump
+/// every flush_every seconds whenever changes are pending. The in-memory index is
+/// authoritative between flushes and stays cross-volume — only the journal state
+/// is per volume.
+///
+/// Volumes that cannot be opened are logged and retried rather than aborting the
+/// run; only a run with nothing at all to watch fails up front.
+///
+/// When push_addr is set a [crate::push::Broadcaster] is bound there and every
+/// applied batch is broadcast to connected fer serve receivers, so a long-lived
+/// server can show newly created files without waiting for a flush.
+pub fn run(
+    mem: MemIndex,
+    drives: Vec<char>,
+    dump: PathBuf,
+    interval: Duration,
+    flush_every: Duration,
+    push_addr: Option<String>,
+    control_addr: Option<String>,
+) -> Result<()> {
+    Monitor::open(mem, drives, dump, interval, flush_every, push_addr, control_addr)?.run_loop()
 }
 
 /// Whether an indexed path (raw arena bytes, original case) lives on `drive`.
