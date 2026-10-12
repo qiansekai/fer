@@ -118,9 +118,13 @@ impl Overlay {
         let prev = std::mem::replace(&mut self.removed, Arc::new(removed));
         for e in b.append {
             let k = fold_lower(&e.p);
-            if self.removed.contains(&k) {
-                continue; // deleted after being created, within the same window
-            }
+            // A path may legitimately sit in both sets: the monitor's upsert
+            // (create / rename / refresh) retires the stale entry and appends
+            // the fresh one under the same path. Dropping the append here made
+            // the file invisible — `removed_ids` filtered the dump copy out and
+            // the delta no longer carried it. Measured on the live overlay
+            // before the fix: 121 of 121 intersect paths existed on disk, e.g. a
+            // real `poolkeeper.db-shm` that `--db` found and serve did not.
             if self.appended.len() >= OVERLAY_MAX {
                 self.saturated = true;
                 break;
@@ -594,10 +598,10 @@ fn search_overlay(
     // The overlay holds everything `fer monitor` has applied since the last
     // dump flush. Query it first so a file created seconds ago lands on page
     // one — the snapshot alone would not have it at all until the next flush
-    // (1800 s by default). No removal filter is needed on this side:
-    // `Overlay::apply` drops any append whose folded path is also in the
-    // batch's removal set, so the delta and the removal set are disjoint by
-    // construction (and there is a test pinning that).
+    // (1800 s by default). No removal filter is needed on this side: a path in
+    // the removal set is the stale dump entry a fresh append replaced (the
+    // monitor's upsert), and a path it really deleted never gets an append, so
+    // the delta is the newer truth for every path it holds.
     if let Some(d) = delta {
         let dids = d.search(q);
         total += dids.len() as u64;
@@ -1030,14 +1034,31 @@ mod tests {
         assert!(!ov.removed.contains(r"d:\docs\readme.txt"));
     }
 
-    /// A path created and deleted inside one monitor window is dropped outright
-    /// (it is in the batch's removal set, so it never enters the delta) — the
-    /// property that keeps deleted files from coming back through the overlay.
+    /// A path that is retired *and* re-appended in one batch is the monitor's
+    /// upsert (a create/rename/refresh replacing the stale entry), so the fresh
+    /// append must survive its own removal. Dropping it hid the file completely:
+    /// the dump copy was filtered out by the removal ids and the delta no longer
+    /// carried it (measured live: an existing poolkeeper.db-shm that a direct
+    /// dump read found and serve could not).
     #[test]
-    fn append_shadowed_by_removal_is_dropped() {
+    fn upsert_path_survives_its_own_removal() {
         let mem = fixture();
         let mut ov = Overlay::default();
-        ov.apply(batch(&[r"D:\flip.txt"], &[r"D:\flip.txt"]), &mem);
+        ov.apply(batch(&[r"D:\proj\main.rs"], &[r"D:\proj\main.rs"]), &mem);
+        assert_eq!(ov.pending(), (1, 1));
+        let (delta, removed_ids) = ov.snapshot();
+        assert_eq!(removed_ids.as_slice(), &[2u32]); // the stale dump copy
+        let delta = delta.expect("the fresh append must be in the delta");
+        assert_eq!(paths(&delta.hits(&[0], 10)), vec![r"D:\proj\main.rs"]);
+    }
+
+    /// A removal with no matching append is the ordinary delete and still hides
+    /// the path outright — the property the old shadowing test stood for.
+    #[test]
+    fn removal_without_append_hides_the_path() {
+        let mem = fixture();
+        let mut ov = Overlay::default();
+        ov.apply(batch(&[], &[r"D:\proj\main.rs"]), &mem);
         assert_eq!(ov.pending(), (0, 1));
         assert!(ov.snapshot().0.is_none());
     }

@@ -101,6 +101,14 @@ const OPEN_RETRY: Duration = Duration::from_secs(60);
 /// stale during a catch-up.
 const PUSH_STALE_FORCE: Duration = Duration::from_secs(60);
 
+/// How many descendants a directory rename may migrate in memory in one round.
+///
+/// The rewrite is O(subtree) and runs inside the change-apply loop, so an
+/// unbounded one (a package cache moved across the volume) would stall the
+/// feed. Above this the volume is rebuilt from $MFT instead: bounded (measured
+/// 25 s for D:+H:) and always correct.
+const RENAME_SUBTREE_MAX: usize = 50_000;
+
 // ---------------------------------------------------------------------------
 // Pending change set
 // ---------------------------------------------------------------------------
@@ -125,6 +133,16 @@ struct Pending {
     /// busy download would cost a stat per flush instead of one per poll
     /// interval. Cleared at the end of every round and on flush.
     refreshed: HashSet<u64>,
+    /// Directories whose RENAME_OLD_NAME has been seen but whose
+    /// RENAME_NEW_NAME has not (FRN -> the path they moved away from). Windows
+    /// emits the two records separately, so the pair can straddle two journal
+    /// reads; without this memo the subtree migration has no old prefix to
+    /// rewrite from. Kept across rounds, cleared by the flush.
+    dir_old: HashMap<u64, String>,
+    /// A directory rename hit more than RENAME_SUBTREE_MAX descendants: the
+    /// in-memory rewrite was skipped and the caller must rebuild the volume
+    /// before the next flush.
+    needs_rebuild: bool,
 }
 
 impl Pending {
@@ -136,6 +154,8 @@ impl Pending {
         self.removed.clear();
         self.removed_frns.clear();
         self.refreshed.clear();
+        self.dir_old.clear();
+        self.needs_rebuild = false;
     }
 }
 
@@ -179,6 +199,14 @@ impl<'a> MergedPending<'a> {
         self.sets.iter().map(|s| s.removed_frns.len()).sum()
     }
 
+    /// Half-observed directory renames across all watched volumes (the pending
+    /// snapshot carries them over a restart).
+    fn dir_old(&self) -> impl Iterator<Item = (u64, &'a str)> + 'a {
+        self.sets
+            .iter()
+            .flat_map(|s| s.dir_old.iter().map(|(frn, path)| (*frn, path.as_str())))
+    }
+
     /// Every retired index in one set. The flush walks the whole index, and a
     /// per-entry lookup across N volumes would be N hash probes each.
     fn removed_union(&self) -> HashSet<u32> {
@@ -211,6 +239,13 @@ struct ApplyStats {
     /// also the legitimate value for a resident file, so the two are only
     /// distinguishable through this counter.
     alloc_fail: usize,
+    /// Descendants migrated by a directory rename this round (see
+    /// rewrite_subtree). NTFS raises no record for a child whose parent moves,
+    /// so this counter is the only evidence the rewrite ran.
+    subtree_moved: usize,
+    /// Directory renames whose subtree was too large to rewrite in memory; the
+    /// round that reports a non-zero value triggers a full rebuild.
+    rebuild_needed: usize,
 }
 
 /// Metadata fill for one create/rename event.
@@ -543,9 +578,25 @@ fn apply_records(
     let mut stats = ApplyStats::default();
     for r in records {
         let hard_link = r.reason & USN_REASON_HARD_LINK_CHANGE != 0;
+        let rename_old = r.reason & USN_REASON_RENAME_OLD_NAME != 0;
         // Disappearance side: delete, rename-away and hard-link change.
         if hard_link || r.reason & (USN_REASON_FILE_DELETE | USN_REASON_RENAME_OLD_NAME) != 0 {
             stats.applied += retire_aliases(mem, drive, r, pending, stat);
+        }
+        // Remember where a directory moved away *from*: the matching
+        // RENAME_NEW_NAME carries the destination and may arrive in a later
+        // batch. Only directories need this - a file's rename is complete in the
+        // record itself.
+        if rename_old
+            && r.is_dir
+            && let Some(parent) = resolve_parent(mem, drive, r.parent_frn, pending, kernel, stat)
+        {
+            let old = if parent.is_empty() {
+                format!("{drive}:\\{}", r.name)
+            } else {
+                format!("{parent}\\{}", r.name)
+            };
+            pending.dir_old.insert(r.frn, old);
         }
         let appearance =
             hard_link || r.reason & (USN_REASON_FILE_CREATE | USN_REASON_RENAME_NEW_NAME) != 0;
@@ -577,8 +628,25 @@ fn apply_records(
                             // again) and take its place with fresh metadata.
                             retire_path(mem, &path, pending);
                             drop_pending_path(pending, &path);
-                            pending.appended.push((path, s.meta));
+                            pending.appended.push((path.clone(), s.meta));
                             stats.applied += 1;
+                            // A moved directory carries its children: NTFS emits
+                            // no record for them, so the subtree is rewritten
+                            // here or every child keeps its old path forever (and
+                            // the next flush writes that ghost into the dump).
+                            if r.is_dir
+                                && r.reason & USN_REASON_RENAME_NEW_NAME != 0
+                                && let Some(old) = pending.dir_old.remove(&r.frn)
+                                && !old.eq_ignore_ascii_case(&path)
+                            {
+                                match rewrite_subtree(mem, &old, &path, pending) {
+                                    Some(n) => stats.subtree_moved += n,
+                                    None => {
+                                        stats.rebuild_needed += 1;
+                                        pending.needs_rebuild = true;
+                                    }
+                                }
+                            }
                         }
                         // A HARD_LINK_CHANGE whose link is not there any more is
                         // a link *removal*: retire the path instead of adding a
@@ -668,6 +736,19 @@ fn refresh_entry(
     };
     match stat(&path, r.is_dir, r.frn) {
         Ok(s) => {
+            // The FRN may still be indexed under an older path: a parent that
+            // moved before this monitor saw the rename leaves every child's old
+            // path behind. Retire only the ones the file system says are gone.
+            for idx in mem.find_frn_all(r.frn) {
+                let old = mem.path_at(idx as usize);
+                if old.eq_ignore_ascii_case(&path) || pending.removed.contains(&idx) {
+                    continue;
+                }
+                let meta = mem.meta_at(idx as usize);
+                if stat(&old, meta.is_dir, meta.frn.unwrap_or(r.frn)).is_err() {
+                    pending.removed.insert(idx);
+                }
+            }
             retire_path(mem, &path, pending);
             drop_pending_path(pending, &path);
             pending.appended.push((path, s.meta));
@@ -691,6 +772,69 @@ fn retire_path(mem: &MemIndex, path: &str, pending: &mut Pending) -> usize {
         }
         None => 0,
     }
+}
+
+/// Rewrite a path from the old prefix to the new one, or None when it is not a
+/// descendant of the old one.
+///
+/// The prefix comparison is ASCII-case-insensitive (the engine-wide contract)
+/// and the byte after it must be a real component boundary, so D:\proj never
+/// claims D:\proj2. The suffix keeps its display casing; ASCII-CI does not
+/// change byte length, so the suffix offset is exact.
+fn rewrite_prefixed(path: &str, old: &str, new: &str) -> Option<String> {
+    if path.len() <= old.len() || !path.is_char_boundary(old.len()) {
+        return None;
+    }
+    if !path[..old.len()].eq_ignore_ascii_case(old) {
+        return None;
+    }
+    let next = path.as_bytes()[old.len()];
+    if next != b'\\' && next != b'/' {
+        return None;
+    }
+    let mut out = String::with_capacity(new.len() + path.len() - old.len());
+    out.push_str(new);
+    out.push_str(&path[old.len()..]);
+    Some(out)
+}
+
+/// Move every indexed descendant of the old directory path under the new one in
+/// the pending set.
+///
+/// NTFS reports a directory rename only against the directory itself, so every
+/// child keeps the path it was indexed under and, because it is absent from the
+/// removal set, the next flush copies that stale path into the new dump - the
+/// ghost that survives until a rebuild. Rewriting the subtree here is what makes
+/// a moved directory (and du against its new path) correct without one.
+///
+/// Returns the number of entries migrated, or None when the subtree exceeds
+/// RENAME_SUBTREE_MAX and the caller must rebuild the volume instead.
+fn rewrite_subtree(mem: &MemIndex, old: &str, new: &str, pending: &mut Pending) -> Option<usize> {
+    let old_lc = old.to_ascii_lowercase();
+    let idxs = mem.subtree_indexes(old_lc.as_bytes());
+    if idxs.len() > RENAME_SUBTREE_MAX {
+        return None;
+    }
+    // Children created or renamed earlier in this window live only in the
+    // pending appends, so they need the same prefix rewrite in place.
+    for k in 0..pending.appended.len() {
+        if let Some(np) = rewrite_prefixed(&pending.appended[k].0, old, new) {
+            pending.appended[k].0 = np;
+        }
+    }
+    let mut moved = 0usize;
+    for idx in idxs {
+        let path = mem.path_at(idx as usize);
+        // The directory itself is upserted by the caller's appearance branch.
+        let Some(np) = rewrite_prefixed(&path, old, new) else {
+            continue;
+        };
+        if pending.removed.insert(idx) {
+            pending.appended.push((np, mem.meta_at(idx as usize)));
+            moved += 1;
+        }
+    }
+    Some(moved)
 }
 
 /// Drop a pending append at the given path (ASCII-CI). Returns 1 when one was
@@ -1351,7 +1495,8 @@ impl Monitor {
             let cache_len: usize = self.vols.iter().map(|v| v.cache.len()).sum();
             eprintln!(
                 "[monitor] stats: mem={} appended={} removed={} frns={} cache={} \
-                 resolve_fail={} stat_fail={} stat_gone={} alloc_fail={} lag={}",
+                 resolve_fail={} stat_fail={} stat_gone={} alloc_fail={} \
+                 subtree_moved={} rebuild={} lag={}",
                 self.mem.len(),
                 merged.appended_len(),
                 merged.removed_len(),
@@ -1361,6 +1506,8 @@ impl Monitor {
                 round_stats.stat_fail,
                 round_stats.stat_gone,
                 round_stats.alloc_fail,
+                round_stats.subtree_moved,
+                round_stats.rebuild_needed,
                 lag_summary(&lags)
             );
             self.last_report = std::time::Instant::now();
@@ -1404,6 +1551,10 @@ impl Monitor {
                 appended: merged
                     .appended()
                     .map(|(p, m)| crate::push::AppendEntry::new(p.clone(), *m))
+                    .collect(),
+                dir_old: merged
+                    .dir_old()
+                    .map(|(frn, path)| (frn, path.to_string()))
                     .collect(),
             };
             match write_snapshot(&self.snap_path, &snap) {
@@ -1502,6 +1653,30 @@ impl Monitor {
         Ok(flushed)
     }
 
+    /// Rebuild every watched volume from $MFT and re-base the journal positions
+    /// on the fresh dump. Shared by the control channel's rebuild and by the
+    /// oversized-directory-rename fallback in the run loop.
+    fn rebuild_now(&mut self) -> String {
+        match rebuild_watched(
+            &mut self.mem,
+            &mut self.vols,
+            &self.drives,
+            &self.dump,
+            &self.usn_sidecar,
+        ) {
+            Ok(msg) => {
+                self.push_stale = false;
+                self.push_stale_since = None;
+                self.last_flush = std::time::Instant::now();
+                for v in self.vols.iter() {
+                    self.durable.insert(v.drive, v.start);
+                }
+                msg
+            }
+            Err(e) => format!("err: rebuild failed: {e}"),
+        }
+    }
+
     /// Serve one control request (`fer flush` / `fer status` / `fer rebuild`).
     fn handle_command(&mut self, req: crate::control::Request, flushed: bool) {
         let msg = match req.cmd {
@@ -1526,26 +1701,7 @@ impl Monitor {
                     self.last_flush.elapsed().as_secs()
                 )
             }
-            crate::control::Cmd::Rebuild => {
-                match rebuild_watched(
-                    &mut self.mem,
-                    &mut self.vols,
-                    &self.drives,
-                    &self.dump,
-                    &self.usn_sidecar,
-                ) {
-                    Ok(msg) => {
-                        self.push_stale = false;
-                        self.push_stale_since = None;
-                        self.last_flush = std::time::Instant::now();
-                        for v in self.vols.iter() {
-                            self.durable.insert(v.drive, v.start);
-                        }
-                        msg
-                    }
-                    Err(e) => format!("err: rebuild failed: {e}"),
-                }
-            }
+            crate::control::Cmd::Rebuild => self.rebuild_now(),
         };
         let _ = req.reply.send(msg);
     }
@@ -1559,6 +1715,12 @@ impl Monitor {
             // since) is retried here, so it rejoins the watch set on its own.
             revive_down(&mut self.vols, &mut self.down, &self.usn_sidecar);
             let round_stats = self.poll_volumes();
+            if round_stats.rebuild_needed > 0 {
+                // The subtree was too large to rewrite in memory (see
+                // rewrite_subtree): rebuilding from $MFT is bounded and correct.
+                let msg = self.rebuild_now();
+                eprintln!("[monitor] oversized directory rename -> {msg}");
+            }
             self.publish(round_stats);
             let flushed = self.flush_if_due(command.as_ref())?;
             if let Some(req) = command.take() {
@@ -1903,6 +2065,11 @@ struct PendingSnapshot {
     removed: Vec<String>,
     /// Entries created/renamed/refreshed since the dump (upserts).
     appended: Vec<crate::push::AppendEntry>,
+    /// Half-observed directory renames (FRN -> the path moved away from). A
+    /// restart between the two records of one rename would otherwise lose the
+    /// prefix the subtree rewrite needs.
+    #[serde(default)]
+    dir_old: Vec<(u64, String)>,
 }
 
 /// `<dump>.pending` — the pending-set snapshot companion to the dump.
@@ -1972,6 +2139,11 @@ fn apply_snapshot(
         }
         pending.appended.push((e.p.clone(), e.meta()));
         appends += 1;
+    }
+    for (frn, path) in &snap.dir_old {
+        if path_on_drive(path.as_bytes(), drive) {
+            pending.dir_old.insert(*frn, path.clone());
+        }
     }
     (appends, removals)
 }
@@ -2331,6 +2503,88 @@ mod tests {
         );
     }
 
+    // -- directory rename (subtree migration) -------------------------------
+
+    #[test]
+    fn rewrite_prefixed_respects_component_boundaries() {
+        assert_eq!(
+            rewrite_prefixed(r"D:\proj\src\main.rs", r"D:\proj", r"D:\work"),
+            Some(r"D:\work\src\main.rs".to_string())
+        );
+        // A sibling whose name merely starts with the prefix is not a child.
+        assert_eq!(rewrite_prefixed(r"D:\proj2\main.rs", r"D:\proj", r"D:\work"), None);
+        // The root itself is the caller's job, not the subtree rewrite's.
+        assert_eq!(rewrite_prefixed(r"D:\proj", r"D:\proj", r"D:\work"), None);
+        // Prefix matching is ASCII-CI; the suffix keeps its display casing.
+        assert_eq!(
+            rewrite_prefixed(r"d:\PROJ\Src\Main.RS", r"D:\proj", r"D:\work"),
+            Some(r"D:\work\Src\Main.RS".to_string())
+        );
+    }
+
+    /// A directory rename has to migrate its indexed descendants. Windows raises
+    /// no record for a child when its parent moves, so without this the child
+    /// keeps the old path - and because it never enters the removal set, the next
+    /// flush copies that ghost into the dump, where only a rebuild clears it.
+    #[test]
+    fn directory_rename_migrates_the_subtree() {
+        let mut b = MemBuilder::default();
+        b.push(
+            r"D:\links",
+            EntryMeta { is_dir: true, frn: Some(PARENT), ..Default::default() },
+        );
+        b.push(r"D:\links\old", EntryMeta { is_dir: true, frn: Some(70), ..Default::default() });
+        b.push(r"D:\links\old\child.bin", meta_file(7, 71));
+        b.push(r"D:\links\old\inner\deep.bin", meta_file(9, 72));
+        b.push(r"D:\links\other.bin", meta_file(11, 73));
+        let mem = b.finish();
+
+        let mut pending = Pending::default();
+        let mut kernel = resolve_links;
+        let present = [
+            r"D:\links",
+            r"D:\links\new",
+            r"D:\links\new\child.bin",
+            r"D:\links\new\inner\deep.bin",
+            r"D:\links\other.bin",
+        ];
+        let mut stat = stat_existing(&present);
+
+        // RENAME_OLD_NAME only says where the directory came from.
+        let stats = apply_records(
+            &mem,
+            'D',
+            &[rec(70, "old", USN_REASON_RENAME_OLD_NAME, true)],
+            &mut pending,
+            &mut kernel,
+            &mut stat,
+        );
+        assert_eq!(stats.subtree_moved, 0);
+        assert_eq!(pending.dir_old.get(&70).map(String::as_str), Some(r"D:\links\old"));
+
+        // RENAME_NEW_NAME completes the pair - possibly in a later batch, which
+        // is exactly why the old side is remembered.
+        let stats = apply_records(
+            &mem,
+            'D',
+            &[rec(70, "new", USN_REASON_RENAME_NEW_NAME, true)],
+            &mut pending,
+            &mut kernel,
+            &mut stat,
+        );
+        assert_eq!(stats.subtree_moved, 2);
+        assert_eq!(stats.rebuild_needed, 0);
+        let appended: Vec<&str> = pending.appended.iter().map(|(p, _)| p.as_str()).collect();
+        assert!(appended.contains(&r"D:\links\new"), "{appended:?}");
+        assert!(appended.contains(&r"D:\links\new\child.bin"), "{appended:?}");
+        assert!(appended.contains(&r"D:\links\new\inner\deep.bin"), "{appended:?}");
+        // The sibling outside the moved directory is untouched.
+        assert!(
+            !appended.iter().any(|p| p.eq_ignore_ascii_case(r"D:\links\other.bin")),
+            "{appended:?}"
+        );
+    }
+
     // -- pending snapshot (restart without a rebuild) ------------------------
 
     fn snap_sample() -> PendingSnapshot {
@@ -2342,6 +2596,7 @@ mod tests {
                 crate::push::AppendEntry::new(r"D:\new.txt", meta_file(42, 900)),
                 crate::push::AppendEntry::new(r"H:\h.txt", meta_file(7, 901)),
             ],
+            dir_old: vec![(70, r"D:\links\old".to_string())],
         }
     }
 

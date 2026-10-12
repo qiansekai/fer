@@ -337,7 +337,7 @@ serve 稳态（引擎侧 took_ms，预热线程 + TTL 缓存）：`ext:rs` 0ms�
 - **转发结果与本地加载逐条一致**：`--db` 强制绕过转发对照三组查询，total 完全相同
 - 索引重建不中断查询：`fer index` 原子替换 dump，serve 的 mtime 轮询 2 s 内热重载
   新引擎（实测日志 `dump changed on disk — reloaded 4577969 entries`），无需重启
-- 测试/静态检查：`cargo test` 库测试 147 passed、集成测试 1 passed（+3 ignored 需管理员），
+- 测试/静态检查：`cargo test` 库测试 150 passed、集成测试 1 passed（+3 ignored 需管理员），
   `cargo clippy --all-targets -- -D warnings` 0 警告
 
 ### 2026-09-29 索引质量大修后复测（本机 6 卷 · 4,223,028 条 · dump v6）
@@ -370,7 +370,10 @@ serve 稳态（引擎侧 took_ms，预热线程 + TTL 缓存）：`ext:rs` 0ms�
   C/E/F/G 的变更要等 `fer index` / `fer rebuild`）② 查询走 serve —— 变更先进 serve 的 overlay，
   `fer search`（默认自动转发）与网页秒级可见，而**直读 dump 的路径**（`--db`、serve 未运行）
   看不到未落盘的部分（dump 仍是每 `--flush-secs` 重写一次，`fer flush` 可立刻落盘）
-  ③ 变更属于创建/删除/重命名/硬链接增删/内容写/属性设置；安全描述符与 EA 变更不在 mask 内
+  ③ 变更属于创建/删除/重命名/硬链接增删/内容写/属性设置；安全描述符与 EA 变更不在 mask 内。
+  目录的改名/移动会**连带迁移其子树**（2026-10-12 起）：Windows 只对目录本身发两条 rename 记录，
+  子项不发，所以 monitor 在拿到 OLD/NEW 配对后按旧路径前缀重写子树（O(子树)；超过 5 万条则改为
+  重扫本卷）。此前子树会一直停在旧路径，并被每次 flush 固化进 dump，只有 `fer index`/`fer rebuild` 能清
 - 内存引擎的路径排序只折叠 ASCII 大小写（非 ASCII 大小写字母如 É/Ö 按字节比较）
   ——Windows 路径中极少见
 - 8.3 短名（namespace=2）不入索引（避免噪音）；分片 `$MFT` 不支持 attribute-list 布局

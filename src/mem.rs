@@ -902,15 +902,51 @@ impl MemIndex {
             let p = path_of(&self.entries, &self.paths, i);
             ci_cmp(p, prefix_lc) == Ordering::Less || ci_starts_with(p, prefix_lc)
         });
-        let mut out: Vec<u32> = self.by_path[lo..hi]
+        let mut idxs: Vec<u32> = self.by_path[lo..hi]
             .iter()
-            .filter(|&&i| {
+            .copied()
+            .filter(|&i| {
                 let p = path_of(&self.entries, &self.paths, i);
                 p.len() == prefix_lc.len()
                     || p[prefix_lc.len()] == b'\\'
                     || p[prefix_lc.len()] == b'/'
             })
+            .collect();
+        idxs.sort_unstable();
+        let mut out: Vec<u32> = idxs
+            .iter()
             .map(|&i| self.entries[i as usize].id)
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// [`Self::subtree_ids`] in *index* space: entry-table indexes rather than
+    /// dump ids. The monitor expresses its pending retirement set in indexes
+    /// ([`crate::monitor`]'s `Pending::removed`), and the two spaces only
+    /// coincide while the dump is dense — resolving a subtree rewrite through
+    /// ids would retire the wrong entries on a sparse one.
+    pub fn subtree_indexes(&self, prefix_lc: &[u8]) -> Vec<u32> {
+        let prefix_lc = trim_seps(prefix_lc);
+        if prefix_lc.is_empty() {
+            return Vec::new();
+        }
+        let lo = self.by_path.partition_point(|&i| {
+            ci_cmp(path_of(&self.entries, &self.paths, i), prefix_lc) == Ordering::Less
+        });
+        let hi = self.by_path.partition_point(|&i| {
+            let p = path_of(&self.entries, &self.paths, i);
+            ci_cmp(p, prefix_lc) == Ordering::Less || ci_starts_with(p, prefix_lc)
+        });
+        let mut out: Vec<u32> = self.by_path[lo..hi]
+            .iter()
+            .copied()
+            .filter(|&i| {
+                let p = path_of(&self.entries, &self.paths, i);
+                p.len() == prefix_lc.len()
+                    || p[prefix_lc.len()] == b'\\'
+                    || p[prefix_lc.len()] == b'/'
+            })
             .collect();
         out.sort_unstable();
         out
