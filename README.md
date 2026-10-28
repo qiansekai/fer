@@ -81,6 +81,9 @@ fer monitor --volume D               # USN 实时增量（需管理员）
 fer monitor --volume D,H             # 多卷监视（逗号列表或重复传参；每卷独立 journal）
 fer flush                            # 让常驻 monitor 立刻把内存索引落盘（不等 --flush-secs）
 fer rebuild                          # 让常驻 monitor 立刻重扫本卷 $MFT 并重写 dump（~5-20s）
+fer monitor --volume D --stat-policy fast   # 每事件元数据策略：full 精确最费 / fast 一次 GetFileAttributesExW（默认）/ off 完全不 stat
+fer monitor --volume D --exclude-dir tmp,out # 追加不索引的目录名（默认已含 target,node_modules,.gradle,build,dist,obj,.git,__pycache__）
+fer monitor --volume D --no-exclude          # 取消默认排除，全量索引（构建产物也进索引）
 fer stats                            # 索引统计
 fer dupes --min-size 1kb --limit 50  # 找重复文件（同大小分组 + 内容哈希 + 字节校验）
 fer dupes --name adb.exe             # 只看文件名含 adb.exe 的重复组
@@ -374,6 +377,17 @@ serve 稳态（引擎侧 took_ms，预热线程 + TTL 缓存）：`ext:rs` 0ms�
   目录的改名/移动会**连带迁移其子树**（2026-10-12 起）：Windows 只对目录本身发两条 rename 记录，
   子项不发，所以 monitor 在拿到 OLD/NEW 配对后按旧路径前缀重写子树（O(子树)；超过 5 万条则改为
   重扫本卷）。此前子树会一直停在旧路径，并被每次 flush 固化进 dump，只有 `fer index`/`fer rebuild` 能清
+- **构建产物目录默认不索引**（`--exclude-dir` / `--no-exclude` 可调）：`target` / `node_modules` /
+  `.gradle` / `build` / `dist` / `obj` / `.git` / `__pycache__` 下的**文件**不进索引，按整个路径组件
+  匹配（`target-gnu` 不是 `target`，`build.rs` 不是 `build`）。该目录的**目录本身仍会索引**——这是
+  刻意的：父目录不在索引里时，每个子事件的父路径都要走内核 FRN 走查，实测比不排除更贵。
+  所以这类树的目录骨架仍可搜到，只是没有文件。**`fer index` / `fer rebuild` 走 MFT 全量扫描、
+  不应用该列表**，重建后这些文件会回到索引，直到下一次编译的 DELETE 事件把它们退役。
+- **每事件元数据成本可调**（`--stat-policy`，默认 `fast`）：`full` = `symlink_metadata` +
+  `GetCompressedFileSizeW`（size 与 allocated 都精确，每次 2 个内核调用）；`fast` = 一次
+  `GetFileAttributesExW`（attributes/size/时间戳全准，allocated 由簇大小向上取整推导，压缩与稀疏
+  文件会高估）；`off` = 完全不 stat，flags 与目录位取自 USN 记录，size/时间标为「未知」
+  （`FLAG_META_UNKNOWN`，与「测量为 0」区分）。编译这类高频写入场景的磁盘活动主要来自这一步。
 - 内存引擎的路径排序只折叠 ASCII 大小写（非 ASCII 大小写字母如 É/Ö 按字节比较）
   ——Windows 路径中极少见
 - 8.3 短名（namespace=2）不入索引（避免噪音）；分片 `$MFT` 不支持 attribute-list 布局
