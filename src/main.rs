@@ -126,6 +126,25 @@ enum Cmd {
         /// Do not listen for control commands.
         #[arg(long)]
         no_control: bool,
+        /// How much metadata work each event may do.
+        ///
+        /// `full` = symlink_metadata + GetCompressedFileSizeW (exact, most I/O);
+        /// `fast` = one GetFileAttributesExW (allocated derived from the volume's
+        /// cluster size); `off` = no stat at all, flags come from the USN record
+        /// and the entry is flagged unknown. A compile raises tens of thousands of
+        /// events per minute, and each event used to stat.
+        #[arg(long, default_value = "fast", value_name = "full|fast|off")]
+        stat_policy: String,
+        /// Extra path component(s) whose events never enter the index (comma
+        /// separated or repeated). Added to the built-in build-output list.
+        #[arg(long, value_delimiter = ',', value_name = "NAME")]
+        exclude_dir: Vec<String>,
+        /// Do not exclude the built-in build-output directories
+        /// (target, node_modules, .gradle, build, dist, obj, .git, __pycache__).
+        /// Alone it indexes everything; together with --exclude-dir only the
+        /// listed names are excluded.
+        #[arg(long)]
+        no_exclude: bool,
     },
     /// Ask the running `fer monitor` to write its pending changes to the dump
     /// now instead of waiting out --flush-secs
@@ -492,21 +511,39 @@ fn main() -> Result<()> {
             no_push,
             control,
             no_control,
+            stat_policy,
+            exclude_dir,
+            no_exclude,
         } => {
             if !file_engine_rust::is_elevated() {
                 file_engine_rust::try_self_elevate()?;
             }
+            let stat_policy = file_engine_rust::monitor::StatPolicy::parse(&stat_policy)?;
+            // Default list + anything the caller added; --no-exclude alone means
+            // "index everything", and --no-exclude with --exclude-dir means "only
+            // these".
+            let mut exclude: Vec<String> = Vec::new();
+            if !no_exclude {
+                exclude.extend(
+                    file_engine_rust::monitor::DEFAULT_EXCLUDE_DIRS
+                        .iter()
+                        .map(|s| s.to_string()),
+                );
+            }
+            exclude.extend(exclude_dir);
             let mem = load_index(&db)?;
             let dump = dump_path(&db);
-            file_engine_rust::monitor::run(
+            file_engine_rust::monitor::run(file_engine_rust::monitor::MonitorConfig {
                 mem,
-                volume,
+                drives: volume,
                 dump,
-                Duration::from_secs(interval_secs),
-                Duration::from_secs(flush_secs),
-                if no_push { None } else { Some(push) },
-                if no_control { None } else { Some(control) },
-            )?;
+                interval: Duration::from_secs(interval_secs),
+                flush_every: Duration::from_secs(flush_secs),
+                push_addr: if no_push { None } else { Some(push) },
+                control_addr: if no_control { None } else { Some(control) },
+                stat_policy,
+                exclude,
+            })?;
         }
         Cmd::Flush { addr } => {
             println!("{}", file_engine_rust::control::request(&addr, "flush")?);

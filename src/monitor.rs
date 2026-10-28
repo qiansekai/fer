@@ -28,6 +28,7 @@ use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_READONLY,
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_SYSTEM, GetCompressedFileSizeW,
+    GetDiskFreeSpaceW, GetFileAttributesExW, GetFileExInfoStandard, WIN32_FILE_ATTRIBUTE_DATA,
 };
 use windows_sys::Win32::System::Ioctl::{
     USN_REASON_BASIC_INFO_CHANGE, USN_REASON_DATA_EXTEND, USN_REASON_DATA_OVERWRITE,
@@ -143,6 +144,16 @@ struct Pending {
     /// in-memory rewrite was skipped and the caller must rebuild the volume
     /// before the next flush.
     needs_rebuild: bool,
+    /// Parent FRNs whose "is this still an existing directory" check already
+    /// succeeded in the *current* round.
+    ///
+    /// A build tree drops thousands of files into the same few directories, and
+    /// every one of them re-validates the same parent FRN. Measured on this
+    /// machine the parent check was the single largest per-event cost once the
+    /// metadata fill was reduced. The memo lives for one round only (cleared with
+    /// `refreshed`), so a directory that is renamed or deleted is noticed within
+    /// one `--interval-secs` instead of being trusted for a whole flush window.
+    verified_dirs: HashSet<u64>,
 }
 
 impl Pending {
@@ -156,6 +167,7 @@ impl Pending {
         self.refreshed.clear();
         self.dir_old.clear();
         self.needs_rebuild = false;
+        self.verified_dirs.clear();
     }
 }
 
@@ -246,6 +258,10 @@ struct ApplyStats {
     /// Directory renames whose subtree was too large to rewrite in memory; the
     /// round that reports a non-zero value triggers a full rebuild.
     rebuild_needed: usize,
+    /// Appearance events dropped because their path sits under an excluded
+    /// build-output directory (`--exclude-dir`). They never stat and never
+    /// enter the index.
+    excluded: usize,
 }
 
 /// Metadata fill for one create/rename event.
@@ -429,6 +445,188 @@ fn wide_verbatim(path: &str) -> Vec<u16> {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Per-event metadata policy
+// ---------------------------------------------------------------------------
+
+/// How much file-system work one appearance / refresh event may do.
+///
+/// Measured on this machine (2048-byte synthetic build events, kernel "other"
+/// operation counter): CREATE 21.5 and WRITE-EXTEND 19.3 metadata operations per
+/// event, of which the metadata fill is the dominant part — `symlink_metadata`
+/// (CreateFile + two queries + Close) plus `GetCompressedFileSizeW`. A build
+/// tree raises tens of thousands of those per minute, which is the disk
+/// *activity* (not byte throughput) a compiler makes visible in Task Manager
+/// while Everything stays flat: Everything never stats per event, it only
+/// stores what the journal hands over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatPolicy {
+    /// `symlink_metadata` + `GetCompressedFileSizeW`: exact logical size and
+    /// exact cluster allocation. The historical behaviour, and the most I/O.
+    Full,
+    /// One `GetFileAttributesExW` for attributes + logical size + both
+    /// timestamps. `allocated` is derived by rounding the size up to the
+    /// volume's cluster size: exact for ordinary non-resident files, and only
+    /// overstates sparse / compressed / resident ones.
+    Fast,
+    /// No stat at all for appearance and refresh events: the entry is built from
+    /// the USN record, so flags and the directory bit are still exact, while
+    /// size / timestamps / allocation are marked unknown
+    /// (`FLAG_META_UNKNOWN`). Parent-directory validation still stats, because
+    /// guessing a parent from a stale index is what produced the measured
+    /// 1,497 "file\child" ghost paths.
+    Off,
+}
+
+impl StatPolicy {
+    pub fn parse(s: &str) -> Result<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "full" => Ok(Self::Full),
+            "fast" => Ok(Self::Fast),
+            "off" | "none" | "no-stat" => Ok(Self::Off),
+            other => bail!("unknown --stat-policy {other:?} (expected full | fast | off)"),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Fast => "fast",
+            Self::Off => "off",
+        }
+    }
+}
+
+/// Cluster size assumed when `GetDiskFreeSpaceW` cannot answer (every NTFS
+/// volume formatted by Windows uses 4 KiB for volumes this small).
+const DEFAULT_CLUSTER: u64 = 4096;
+
+/// Path components whose **files** never enter the index unless the caller turns
+/// the list off (`--no-exclude`).
+///
+/// These are build-output directories: a compiler creates and deletes tens of
+/// thousands of files under them per minute, and nobody searches them. Excluding
+/// them is what Everything's folder filter does, and it removes the compile-time
+/// cost at the source instead of making each event cheaper. Matched as **whole
+/// path components**, so `target-gnu` is not `target` and `build.rs` is not
+/// `build`.
+///
+/// Directories under these names still get indexed — a few thousand entries — and
+/// that is load-bearing: an unindexed parent sends every child event through the
+/// kernel FRN walk (`FSCTL_ENUM_USN_DATA`), which measured *worse* than not
+/// excluding at all. `fer search --count-only` therefore still reports the
+/// directory skeleton of an excluded tree, just none of its files.
+pub const DEFAULT_EXCLUDE_DIRS: &[&str] =
+    &["target", "node_modules", ".gradle", "build", "dist", "obj", ".git", "__pycache__"];
+
+/// Whether any whole path component of `path` is in `exclude` (ASCII-CI).
+///
+/// Allocation-free: the scan walks the string once and compares each component
+/// in place, because this runs for every event in a burst.
+fn path_is_excluded(path: &str, exclude: &[String]) -> bool {
+    if exclude.is_empty() {
+        return false;
+    }
+    let bytes = path.as_bytes();
+    let mut start = 0usize;
+    for i in 0..=bytes.len() {
+        if i == bytes.len() || bytes[i] == b'\\' || bytes[i] == b'/' {
+            let comp = &path[start..i];
+            if !comp.is_empty() && exclude.iter().any(|e| comp.eq_ignore_ascii_case(e)) {
+                return true;
+            }
+            // +1 skips the separator; components always start on an ASCII
+            // boundary, so the slice below is always char-safe.
+            start = i + 1;
+        }
+    }
+    false
+}
+
+/// Bytes per cluster for `drive`, asked once per volume at open time.
+fn cluster_size_for(drive: char) -> u64 {
+    let root: Vec<u16> = format!("{drive}:\\")
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let (mut per_cluster, mut per_sector, mut free, mut total) = (0u32, 0u32, 0u32, 0u32);
+    let ok = unsafe {
+        GetDiskFreeSpaceW(root.as_ptr(), &mut per_cluster, &mut per_sector, &mut free, &mut total)
+    };
+    if ok == 0 || per_cluster == 0 || per_sector == 0 {
+        return DEFAULT_CLUSTER;
+    }
+    u64::from(per_cluster) * u64::from(per_sector)
+}
+
+/// Metadata fill in a single kernel call (see `StatPolicy::Fast`).
+///
+/// `GetFileAttributesExW` returns attributes, logical size and all three
+/// timestamps without opening a handle, which is both one call instead of the
+/// CreateFile/queries/Close sequence `symlink_metadata` performs and the reason
+/// this is the right fast path. Two contracts are preserved from `stat_meta`:
+///
+/// * a reparse point reports **its own** attributes (the API does not follow
+///   links, matching the raw $MFT scan and `symlink_metadata`);
+/// * the `FILE_ATTRIBUTE_DIRECTORY` bit decides directories, so a junction to a
+///   directory is a directory (Rust's std reports it as a symlink).
+fn stat_meta_fast(path: &str, cluster: u64, frn: u64) -> StatResult {
+    let wide = wide_verbatim(path);
+    // SAFETY: WIN32_FILE_ATTRIBUTE_DATA is plain old data; all-zero is a valid
+    // value for it and GetFileAttributesExW overwrites it on success.
+    let mut data: WIN32_FILE_ATTRIBUTE_DATA = unsafe { std::mem::zeroed() };
+    // SAFETY: 'wide' is NUL-terminated and 'data' outlives the call.
+    let ok = unsafe {
+        GetFileAttributesExW(
+            wide.as_ptr(),
+            GetFileExInfoStandard,
+            std::ptr::addr_of_mut!(data).cast(),
+        )
+    };
+    if ok == 0 {
+        let e = std::io::Error::last_os_error();
+        return Err(classify_stat_error(&e));
+    }
+    let attrs = data.dwFileAttributes;
+    let flags = flags_from_attributes(attrs);
+    let reparse = attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    let is_dir = attrs & FILE_ATTRIBUTE_DIRECTORY != 0;
+    let size = if is_dir {
+        0
+    } else {
+        (u64::from(data.nFileSizeHigh) << 32) | u64::from(data.nFileSizeLow)
+    };
+    // A byte count rounded up to whole clusters, which is exactly how NTFS
+    // allocates for a normal non-resident file. Empty and reparse-point entries
+    // are 0 by contract; compressed and sparse files are overstated, which is
+    // the documented trade of this policy (fer index gives the exact figure).
+    let cluster = cluster.max(1);
+    let allocated = if is_dir || reparse || size == 0 {
+        0
+    } else {
+        size.div_ceil(cluster) * cluster
+    };
+    Ok(StatMeta {
+        meta: EntryMeta {
+            is_dir,
+            size,
+            allocated,
+            mtime: crate::mft::filetime_to_unix(filetime_u64(data.ftLastWriteTime)),
+            ctime: crate::mft::filetime_to_unix(filetime_u64(data.ftCreationTime)),
+            flags,
+            frn: Some(frn),
+        },
+        // Fast mode never queries the allocation API, so nothing failed: the
+        // figure above is derived, not a 0 fallback.
+        alloc_failed: false,
+    })
+}
+
+/// FILETIME (two halves) as the single u64 `filetime_to_unix` expects.
+fn filetime_u64(ft: windows_sys::Win32::Foundation::FILETIME) -> u64 {
+    (u64::from(ft.dwHighDateTime) << 32) | u64::from(ft.dwLowDateTime)
+}
+
 /// ASCII-CI comparison of a path's last component against a USN record name.
 fn name_matches_path(path: &[u8], name: &str) -> bool {
     let base = path
@@ -529,10 +727,26 @@ fn resolve_parent(
     mem: &MemIndex,
     drive: char,
     frn: u64,
-    pending: &Pending,
+    pending: &mut Pending,
     kernel: &mut impl FnMut(u64) -> Option<String>,
     stat: &mut impl FnMut(&str, bool, u64) -> StatResult,
 ) -> Option<String> {
+    // Already validated in this round: take the first candidate without asking
+    // the file system again. This is the batch case a build tree is made of.
+    if pending.verified_dirs.contains(&frn) {
+        for &idx in &mem.find_frn_all(frn) {
+            let i = idx as usize;
+            if path_on_drive(mem.path_bytes(i), drive) && mem.meta_at(i).is_dir {
+                return Some(trim_dir_sep(mem.path_at(i)));
+            }
+        }
+        for (path, meta) in &pending.appended {
+            if meta.frn == Some(frn) && meta.is_dir {
+                return Some(trim_dir_sep(path.clone()));
+            }
+        }
+        return kernel(frn);
+    }
     for &idx in &mem.find_frn_all(frn) {
         let i = idx as usize;
         if !path_on_drive(mem.path_bytes(i), drive) || !mem.meta_at(i).is_dir {
@@ -540,19 +754,33 @@ fn resolve_parent(
         }
         let path = trim_dir_sep(mem.path_at(i));
         if is_existing_dir(&path, frn, stat) {
+            pending.verified_dirs.insert(frn);
             return Some(path);
         }
     }
+    // Resolved first, memoised after: holding a borrow of 'appended' across the
+    // insert would not compile, and the borrow is the point (no clone per miss).
+    let mut found: Option<String> = None;
     for (path, meta) in &pending.appended {
         if meta.frn != Some(frn) || !meta.is_dir {
             continue;
         }
         let path = trim_dir_sep(path.clone());
         if is_existing_dir(&path, frn, stat) {
-            return Some(path);
+            found = Some(path);
+            break;
         }
     }
-    kernel(frn)
+    if let Some(path) = found {
+        pending.verified_dirs.insert(frn);
+        return Some(path);
+    }
+    // kernel_parent validates its own answer, so a hit is memo-worthy too.
+    let resolved = kernel(frn);
+    if resolved.is_some() {
+        pending.verified_dirs.insert(frn);
+    }
+    resolved
 }
 
 /// Apply one round of USN records to the pending change set.
@@ -567,6 +795,25 @@ fn resolve_parent(
 /// candidate paths, so the file system is the judge. That is what lets "one of
 /// several hard links was removed" (keep the survivors) and "the FILE record
 /// was deleted" (retire everything) share one code path.
+/// What a round is allowed to do beyond reading the record itself.
+#[derive(Debug, Clone, Copy)]
+struct ApplyOpts<'a> {
+    policy: StatPolicy,
+    /// Whole path components that never enter the index.
+    exclude: &'a [String],
+}
+
+impl Default for ApplyOpts<'_> {
+    /// The historical behaviour, so every existing unit test keeps meaning what
+    /// it meant: exact metadata, no exclusion list.
+    fn default() -> Self {
+        Self { policy: StatPolicy::Full, exclude: &[] }
+    }
+}
+
+/// Test-facing entry point: exact metadata, no exclusion list — the behaviour
+/// every pre-existing unit test was written against.
+#[cfg(test)]
 fn apply_records(
     mem: &MemIndex,
     drive: char,
@@ -574,6 +821,18 @@ fn apply_records(
     pending: &mut Pending,
     kernel: &mut impl FnMut(u64) -> Option<String>,
     stat: &mut impl FnMut(&str, bool, u64) -> StatResult,
+) -> ApplyStats {
+    apply_records_with(mem, drive, records, pending, kernel, stat, ApplyOpts::default())
+}
+
+fn apply_records_with(
+    mem: &MemIndex,
+    drive: char,
+    records: &[UsnRecord],
+    pending: &mut Pending,
+    kernel: &mut impl FnMut(u64) -> Option<String>,
+    stat: &mut impl FnMut(&str, bool, u64) -> StatResult,
+    opts: ApplyOpts<'_>,
 ) -> ApplyStats {
     let mut stats = ApplyStats::default();
     for r in records {
@@ -604,7 +863,15 @@ fn apply_records(
         // stat'ed the file, so only the other records are refreshed — and at
         // most once per FRN per round, because a writer raises DATA_* on every
         // buffer flush.
-        if !appearance && r.reason & REFRESH_REASON != 0 && pending.refreshed.insert(r.frn) {
+        // --stat-policy off never refreshes: the entry has no size or timestamp
+        // to update and is already flagged unknown, so the stat would buy
+        // nothing. That stat is one per written file, i.e. exactly the cost this
+        // policy exists to remove.
+        if !appearance
+            && opts.policy != StatPolicy::Off
+            && r.reason & REFRESH_REASON != 0
+            && pending.refreshed.insert(r.frn)
+        {
             stats.applied += refresh_entry(mem, drive, r, pending, kernel, stat);
         }
         // Appearance side: create, rename-into-place and hard-link change - the
@@ -618,6 +885,64 @@ fn apply_records(
                     } else {
                         format!("{parent}\\{}", r.name)
                     };
+                    // An excluded build-output directory's *files* never reach the
+                    // index: the event is dropped before any metadata work, which is
+                    // what makes a compile cost nothing instead of costing less.
+                    //
+                    // Directories are deliberately NOT excluded. Keeping them costs
+                    // a few thousand entries, and it is what makes the exclusion
+                    // work at all: resolve_parent finds a directory in the in-memory
+                    // index in zero kernel calls, while an unindexed parent falls
+                    // through to the FRN walk for every child. Measured with
+                    // directories excluded too: 6.11 metadata ops per event and a
+                    // resolve_fail per file — the events never reached this check at
+                    // all, so the exclusion bought nothing.
+                    if !r.is_dir && path_is_excluded(&path, opts.exclude) {
+                        stats.excluded += 1;
+                        stats.applied += retire_path(mem, &path, pending);
+                        stats.applied += drop_pending_path(pending, &path);
+                        continue;
+                    }
+                    // Off: no stat. Flags and the directory bit come from the
+                    // journal record itself; a path that already had an entry keeps
+                    // its real metadata, so switching to off does not zero out a
+                    // file the last scan measured.
+                    if opts.policy == StatPolicy::Off {
+                        let meta = match mem
+                            .find_frn_all(r.frn)
+                            .into_iter()
+                            .find(|&i| mem.path_at(i as usize).eq_ignore_ascii_case(&path))
+                        {
+                            Some(i) => mem.meta_at(i as usize),
+                            None => EntryMeta {
+                                is_dir: r.is_dir,
+                                flags: flags_from_attributes(r.file_attributes)
+                                    | EntryMeta::FLAG_META_UNKNOWN,
+                                frn: Some(r.frn),
+                                ..Default::default()
+                            },
+                        };
+                        retire_path(mem, &path, pending);
+                        drop_pending_path(pending, &path);
+                        pending.appended.push((path.clone(), meta));
+                        stats.applied += 1;
+                        // A moved directory still carries its children, and that
+                        // rewrite needs the two paths only — never metadata.
+                        if r.is_dir
+                            && r.reason & USN_REASON_RENAME_NEW_NAME != 0
+                            && let Some(old) = pending.dir_old.remove(&r.frn)
+                            && !old.eq_ignore_ascii_case(&path)
+                        {
+                            match rewrite_subtree(mem, &old, &path, pending) {
+                                Some(n) => stats.subtree_moved += n,
+                                None => {
+                                    stats.rebuild_needed += 1;
+                                    pending.needs_rebuild = true;
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     match stat(&path, r.is_dir, r.frn) {
                         Ok(s) => {
                             if s.alloc_failed {
@@ -965,6 +1290,9 @@ fn retire_aliases(
 struct Watched {
     drive: char,
     vol: UsnVolume,
+    /// Bytes per cluster, asked once at open time and used to derive `allocated`
+    /// under `--stat-policy fast`.
+    cluster: u64,
     /// Next USN to read from — the position the sidecar stores.
     start: i64,
     /// Parent-FRN -> path memo. Per volume on purpose: FRNs are volume-local, so
@@ -1059,6 +1387,7 @@ fn open_watched(drive: char, sidecar: &Path) -> Result<Watched> {
     Ok(Watched {
         drive,
         vol,
+        cluster: cluster_size_for(drive),
         start,
         cache: HashMap::new(),
         pending: Pending::default(),
@@ -1141,6 +1470,23 @@ fn revive_down(vols: &mut Vec<Watched>, down: &mut Vec<Down>, sidecar: &Path) {
 /// all shared forty locals — which buried the ordering rules (broadcast and
 /// snapshot BEFORE the flush; pending cleared only after it) in a very long body.
 /// The split changes no behaviour: the same statements run in the same order.
+/// Everything `fer monitor` is started with.
+///
+/// Grouped into a struct because the run parameters had grown past what a
+/// nine-argument call can be read at: the volume set, the two timing knobs, the
+/// two loopback endpoints and the two cost controls are all independent.
+pub struct MonitorConfig {
+    pub mem: MemIndex,
+    pub drives: Vec<char>,
+    pub dump: PathBuf,
+    pub interval: Duration,
+    pub flush_every: Duration,
+    pub push_addr: Option<String>,
+    pub control_addr: Option<String>,
+    pub stat_policy: StatPolicy,
+    pub exclude: Vec<String>,
+}
+
 struct Monitor {
     mem: MemIndex,
     vols: Vec<Watched>,
@@ -1151,6 +1497,10 @@ struct Monitor {
     snap_path: PathBuf,
     interval: Duration,
     flush_every: Duration,
+    /// How much metadata work each event may do (see StatPolicy).
+    stat_policy: StatPolicy,
+    /// Whole path components whose events never enter the index.
+    exclude: Vec<String>,
     feed: Option<crate::push::Broadcaster>,
     control: Option<std::sync::mpsc::Receiver<crate::control::Request>>,
     /// Position the *dump on disk* was stamped with, per volume. Every flush and
@@ -1172,15 +1522,18 @@ struct Monitor {
 impl Monitor {
     /// Elevation gate, optional feeds, open every requested volume, then restore
     /// the pending snapshot and heal a journal recycled while we were down.
-    fn open(
-        mem: MemIndex,
-        drives: Vec<char>,
-        dump: PathBuf,
-        interval: Duration,
-        flush_every: Duration,
-        push_addr: Option<String>,
-        control_addr: Option<String>,
-    ) -> Result<Self> {
+    fn open(cfg: MonitorConfig) -> Result<Self> {
+        let MonitorConfig {
+            mem,
+            drives,
+            dump,
+            interval,
+            flush_every,
+            push_addr,
+            control_addr,
+            stat_policy,
+            exclude,
+        } = cfg;
         // Hard gate: the USN journal needs an elevated token; failing 10 minutes
         // into a watch (or worse, flushing a broken index) is worse than refusing
         // up front.
@@ -1249,6 +1602,8 @@ impl Monitor {
             dump,
             interval,
             flush_every,
+            stat_policy,
+            exclude,
             feed,
             control,
             durable: HashMap::new(),
@@ -1400,14 +1755,36 @@ impl Monitor {
                 // (resolve_parent). The walk gets a throwaway map because
                 // kernel_parent owns the validated per-volume memo — a poisoned
                 // entry has to be droppable.
-                let Watched { drive, vol, cache, pending, .. } = &mut *w;
-                let mut stat_fn = |path: &str, is_dir: bool, frn: u64| stat_meta(path, is_dir, frn);
+                let Watched { drive, vol, cluster, cache, pending, .. } = &mut *w;
+                let cluster_bytes = *cluster;
+                let policy = self.stat_policy;
+                // An existence check only ever needs "is this still here, and is
+                // it a directory", so it takes the cheapest query regardless of
+                // the policy: parent resolution and retire verification would
+                // otherwise pay the full price on every event.
+                let mut stat_fn =
+                    |path: &str, _is_dir: bool, frn: u64| stat_meta_fast(path, cluster_bytes, frn);
                 let mut kernel = |frn: u64| {
                     let mut walk = |f: u64| resolve_path(vol, *drive, f, &mut HashMap::new());
                     kernel_parent(frn, cache, &mut walk, &mut stat_fn)
                 };
-                let mut stat = |path: &str, is_dir: bool, frn: u64| stat_meta(path, is_dir, frn);
-                stats = apply_records(&self.mem, *drive, &records, pending, &mut kernel, &mut stat);
+                // Metadata fills follow --stat-policy. Off never reaches this
+                // closure from an appearance/refresh branch, but it is wired to
+                // fast so a future caller cannot panic.
+                let mut stat = |path: &str, is_dir: bool, frn: u64| match policy {
+                    StatPolicy::Full => stat_meta(path, is_dir, frn),
+                    StatPolicy::Fast | StatPolicy::Off => stat_meta_fast(path, cluster_bytes, frn),
+                };
+                let opts = ApplyOpts { policy, exclude: &self.exclude };
+                stats = apply_records_with(
+                    &self.mem,
+                    *drive,
+                    &records,
+                    pending,
+                    &mut kernel,
+                    &mut stat,
+                    opts,
+                );
             }
             if next != w.start {
                 w.start = next;
@@ -1417,6 +1794,7 @@ impl Monitor {
             round_stats.stat_fail += stats.stat_fail;
             round_stats.stat_gone += stats.stat_gone;
             round_stats.alloc_fail += stats.alloc_fail;
+            round_stats.excluded += stats.excluded;
             if stats.applied > 0 {
                 eprintln!(
                     "[monitor] {}: applied {} changes (usn={})",
@@ -1495,7 +1873,7 @@ impl Monitor {
             let cache_len: usize = self.vols.iter().map(|v| v.cache.len()).sum();
             eprintln!(
                 "[monitor] stats: mem={} appended={} removed={} frns={} cache={} \
-                 resolve_fail={} stat_fail={} stat_gone={} alloc_fail={} \
+                 resolve_fail={} stat_fail={} stat_gone={} alloc_fail={} excluded={} \
                  subtree_moved={} rebuild={} lag={}",
                 self.mem.len(),
                 merged.appended_len(),
@@ -1506,6 +1884,7 @@ impl Monitor {
                 round_stats.stat_fail,
                 round_stats.stat_gone,
                 round_stats.alloc_fail,
+                round_stats.excluded,
                 round_stats.subtree_moved,
                 round_stats.rebuild_needed,
                 lag_summary(&lags)
@@ -1742,16 +2121,13 @@ impl Monitor {
 /// When push_addr is set a [crate::push::Broadcaster] is bound there and every
 /// applied batch is broadcast to connected fer serve receivers, so a long-lived
 /// server can show newly created files without waiting for a flush.
-pub fn run(
-    mem: MemIndex,
-    drives: Vec<char>,
-    dump: PathBuf,
-    interval: Duration,
-    flush_every: Duration,
-    push_addr: Option<String>,
-    control_addr: Option<String>,
-) -> Result<()> {
-    Monitor::open(mem, drives, dump, interval, flush_every, push_addr, control_addr)?.run_loop()
+pub fn run(cfg: MonitorConfig) -> Result<()> {
+    eprintln!(
+        "[monitor] stat-policy={} exclude=[{}]",
+        cfg.stat_policy.name(),
+        cfg.exclude.join(",")
+    );
+    Monitor::open(cfg)?.run_loop()
 }
 
 /// Whether an indexed path (raw arena bytes, original case) lives on `drive`.
@@ -2049,7 +2425,14 @@ const SNAPSHOT_VERSION: u32 = 1;
 ///
 /// It is rewritten after every round that applied changes (bounded by this gap),
 /// because the shorter that window is, the less the journal has to still hold.
-const SNAPSHOT_MIN_GAP: Duration = Duration::from_secs(5);
+/// Raised from 5 s to 30 s on 2026-10-28. Every snapshot serializes the *whole*
+/// pending set, so a build that has created 30k files rewrote ~4 MB every 5 s —
+/// a steady write stream that competes with the compile itself for the disk. The
+/// cost of a longer gap is bounded and small: a crash can lose at most 30 s of
+/// pending changes, and those are exactly the changes the journal still replays
+/// (the snapshot is an optimisation over replaying from the sidecar, not the
+/// only record of them).
+const SNAPSHOT_MIN_GAP: Duration = Duration::from_secs(30);
 /// Snapshot writes are capped at roughly this many bytes per second, so a large
 /// pending set cannot turn the snapshot into the write load the deferred flush
 /// exists to avoid: the gap between writes grows with the set.
@@ -2253,6 +2636,7 @@ mod tests {
             is_dir,
             usn: 0,
             reason,
+            file_attributes: if is_dir { FILE_ATTRIBUTE_DIRECTORY } else { 0 },
         }
     }
 
@@ -3378,14 +3762,14 @@ mod tests {
         // No kernel call at all: the indexed directory path is exact, and the
         // kernel walk has been measured to return another record for the FRN.
         let mem = dir_index();
-        let pending = Pending::default();
+        let mut pending = Pending::default();
         let mut calls = 0u32;
         let mut kernel = |_frn: u64| {
             calls += 1;
             Some(r"D:\Apps\cent\Sync Data\Nigori.bin".to_string())
         };
         let mut stat = stat_existing(&[r"D:\links"]);
-        let parent = resolve_parent(&mem, 'D', 5, &pending, &mut kernel, &mut stat);
+        let parent = resolve_parent(&mem, 'D', 5, &mut pending, &mut kernel, &mut stat);
         assert_eq!(parent.as_deref(), Some(r"D:\links"));
         assert_eq!(calls, 0, "the kernel must not be asked when the index knows");
     }
@@ -3406,7 +3790,7 @@ mod tests {
             Some(r"D:\wrong".to_string())
         };
         let mut stat = stat_existing(&[r"D:\links\newdir"]);
-        let parent = resolve_parent(&mem, 'D', 42, &pending, &mut kernel, &mut stat);
+        let parent = resolve_parent(&mem, 'D', 42, &mut pending, &mut kernel, &mut stat);
         assert_eq!(parent.as_deref(), Some(r"D:\links\newdir"));
         assert_eq!(calls, 0);
     }
@@ -3417,10 +3801,10 @@ mod tests {
         // build a path that does not exist, so the hit is skipped and the
         // verified fallback decides (in run() that fallback also stat-checks).
         let mem = dir_index();
-        let pending = Pending::default();
+        let mut pending = Pending::default();
         let mut kernel = |_frn: u64| Some(r"D:\links".to_string());
         let mut stat = stat_ok;
-        let got = resolve_parent(&mem, 'D', 6, &pending, &mut kernel, &mut stat);
+        let got = resolve_parent(&mem, 'D', 6, &mut pending, &mut kernel, &mut stat);
         assert_eq!(got.as_deref(), Some(r"D:\links"), "the file hit must not be used");
         // Another volume's entry of the same number is not this volume's parent
         // either, so the FRN is asked of the kernel instead.
@@ -3429,7 +3813,7 @@ mod tests {
             calls += 1;
             None
         };
-        assert_eq!(resolve_parent(&mem, 'H', 5, &pending, &mut kernel, &mut stat), None);
+        assert_eq!(resolve_parent(&mem, 'H', 5, &mut pending, &mut kernel, &mut stat), None);
         assert_eq!(calls, 1, "a foreign-volume hit does not answer for this volume");
     }
 
@@ -3467,7 +3851,7 @@ mod tests {
             calls += 1;
             None
         };
-        let parent = resolve_parent(&mem, 'D', 5, &pending, &mut kernel, &mut stat);
+        let parent = resolve_parent(&mem, 'D', 5, &mut pending, &mut kernel, &mut stat);
         assert_eq!(parent.as_deref(), Some(r"D:\links\renamed"));
         assert_eq!(calls, 0, "the renamed parent is found without the kernel");
     }
@@ -3747,6 +4131,165 @@ mod tests {
         assert_eq!(read_usn(&sidecar, 'C'), Some(300));
         let text = std::fs::read_to_string(&sidecar).unwrap();
         assert_eq!(text.lines().count(), 3, "one line per volume: {text:?}");
+    }
+
+    // -- per-event cost controls (2026-10-28) -------------------------------
+    //
+    // A build raises tens of thousands of file events per minute. These tests pin
+    // the two mechanisms that make that cheap: whole-component exclusion (the
+    // event never reaches the file system at all) and the metadata policies (each
+    // event is one kernel call, or none).
+
+    #[test]
+    fn path_is_excluded_matches_whole_components_only() {
+        let ex: Vec<String> = DEFAULT_EXCLUDE_DIRS.iter().map(|s| s.to_string()).collect();
+        // The name appears as a real directory on the path.
+        assert!(path_is_excluded(r"D:\proj\target\debug\app.exe", &ex));
+        assert!(path_is_excluded(r"D:\proj\node_modules\pkg\index.js", &ex));
+        assert!(path_is_excluded(r"D:\proj\.git\objects\ab\cdef", &ex));
+        // Merely a prefix or a suffix of a component is not an exclusion. Getting
+        // this wrong hides real source trees: fer's own build dir is target-gnu,
+        // and build.rs is a source file.
+        assert!(!path_is_excluded(r"D:\Kita-Tools\Coding\fer\target-gnu\debug", &ex));
+        assert!(!path_is_excluded(r"D:\proj\src\build.rs", &ex));
+        assert!(!path_is_excluded(r"D:\proj\targets\main.rs", &ex));
+        assert!(!path_is_excluded(r"D:\proj\src\main.rs", &ex));
+        // A forward slash separates components too.
+        assert!(path_is_excluded("D:/proj/dist/app.js", &ex));
+        // An empty list excludes nothing.
+        assert!(!path_is_excluded(r"D:\proj\target\debug\app.exe", &[]));
+    }
+
+    #[test]
+    fn stat_policy_parses_every_documented_name() {
+        assert_eq!(StatPolicy::parse("full").unwrap(), StatPolicy::Full);
+        assert_eq!(StatPolicy::parse("FAST").unwrap(), StatPolicy::Fast);
+        assert_eq!(StatPolicy::parse("off").unwrap(), StatPolicy::Off);
+        assert_eq!(StatPolicy::parse("no-stat").unwrap(), StatPolicy::Off);
+        assert!(StatPolicy::parse("sometimes").is_err());
+        assert_eq!(StatPolicy::Fast.name(), "fast");
+    }
+
+    /// An excluded path is dropped before any metadata work: the stat counter must
+    /// stay at zero, which is exactly what the exclusion exists for. The parent is
+    /// a real build-output directory, and it arrives through the kernel fallback
+    /// because the index does not contain FRN 5.
+    #[test]
+    fn excluded_build_dirs_never_enter_the_index() {
+        let mem = hard_link_index();
+        let mut pending = Pending::default();
+        let mut kernel = |_frn: u64| Some(r"D:\links\target\debug".to_string());
+        let mut stat_calls = 0usize;
+        let mut stat = |p: &str, d: bool, f: u64| {
+            stat_calls += 1;
+            stat_ok(p, d, f)
+        };
+        let ex: Vec<String> = vec!["target".to_string()];
+        let opts = ApplyOpts { policy: StatPolicy::Fast, exclude: &ex };
+        let stats = apply_records_with(
+            &mem,
+            'D',
+            &[rec(900, "obj.o", USN_REASON_FILE_CREATE, false)],
+            &mut pending,
+            &mut kernel,
+            &mut stat,
+            opts,
+        );
+        assert_eq!(stats.excluded, 1);
+        assert_eq!(stats.applied, 0);
+        assert_eq!(stat_calls, 0, "an excluded event must not touch the file system");
+        assert!(pending.appended.is_empty());
+    }
+
+    /// --stat-policy off: the entry is built from the record alone. Flags and the
+    /// directory bit stay exact (they are on the record), and the entry is flagged
+    /// so a reader can tell "not measured" from "measured zero".
+    #[test]
+    fn off_policy_indexes_from_the_record_without_any_stat() {
+        let mem = hard_link_index();
+        let mut pending = Pending::default();
+        let mut kernel = resolve_links;
+        let mut stat_calls = 0usize;
+        let mut stat = |p: &str, d: bool, f: u64| {
+            stat_calls += 1;
+            stat_ok(p, d, f)
+        };
+        let mut r = rec(901, "new.bin", USN_REASON_FILE_CREATE, false);
+        r.file_attributes = FILE_ATTRIBUTE_HIDDEN;
+        let opts = ApplyOpts { policy: StatPolicy::Off, exclude: &[] };
+        let stats =
+            apply_records_with(&mem, 'D', &[r], &mut pending, &mut kernel, &mut stat, opts);
+        assert_eq!(stats.applied, 1);
+        assert_eq!(stat_calls, 0, "off must not stat the new file");
+        assert_eq!(pending.appended.len(), 1);
+        let (path, meta) = &pending.appended[0];
+        assert_eq!(path, r"D:\links\new.bin");
+        assert_eq!(meta.frn, Some(901));
+        assert!(meta.hidden(), "flags come from the USN record");
+        assert!(meta.meta_unknown(), "size and time are unknown, not measured zero");
+        assert_eq!(meta.size, 0);
+    }
+
+    /// A parent directory is validated once per round, not once per child: a build
+    /// tree drops thousands of files into the same few directories and every one
+    /// of them resolves the same parent FRN.
+    #[test]
+    fn a_parent_is_validated_once_per_round() {
+        let mut b = MemBuilder::default();
+        b.push(
+            r"D:\links",
+            EntryMeta { is_dir: true, frn: Some(PARENT), ..Default::default() },
+        );
+        let mem = b.finish();
+        let mut pending = Pending::default();
+        let mut kernel = |_frn: u64| None;
+        let mut stat_calls = 0usize;
+        let mut stat = |p: &str, d: bool, f: u64| {
+            stat_calls += 1;
+            stat_ok(p, d, f)
+        };
+        let records: Vec<UsnRecord> = (0u64..3)
+            .map(|i| rec(1000 + i, &format!("f{i}.bin"), USN_REASON_FILE_CREATE, false))
+            .collect();
+        let stats = apply_records(&mem, 'D', &records, &mut pending, &mut kernel, &mut stat);
+        assert_eq!(stats.applied, 3);
+        // Three metadata fills plus exactly one parent validation.
+        assert_eq!(stat_calls, 4, "the parent must be validated once, not per child");
+        assert!(pending.verified_dirs.contains(&PARENT));
+    }
+
+    /// The fast path must report the same facts as the exact one for an ordinary
+    /// file: attributes, logical size and both timestamps. Only the allocation is
+    /// derived (rounded up to the cluster size) instead of queried.
+    #[test]
+    fn stat_meta_fast_reads_real_size_time_and_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fast.bin");
+        std::fs::write(&path, vec![0u8; 5000]).unwrap();
+        let s = stat_meta_fast(&path.to_string_lossy(), 4096, 4242).expect("file exists");
+        assert!(!s.meta.is_dir);
+        assert_eq!(s.meta.size, 5000);
+        assert!(s.meta.mtime > 1_600_000_000, "mtime was {}", s.meta.mtime);
+        assert!(s.meta.ctime > 1_600_000_000, "ctime was {}", s.meta.ctime);
+        assert_eq!(s.meta.frn, Some(4242));
+        assert_eq!(s.meta.allocated, 8192, "5000 bytes round up to two 4 KiB clusters");
+        assert!(!s.alloc_failed);
+    }
+
+    #[test]
+    fn stat_meta_fast_handles_a_gone_path_and_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("nope.bin");
+        assert!(matches!(
+            stat_meta_fast(&gone.to_string_lossy(), 4096, 1),
+            Err(StatMiss::Gone)
+        ));
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let s = stat_meta_fast(&sub.to_string_lossy(), 4096, 7).expect("directory exists");
+        assert!(s.meta.is_dir);
+        assert_eq!(s.meta.size, 0);
+        assert_eq!(s.meta.allocated, 0);
     }
 }
 

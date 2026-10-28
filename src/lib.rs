@@ -197,7 +197,20 @@ impl EntryMeta {
     pub const FLAG_SYSTEM: u8 = 2;
     pub const FLAG_READONLY: u8 = 4;
     pub const FLAG_REPARSE: u8 = 8;
+    /// size / mtime / ctime / allocated were **not** read from the file system.
+    ///
+    /// This exists because "unknown" and "zero" are different facts: the monitor
+    /// under `--stat-policy off` (or a stat that failed) records an entry from the
+    /// USN record alone, and that entry has no size and no timestamp. Without this
+    /// bit it is indistinguishable from a genuinely empty file with epoch
+    /// timestamps — exactly the ambiguity the 2026-09-29 zero-metadata audit
+    /// (482,481 entries at dm:1970-01-01) had to clean up. A reader that needs a
+    /// trustworthy size must either ignore these entries or rebuild the index.
+    pub const FLAG_META_UNKNOWN: u8 = 16;
 
+    pub fn meta_unknown(&self) -> bool {
+        self.flags & Self::FLAG_META_UNKNOWN != 0
+    }
     pub fn hidden(&self) -> bool {
         self.flags & Self::FLAG_HIDDEN != 0
     }

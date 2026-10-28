@@ -39,6 +39,13 @@ pub struct UsnRecord {
     pub is_dir: bool,
     pub usn: i64,
     pub reason: u32,
+    /// Raw FILE_ATTRIBUTE_* bits off the record itself.
+    ///
+    /// This is the one piece of metadata the journal hands over for free, so a
+    /// monitor that refuses to stat (`--stat-policy off`) can still index
+    /// hidden / system / readonly / reparse / directory correctly. USN_RECORD_V2
+    /// carries it at +52, V3 at +68 (V3's file references are 16-byte FILE_ID_128).
+    pub file_attributes: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -422,6 +429,7 @@ pub fn parse_usn_buffer(buf: &[u8]) -> Vec<UsnRecord> {
             is_dir: attrs & FILE_ATTRIBUTE_DIRECTORY != 0,
             usn,
             reason,
+            file_attributes: attrs,
         });
         off += rec_len;
     }
