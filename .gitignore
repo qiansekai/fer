@@ -1,5 +1,6 @@
 /target
 /target-gnu
+/target-verify
 *.db
 *.db-wal
 *.db-shm

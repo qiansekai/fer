@@ -108,7 +108,7 @@ pub fn command_label(id: u16) -> &'static str {
 // ---------------- 菜单结构表 ----------------
 
 /// 一个菜单项：命令项（文字 + id）或分隔线。
-enum ItemDef {
+pub enum ItemDef {
 	/// 可点击命令项：(显示文字, 命令 id)。
 	Cmd(&'static str, u16),
 	/// 分隔线。
@@ -156,7 +156,7 @@ const TOOLS_ITEMS: &[ItemDef] = &[
 ];
 
 /// 菜单栏：(标题, 下拉项)。
-const MENUS: [(&str, &[ItemDef]); 5] = [
+pub const MENUS: [(&str, &[ItemDef]); 5] = [
 	("文件(&F)", FILE_ITEMS),
 	("编辑(&E)", EDIT_ITEMS),
 	("视图(&V)", VIEW_ITEMS),
@@ -164,11 +164,19 @@ const MENUS: [(&str, &[ItemDef]); 5] = [
 	("工具(&T)", TOOLS_ITEMS),
 ];
 
+/// 按序号构建单个下拉菜单（自绘菜单栏用：按钮点击时现建现弹）。
+pub fn build_popup_at(index: usize) -> SysResult<HMENU> {
+	let (_, items) = MENUS[index];
+	build_popup(items)
+}
+
 // ---------------- 构建 ----------------
 
 /// 构建菜单栏并返回其句柄（交由 main.rs 的 WindowMainOpts.menu 持有）。
 ///
 /// 任何一步失败都返回 Err，并尽量销毁已建好的部分菜单；不 panic。
+/// 构建完整菜单栏（自绘菜单栏后不再使用，保留给未来的系统菜单栏方案）。
+#[allow(dead_code)]
 pub fn build_menu_bar() -> SysResult<HMENU> {
 	validate_tables()?;
 	let bar = HMENU::CreateMenu()?;
@@ -196,6 +204,7 @@ pub fn build_menu_bar() -> SysResult<HMENU> {
 ///
 /// 让「清单唯一事实源」在运行期也生效：以后往菜单表里加项时若写错 id，启动即失败，
 /// 而不是让 WM_COMMAND 收到一个没人处理的未知命令。
+#[allow(dead_code)]
 fn validate_tables() -> SysResult<()> {
 	for (_, items) in MENUS {
 		for item in items {
@@ -215,12 +224,10 @@ fn build_popup(items: &[ItemDef]) -> SysResult<HMENU> {
 	for item in items {
 		let appended = match item {
 			ItemDef::Cmd(text, id) => {
-				let label: &str = text;
-				popup.AppendMenu(
-					co::MF::STRING,
-					IdMenu::Id(*id),
-					BmpPtrStr::Str(WString::from_str(label)),
-				)
+				// owner-draw：itemData 持有文本指针（WString 故意泄漏，进程生命周期）。
+				let ws: Box<WString> = Box::new(WString::from_str(text));
+				let ptr = Box::into_raw(ws) as *const std::ffi::c_void;
+				popup.AppendMenu(co::MF::OWNERDRAW, IdMenu::Id(*id), BmpPtrStr::Ptr(ptr))
 			}
 			ItemDef::Sep => popup.AppendMenu(co::MF::SEPARATOR, IdMenu::None, BmpPtrStr::None),
 		};
@@ -234,6 +241,7 @@ fn build_popup(items: &[ItemDef]) -> SysResult<HMENU> {
 }
 
 /// 销毁已建好的菜单栏（已挂载的子菜单随之销毁），原样返回错误。
+#[allow(dead_code)]
 fn destroy_bar(mut bar: HMENU, err: co::ERROR) -> co::ERROR {
 	let _ = bar.DestroyMenu();
 	err

@@ -18,6 +18,7 @@ fn main() {
 
 	println!("cargo:rerun-if-changed=app.rc");
 	println!("cargo:rerun-if-changed=app.manifest");
+	println!("cargo:rerun-if-changed=fer.ico");
 
 	let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
 	let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());

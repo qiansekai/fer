@@ -50,11 +50,13 @@ winsafe = { version = "0.0.29", features = ["gui"], optional = true }
 # 故在 fer-gui 的 actions.rs 里按 Win32 文档自声明同签名 extern（与 GlobalFree 同一先例）。
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Gdi",
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_DataExchange",
     "Win32_System_IO",
     "Win32_System_Ioctl",
+    "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_ProcessStatus",
     "Win32_System_Threading",

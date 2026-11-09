@@ -26,26 +26,35 @@ mod json;
 mod menu;
 mod query;
 mod serve_ctl;
+mod theme;
 
 use config::Config;
 use ferapi::{FerClient, Hit, SearchResult};
 use query::{SearchState, SortKey};
 
 const PAD: i32 = 8;
+/// 自绘菜单栏高度（逻辑像素）：Win10 的系统菜单栏无法跟随深色，改在客户区自绘。
+const MENU_H: i32 = 22;
 const TITLE_BASE: &str = "fer GUI - File Express Retriever";
 const TIMER_PUMP: usize = 1;
+/// 输入防抖期间的泵间隔。
 const TIMER_PUMP_MS: u32 = 40;
+/// 空闲心跳间隔：只用来兜底处理迟到的回包，不做事时开销可忽略。
+const TIMER_IDLE_MS: u32 = 200;
 const TIMER_STATS: usize = 2;
 const TIMER_STATS_MS: u32 = 4000;
 const DEBOUNCE_MS: u64 = 150;
-/// 快捷筛选 chip：显示文本 -> 追加到查询串的 term（与 build_chips 顺序一致）。
-const CHIP_DEFS: [(&str, &str); 6] = [
-	("文件", "type:file"),
-	("目录", "type:dir"),
-	("今天", "dm:today"),
-	("本周", "dm:thisweek"),
-	(">1MB", "size:>1mb"),
-	("隐藏", "hidden:true"),
+/// 快捷筛选 chip：(显示文本, 查询 term, 互斥组)。
+///
+/// 语义是**开关**：点一次加入、再点一次移除；互斥组内加入新值会先剔除同组旧值
+/// （文件 vs 目录、今天 vs 本周）。组为 `None` 的 chip 可自由叠加。
+const CHIP_DEFS: [(&str, &str, Option<&str>); 6] = [
+	("文件", "type:file", Some("type")),
+	("目录", "type:dir", Some("type")),
+	("今天", "dm:today", Some("dm")),
+	("本周", "dm:thisweek", Some("dm")),
+	(">1MB", "size:>1mb", None),
+	("隐藏", "hidden:true", None),
 ];
 const HTTP_TIMEOUT: Duration = Duration::from_millis(4000);
 /// 结果表右键菜单（复用菜单栏命令 ID，两者走同一个 menu_command 分派）。
@@ -65,6 +74,7 @@ const CMD_HISTORY_OPEN: u16 = 1998;
 /// Enter 加速键：焦点在搜索框=立即搜索，焦点在结果表=打开/下钻（用焦点判断，不改列表语义）。
 const CMD_ENTER_KEY: u16 = 1997;
 fn main() {
+	theme::prefer_dark_app_mode();
 	if let Err(err) = App::create_and_run() {
 		w::HWND::NULL
 			.MessageBox(&err.to_string(), "fer GUI - uncaught error", co::MB::ICONERROR)
@@ -122,21 +132,119 @@ struct AppState {
 #[derive(Clone)]
 struct App {
 	wnd: gui::WindowMain,
+	/// 自绘菜单栏按钮（文件/编辑/视图/搜索/工具）。
+	menu_buttons: Vec<gui::Button>,
 	txt_query: gui::Edit,
 	btn_search: gui::Button,
 	/// 行负载 = 结果序号（供键盘/右键按行定位，不依赖 ListView 的 uid）。
 	list: gui::ListView<usize>,
-	chips: Vec<gui::Button>,
+	chips: Vec<gui::CheckBox>,
 	btn_du: gui::Button,
 	btn_up: gui::Button,
 	btn_rebuild: gui::Button,
 	btn_serve: gui::Button,
 	lbl_status: gui::Label,
 	lbl_index: gui::Label,
+	/// 深色画刷（裸句柄；进程退出由系统回收）。
+	brush_bg: isize,
+	brush_edit: isize,
+	/// 结果表小图标列表（裸句柄）与「文件类型 -> 图标序号」缓存。
+	icon_list: isize,
+	icons: Rc<RefCell<std::collections::HashMap<String, i32>>>,
 	client: Arc<FerClient>,
 	tx: Sender<TaskMsg>,
 	rx: Rc<RefCell<Receiver<TaskMsg>>>,
 	state: Rc<RefCell<AppState>>,
+}
+
+/// 把窗口位置夹回虚拟屏幕。
+///
+/// 多显示器下负坐标是合法的（左侧副屏），所以不能用「x < 0 就重置」的粗暴规则；
+/// 判据是窗口矩形与虚拟屏幕的交集面积是否达到 40%，不够就居中。
+fn clamp_window_pos(x: i32, y: i32, w: i32, h: i32) -> (i32, i32) {
+	use windows_sys::Win32::UI::WindowsAndMessaging::{
+		GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+		SM_YVIRTUALSCREEN,
+	};
+	unsafe {
+		let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+		let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+		let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+		let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+		let iw = (x + w).min(vx + vw) - x.max(vx);
+		let ih = (y + h).min(vy + vh) - y.max(vy);
+		let visible =
+			iw > 0 && ih > 0 && (iw as i64 * ih as i64) * 5 >= (w as i64 * h as i64) * 2;
+		if visible {
+			(x, y)
+		} else {
+			(vx + (vw - w) / 2, vy + (vh - h) / 2)
+		}
+	}
+}
+
+/// 取一个文件类型的小图标并加入 ImageList，返回图标序号（失败 -1）。
+///
+/// 用 `SHGFI_USEFILEATTRIBUTES`：按扩展名取系统通用图标，不访问磁盘，毫秒级返回。
+fn icon_index_for(icon_list: isize, path: &str, is_dir: bool) -> i32 {
+	use windows_sys::Win32::Storage::FileSystem::{
+		FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
+	};
+	use windows_sys::Win32::UI::Shell::{
+		SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_SMALLICON, SHGFI_USEFILEATTRIBUTES,
+	};
+	use windows_sys::Win32::UI::WindowsAndMessaging::DestroyIcon;
+
+	let mut shfi = unsafe { std::mem::zeroed::<SHFILEINFOW>() };
+	let attrs = if is_dir {
+		FILE_ATTRIBUTE_DIRECTORY
+	} else {
+		FILE_ATTRIBUTE_NORMAL
+	};
+	let wide = w::WString::from_str(path);
+	let ok = unsafe {
+		SHGetFileInfoW(
+			wide.as_ptr(),
+			attrs,
+			&mut shfi,
+			std::mem::size_of::<SHFILEINFOW>() as u32,
+			SHGFI_ICON | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES,
+		)
+	};
+	if ok == 0 || shfi.hIcon.is_null() {
+		return -1;
+	}
+	let himgl = unsafe { w::HIMAGELIST::from_ptr(icon_list as *mut std::ffi::c_void) };
+	let hicon = unsafe { w::HICON::from_ptr(shfi.hIcon) };
+	let idx = himgl.AddIcon(&hicon).map(|i| i as i32).unwrap_or(-1);
+	unsafe { DestroyIcon(shfi.hIcon) };
+	idx
+}
+
+/// 后台线程回包后唤醒 UI 泵。
+///
+/// 从后台线程 `SetTimer` 且传入有效 hwnd 时，定时器绑定到窗口所在的 UI 线程；
+/// 1ms 只是「尽快醒一次」，pump 处理完会自行 KillTimer。
+fn wake_pump(hwnd_raw: isize) {
+	unsafe {
+		windows_sys::Win32::UI::WindowsAndMessaging::SetTimer(
+			hwnd_raw as *mut std::ffi::c_void,
+			TIMER_PUMP,
+			1,
+			None,
+		);
+	}
+}
+
+/// Windows 的 MEASUREITEMSTRUCT（winsafe 未封装，按官方定义自声明）。
+#[repr(C)]
+struct MeasureItemStruct {
+	ctl_type: u32,
+	ctl_id: u32,
+	item_id: u32,
+	item_width: u32,
+	item_height: u32,
+	item_data: usize,
 }
 
 impl App {
@@ -144,12 +252,18 @@ impl App {
 		let cfg = Config::load();
 		let (tx, rx) = mpsc::channel::<TaskMsg>();
 
+		// 结果表的小图标列表；生命周期跟进程（forget 掉 guard，避免离开作用域即销毁）。
+		let icon_list = {
+			let himgl = w::HIMAGELIST::Create(w::SIZE::with(16, 16), co::ILC::COLOR32, 32, 32)
+				.map_err(|e| e.to_string())?;
+			let raw = himgl.ptr() as isize;
+			std::mem::forget(himgl);
+			raw
+		};
+
 		// 控件布局按默认逻辑尺寸计算；窗口几何（物理像素）在 bootstrap 里用 SetWindowPos 恢复。
 		let win_w = 1180;
 		let win_h = 720;
-
-		// Everything 式菜单栏（构建失败不阻塞启动，退化为无菜单）。
-		let app_menu = menu::build_menu_bar().unwrap_or(w::HMENU::NULL);
 
 		// 加速键表：由消息循环的 TranslateAccelerator 处理，不依赖焦点。
 		// 起因（R4-D1 实测）：comctl32 的 ListView 会吞掉 VK_ESCAPE、不产生 LVN_KEYDOWN，
@@ -172,16 +286,35 @@ impl App {
 		])
 		.ok();
 
+		let bg_brush = unsafe { w::HBRUSH::from_ptr(theme::solid(theme::BG)) };
 		let wnd = gui::WindowMain::new(gui::WindowMainOpts {
 			title: TITLE_BASE,
 			size: gui::dpi(win_w, win_h),
-			menu: app_menu,
+			// 系统菜单栏在 Win10 无法变深，改在客户区顶部自绘（见 menu_buttons）。
 			accel_table: accel,
+			class_icon: gui::Icon::Id(1),
+			class_bg_brush: gui::Brush::Handle(bg_brush),
 			..Default::default()
 		});
 
+		// 自绘菜单栏：扁平按钮，点击弹出 owner-draw 深色下拉菜单。
+		let menu_buttons: Vec<gui::Button> = menu::MENUS
+			.iter()
+			.enumerate()
+			.map(|(i, (title, _))| {
+				gui::Button::new(&wnd, gui::ButtonOpts {
+					text: title,
+					position: gui::dpi(PAD + i as i32 * 62, 0),
+					width: gui::dpi_x(58),
+					height: gui::dpi_y(MENU_H),
+					control_style: co::BS::FLAT,
+					..Default::default()
+				})
+			})
+			.collect();
+
 		let txt_query = gui::Edit::new(&wnd, gui::EditOpts {
-			position: gui::dpi(PAD, PAD),
+			position: gui::dpi(PAD, PAD + MENU_H),
 			width: gui::dpi_x(win_w - PAD * 2 - 110),
 			height: gui::dpi_y(26),
 			control_style: co::ES::AUTOHSCROLL,
@@ -191,7 +324,7 @@ impl App {
 
 		let btn_search = gui::Button::new(&wnd, gui::ButtonOpts {
 			text: "搜索",
-			position: gui::dpi(win_w - PAD - 100, PAD),
+			position: gui::dpi(win_w - PAD - 100, PAD + MENU_H),
 			width: gui::dpi_x(100),
 			height: gui::dpi_y(26),
 			resize_behavior: (gui::Horz::Repos, gui::Vert::None),
@@ -204,47 +337,46 @@ impl App {
 		let tools_x = PAD + 6 * 70 + 14;
 		let btn_du = gui::Button::new(&wnd, gui::ButtonOpts {
 			text: "占用分析",
-			position: gui::dpi(tools_x, PAD + 32),
+			position: gui::dpi(tools_x, PAD + MENU_H + 32),
 			width: gui::dpi_x(80),
 			height: gui::dpi_y(24),
 			..Default::default()
 		});
 		let btn_up = gui::Button::new(&wnd, gui::ButtonOpts {
 			text: "返回上级",
-			position: gui::dpi(tools_x + 84, PAD + 32),
+			position: gui::dpi(tools_x + 84, PAD + MENU_H + 32),
 			width: gui::dpi_x(80),
 			height: gui::dpi_y(24),
 			..Default::default()
 		});
 		let btn_rebuild = gui::Button::new(&wnd, gui::ButtonOpts {
 			text: "重建索引",
-			position: gui::dpi(tools_x + 168, PAD + 32),
+			position: gui::dpi(tools_x + 168, PAD + MENU_H + 32),
 			width: gui::dpi_x(80),
 			height: gui::dpi_y(24),
 			..Default::default()
 		});
 		let btn_serve = gui::Button::new(&wnd, gui::ButtonOpts {
 			text: "启动服务",
-			position: gui::dpi(tools_x + 252, PAD + 32),
+			position: gui::dpi(tools_x + 252, PAD + MENU_H + 32),
 			width: gui::dpi_x(80),
 			height: gui::dpi_y(24),
 			..Default::default()
 		});
 
 		let list = gui::ListView::<usize>::new(&wnd, gui::ListViewOpts {
-			position: gui::dpi(PAD, PAD + 34 + 30),
-			size: gui::dpi(win_w - PAD * 2, win_h - PAD * 2 - 34 - 30 - 22),
+			position: gui::dpi(PAD, PAD + MENU_H + 34 + 30),
+			size: gui::dpi(win_w - PAD * 2, win_h - PAD * 2 - MENU_H - 34 - 30 - 22),
 			control_style: co::LVS::REPORT | co::LVS::SHOWSELALWAYS,
 			control_ex_style: co::LVS_EX::FULLROWSELECT
-				| co::LVS_EX::DOUBLEBUFFER
-				| co::LVS_EX::GRIDLINES,
+				| co::LVS_EX::DOUBLEBUFFER,
 			resize_behavior: (gui::Horz::Resize, gui::Vert::Resize),
 			columns: &[
-				("名称", gui::dpi_x(260)),
-				("路径", gui::dpi_x(540)),
-				("大小", gui::dpi_x(90)),
-				("修改时间", gui::dpi_x(140)),
-				("类型", gui::dpi_x(90)),
+				("名称", gui::dpi_x(300)),
+				("所在目录", gui::dpi_x(430)),
+				("大小", gui::dpi_x(80)),
+				("修改时间", gui::dpi_x(130)),
+				("类型", gui::dpi_x(60)),
 			],
 			..Default::default()
 		});
@@ -288,6 +420,7 @@ impl App {
 
 		let app = Self {
 			wnd,
+			menu_buttons,
 			txt_query,
 			btn_search,
 			list,
@@ -298,6 +431,10 @@ impl App {
 			btn_serve,
 			lbl_status,
 			lbl_index,
+			brush_bg: theme::solid(theme::BG) as isize,
+			brush_edit: theme::solid(theme::EDIT_BG) as isize,
+			icon_list,
+			icons: Rc::new(RefCell::new(std::collections::HashMap::new())),
 			client,
 			tx,
 			rx: Rc::new(RefCell::new(rx)),
@@ -322,20 +459,39 @@ impl App {
 		app.wnd.run_main(None)
 	}
 
-	fn build_chips(wnd: &gui::WindowMain) -> Vec<gui::Button> {
+	fn build_chips(wnd: &gui::WindowMain) -> Vec<gui::CheckBox> {
 		CHIP_DEFS
 			.iter()
 			.enumerate()
-			.map(|(i, (label, _))| {
-				gui::Button::new(wnd, gui::ButtonOpts {
+			.map(|(i, (label, _, _))| {
+				gui::CheckBox::new(wnd, gui::CheckBoxOpts {
 					text: label,
-					position: gui::dpi(PAD + i as i32 * 70, PAD + 32),
-					width: gui::dpi_x(66),
-					height: gui::dpi_y(24),
+					// Everything 式：筛选 chip 横排在搜索框下方。
+					position: gui::dpi(PAD + i as i32 * 70, PAD + MENU_H + 32),
+					size: gui::dpi(66, 24),
+					// PUSHLIKE：AutoCheckBox 呈现为可按下的按钮，按下态 = 该条件已启用。
+					control_style: co::BS::AUTOCHECKBOX | co::BS::PUSHLIKE,
 					..Default::default()
 				})
 			})
 			.collect()
+	}
+
+	/// 弹出第 index 个下拉菜单（owner-draw，配色由 WM_DRAWITEM 处理）。
+	fn show_menu(&self, index: usize) {
+		let Ok(mut popup) = menu::build_popup_at(index) else {
+			return;
+		};
+		let Some(btn) = self.menu_buttons.get(index) else {
+			return;
+		};
+		let Ok(rc) = btn.hwnd().GetWindowRect() else {
+			let _ = popup.DestroyMenu();
+			return;
+		};
+		let pt = w::POINT { x: rc.left, y: rc.bottom };
+		let _ = popup.track_popup_menu_at_point(pt, self.wnd.hwnd(), self.wnd.hwnd());
+		let _ = popup.DestroyMenu();
 	}
 
 	fn events(&self) {
@@ -346,6 +502,16 @@ impl App {
 				Ok(())
 			}
 		});
+
+		for (i, btn) in self.menu_buttons.iter().enumerate() {
+			btn.on().bn_clicked({
+				let app = self.clone();
+				move || {
+					app.show_menu(i);
+					Ok(())
+				}
+			});
+		}
 
 		self.txt_query.on().en_change({
 			let app = self.clone();
@@ -402,7 +568,7 @@ impl App {
 			chip.on().bn_clicked({
 				let app = self.clone();
 				move || {
-					app.apply_chip(CHIP_DEFS[i].1);
+					app.apply_chip(CHIP_DEFS[i].1, CHIP_DEFS[i].2);
 					Ok(())
 				}
 			});
@@ -492,6 +658,25 @@ impl App {
 			});
 		}
 
+		// 深色：表头文字用自绘 HDC 文字色（控件主题只换背景，不换表头字色）。
+		if let Some(header) = self.list.header() {
+			header.on().nm_custom_draw(|p| {
+				use winsafe::co::{CDDS, CDRF};
+				if p.dwDrawStage == CDDS::PREPAINT {
+					return Ok(CDRF::NOTIFYITEMDRAW);
+				}
+				if p.dwDrawStage == CDDS::ITEMPREPAINT {
+					unsafe {
+						use windows_sys::Win32::Graphics::Gdi::{SetBkColor, SetTextColor};
+						SetTextColor(p.hdc.ptr(), theme::FG_DIM);
+						SetBkColor(p.hdc.ptr(), theme::BG);
+					}
+					return Ok(CDRF::NEWFONT);
+				}
+				Ok(CDRF::DODEFAULT)
+			});
+		}
+
 		self.list.on().lvn_column_click({
 			let app = self.clone();
 			move |p: &w::NMLISTVIEW| {
@@ -502,9 +687,122 @@ impl App {
 
 		// 定时器必须在窗口真正创建之后才能设置：run_main 之前 hwnd 还是 NULL，
 		// 此时 SetTimer(NULL, ..) 会把定时器绑到线程而非窗口，WM_TIMER 永远到不了窗口过程。
+		// owner-draw 下拉菜单：度量与绘制（Win10 系统菜单不支持深色，必须自绘）。
+		self.wnd.on().wm(unsafe { co::WM::from_raw(0x002C) }, |p| {
+			unsafe {
+				let mis = &mut *(p.lparam as *mut MeasureItemStruct);
+				if mis.ctl_type == 1 {
+					mis.item_width = 220;
+					mis.item_height = 26;
+				}
+			}
+			Ok(1)
+		});
+
+		self.wnd.on().wm(unsafe { co::WM::from_raw(0x002B) }, |p| {
+			unsafe {
+				use windows_sys::Win32::Graphics::Gdi::{
+					DrawTextW, FillRect, SetBkMode, SetTextColor,
+				};
+				let dis = &mut *(p.lparam as *mut w::DRAWITEMSTRUCT);
+				if dis.CtlType == co::ODT::MENU {
+					// winsafe 的 RECT 与 windows-sys 的是不同类型，需逐字段转换。
+					let mut rc = windows_sys::Win32::Foundation::RECT {
+						left: dis.rcItem.left,
+						top: dis.rcItem.top,
+						right: dis.rcItem.right,
+						bottom: dis.rcItem.bottom,
+					};
+					let bg = theme::solid(theme::LIST_BG);
+					FillRect(dis.hDC.ptr(), &rc, bg);
+					if dis.itemID != u32::MAX && dis.itemData != 0 {
+						if dis.itemState.raw() & co::ODS::SELECTED.raw() != 0 {
+							let sel = theme::solid(theme::SELECT);
+							FillRect(dis.hDC.ptr(), &rc, sel);
+						}
+						rc.left += 12;
+						SetBkMode(dis.hDC.ptr(), 1);
+						SetTextColor(dis.hDC.ptr(), theme::FG);
+						DrawTextW(dis.hDC.ptr(), dis.itemData as *const u16, -1, &mut rc, 0x0024);
+					}
+				}
+			}
+			Ok(1)
+		});
+
+		// 深色：编辑框与标签的底色/文字色（控件主题不覆盖这两项）。
+		self.wnd.on().wm_ctl_color_edit({
+			let app = self.clone();
+			move |p: w::msg::WmCtlColorEdit| {
+				unsafe {
+					use windows_sys::Win32::Graphics::Gdi::{SetBkColor, SetTextColor};
+					SetTextColor(p.hdc.ptr(), theme::FG);
+					SetBkColor(p.hdc.ptr(), theme::EDIT_BG);
+				}
+				Ok(unsafe { w::HBRUSH::from_ptr(app.brush_edit as *mut std::ffi::c_void) })
+			}
+		});
+
+		self.wnd.on().wm_ctl_color_static({
+			let app = self.clone();
+			move |p: w::msg::WmCtlColorStatic| {
+				unsafe {
+					use windows_sys::Win32::Graphics::Gdi::{SetBkColor, SetTextColor};
+					SetTextColor(p.hdc.ptr(), theme::FG_DIM);
+					SetBkColor(p.hdc.ptr(), theme::BG);
+				}
+				Ok(unsafe { w::HBRUSH::from_ptr(app.brush_bg as *mut std::ffi::c_void) })
+			}
+		});
+
 		self.wnd.on().wm_create({
 			let app = self.clone();
 			move |_p: w::msg::WmCreate| -> w::AnyResult<i32> {
+				let wnd_raw = app.wnd.hwnd().ptr();
+				theme::apply_window(wnd_raw);
+				theme::apply_control(app.list.hwnd().ptr(), "DarkMode_ItemsView");
+				if let Some(header) = app.list.header() {
+					theme::apply_control(header.hwnd().ptr(), "DarkMode_ItemsView");
+				}
+				// 列表内部滚动条是独立子窗口，主题不自动继承，单独刷一次。
+				unsafe {
+					use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowExW, GetWindowLongW};
+					let mut child = FindWindowExW(app.list.hwnd().ptr(), std::ptr::null_mut(), w::WString::from_str("ScrollBar").as_ptr(), std::ptr::null());
+					while !child.is_null() {
+						theme::apply_control(child, "DarkMode_Explorer");
+						let style = GetWindowLongW(child, -16);
+						if style & 0x0000_0001 != 0 {
+							theme::apply_control(child, "DarkMode_Explorer");
+						}
+						child = FindWindowExW(app.list.hwnd().ptr(), child, w::WString::from_str("ScrollBar").as_ptr(), std::ptr::null());
+					}
+				}
+				theme::apply_control(app.txt_query.hwnd().ptr(), "DarkMode_Explorer");
+				for b in [
+					&app.btn_search,
+					&app.btn_du,
+					&app.btn_up,
+					&app.btn_rebuild,
+					&app.btn_serve,
+				] {
+					theme::apply_control(b.hwnd().ptr(), "DarkMode_Explorer");
+				}
+				for c in &app.chips {
+					theme::apply_control(c.hwnd().ptr(), "DarkMode_Explorer");
+				}
+				// 列表背景/文字色不在主题覆盖范围内，需显式设定。
+				use windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW;
+				const LVM_SETBKCOLOR: u32 = 0x1000 + 1;
+				const LVM_SETTEXTCOLOR: u32 = 0x1000 + 36;
+				const LVM_SETTEXTBKCOLOR: u32 = 0x1000 + 38;
+				const LVM_SETIMAGELIST: u32 = 0x1000 + 3;
+				const LVSIL_SMALL: usize = 1;
+				unsafe {
+					SendMessageW(app.list.hwnd().ptr(), LVM_SETBKCOLOR, 0, theme::LIST_BG as isize);
+					SendMessageW(app.list.hwnd().ptr(), LVM_SETTEXTCOLOR, 0, theme::FG as isize);
+					SendMessageW(app.list.hwnd().ptr(), LVM_SETTEXTBKCOLOR, 0, theme::LIST_BG as isize);
+					SendMessageW(app.list.hwnd().ptr(), LVM_SETIMAGELIST, LVSIL_SMALL, app.icon_list);
+				}
 				app.start_timers();
 				Ok(0)
 			}
@@ -530,16 +828,44 @@ impl App {
 	// ---------------- 搜索流程 ----------------
 
 	/// 快捷 chip：把 term 追加到查询串末尾并立即搜索。
-	fn apply_chip(&self, term: &str) {
+	/// 应用/取消一个快捷筛选 chip。
+	///
+	/// 语义是**开关**而非追加：已存在则移除；不存在则加入，并先剔除同组互斥项。
+	/// 互斥剔除只针对本组已定义的 chip 值，用户手写的同前缀条件（如 `dm:2020-01-01`）不动。
+	fn apply_chip(&self, term: &str, group: Option<&str>) {
 		let cur = self.txt_query.text().unwrap_or_default();
-		let cur = cur.trim();
-		let next = if cur.is_empty() {
-			term.to_string()
+		let mut tokens: Vec<String> =
+			cur.split_whitespace().map(|t| t.to_string()).collect();
+
+		let present = tokens.iter().any(|t| t.eq_ignore_ascii_case(term));
+
+		if present {
+			tokens.retain(|t| !t.eq_ignore_ascii_case(term));
 		} else {
-			format!("{cur} {term}")
-		};
+			if let Some(group) = group {
+				let group_terms: Vec<&str> = CHIP_DEFS
+					.iter()
+					.filter(|(_, _, g)| *g == Some(group))
+					.map(|(_, t, _)| *t)
+					.collect();
+				tokens.retain(|t| !group_terms.iter().any(|gt| t.eq_ignore_ascii_case(gt)));
+			}
+			tokens.push(term.to_string());
+		}
+
+		let next = tokens.join(" ");
 		let _ = self.txt_query.set_text(&next);
+		self.sync_chip_states();
 		self.trigger_search_now();
+	}
+
+	/// 让 chip 的按下态与查询串保持一致（用户手改查询串也会反映）。
+	fn sync_chip_states(&self) {
+		let cur = self.txt_query.text().unwrap_or_default();
+		let tokens: Vec<&str> = cur.split_whitespace().collect();
+		for (chip, (_, term, _)) in self.chips.iter().zip(CHIP_DEFS.iter()) {
+			chip.set_check(tokens.iter().any(|t| t.eq_ignore_ascii_case(term)));
+		}
 	}
 
 	/// 关闭时落盘：上次查询 / 排序 / limit（窗口几何在下一批补）。
@@ -570,9 +896,14 @@ impl App {
 	/// 输入变化：登记待发起（由 WM_TIMER 做防抖）。
 	fn on_query_changed(&self) {
 		let text = self.txt_query.text().unwrap_or_default();
-		let mut st = self.state.borrow_mut();
-		st.pending_query = text;
-		st.pending_since_ms = query::now_ms();
+		{
+			let mut st = self.state.borrow_mut();
+			st.pending_query = text;
+			st.pending_since_ms = query::now_ms();
+		}
+		self.sync_chip_states();
+		// 拉起泵，直到防抖到期并处理完（pump 空闲时自行 KillTimer）。
+		let _ = self.wnd.hwnd().SetTimer(TIMER_PUMP, TIMER_PUMP_MS, None);
 	}
 
 	/// 立即搜索（按钮 / Enter）。
@@ -597,11 +928,13 @@ impl App {
 		let req = self.state.borrow_mut().search.begin(query);
 		let tx = self.tx.clone();
 		let client = self.client.clone();
+		let hwnd_raw = self.wnd.hwnd().ptr() as isize;
 		self.wnd.spawn_thread(move || {
 			let result = client
 				.search(&req.query, req.limit, Some(req.sort.as_api()), req.desc)
 				.map_err(|e| e.to_string());
 			let _ = tx.send(TaskMsg::Search { generation: req.generation, result });
+			wake_pump(hwnd_raw);
 			Ok(())
 		});
 	}
@@ -693,12 +1026,14 @@ impl App {
 		self.set_status("已请求全量重扫…");
 		let tx = self.tx.clone();
 		let client = self.client.clone();
+		let hwnd_raw = self.wnd.hwnd().ptr() as isize;
 		self.wnd.spawn_thread(move || {
 			let line = match client.rescan() {
 				Ok(()) => "全量重扫请求已提交".to_string(),
 				Err(e) => format!("全量重扫失败：{e}"),
 			};
 			let _ = tx.send(TaskMsg::IndexInfo(line));
+			wake_pump(hwnd_raw);
 			Ok(())
 		});
 	}
@@ -750,12 +1085,14 @@ impl App {
 		self.set_status("已请求重建索引（后台执行，完成后结果会自动刷新）…");
 		let tx = self.tx.clone();
 		let client = self.client.clone();
+		let hwnd_raw = self.wnd.hwnd().ptr() as isize;
 		self.wnd.spawn_thread(move || {
 			let line = match client.rebuild() {
 				Ok(()) => "重建请求已提交（monitor 正在重扫本卷）".to_string(),
 				Err(e) => format!("重建失败：{e}"),
 			};
 			let _ = tx.send(TaskMsg::IndexInfo(line));
+			wake_pump(hwnd_raw);
 			Ok(())
 		});
 	}
@@ -765,9 +1102,11 @@ impl App {
 		self.set_status("正在启动 fer serve…");
 		let tx = self.tx.clone();
 		let addr = self.client.addr().to_string();
+		let hwnd_raw = self.wnd.hwnd().ptr() as isize;
 		self.wnd.spawn_thread(move || {
 			let st = serve_ctl::ensure_serve(&addr, Duration::from_secs(2), 8000);
 			let _ = tx.send(TaskMsg::ServeUp(st));
+			wake_pump(hwnd_raw);
 			Ok(())
 		});
 	}
@@ -785,16 +1124,19 @@ impl App {
 			st.mode = Mode::Du { root: root.clone() };
 			st.du_generation
 		};
+		let _ = self.btn_up.hwnd().EnableWindow(true);
 		let _ = self.wnd.hwnd().SetWindowText(&format!("{TITLE_BASE} - 占用分析"));
 		self.set_status(&format!("正在分析占用：{root} …"));
 		let tx = self.tx.clone();
 		let client = self.client.clone();
 		let path = root.clone();
+		let hwnd_raw = self.wnd.hwnd().ptr() as isize;
 		self.wnd.spawn_thread(move || {
 			let result = client
 				.du(&path, Some(1), Some(300), false)
 				.map_err(|e| e.to_string());
 			let _ = tx.send(TaskMsg::Du { generation, result });
+			wake_pump(hwnd_raw);
 			Ok(())
 		});
 	}
@@ -817,10 +1159,11 @@ impl App {
 			return;
 		}
 		self.state.borrow_mut().mode = Mode::Search;
+		let _ = self.btn_up.hwnd().EnableWindow(false);
 		// 即使查询框为空（此时 trigger_search_now 会走 clear_results 提前返回，不经过 render），
 		// 也要把标题与列头切回搜索态 —— 否则退出占用视图后界面外观停在占用模式（R3-D1）。
 		let _ = self.wnd.hwnd().SetWindowText(TITLE_BASE);
-		self.set_column_titles(["名称", "路径", "大小", "修改时间", "类型"]);
+		self.set_column_titles(["名称", "所在目录", "大小", "修改时间", "类型"]);
 		self.trigger_search_now();
 	}
 
@@ -894,7 +1237,9 @@ impl App {
 	}
 
 	fn start_timers(&self) {
-		let _ = self.wnd.hwnd().SetTimer(TIMER_PUMP, TIMER_PUMP_MS, None);
+		// 泵按「空闲低频 + 按需加速」运行：空闲 5Hz 兜底，输入防抖期间 40ms，
+		// 后台回包时 wake_pump 拉到 1ms 立即处理。常驻 25Hz 空泵实测占 0.94% 单核。
+		let _ = self.wnd.hwnd().SetTimer(TIMER_PUMP, TIMER_IDLE_MS, None);
 		let _ = self.wnd.hwnd().SetTimer(TIMER_STATS, TIMER_STATS_MS, None);
 	}
 
@@ -903,19 +1248,25 @@ impl App {
 		// 恢复上次窗口位置与尺寸（存的是物理像素，直接喂 SetWindowPos）。
 		let cfg = self.state.borrow().cfg.clone();
 		if cfg.win_x != i32::MIN && cfg.win_w >= 400 && cfg.win_h >= 300 {
+			// 显示器布局可能已变（拔掉副屏/改分辨率），旧坐标可能整窗落在屏幕外。
+			let (px, py) = clamp_window_pos(cfg.win_x, cfg.win_y, cfg.win_w, cfg.win_h);
 			let _ = self.wnd.hwnd().SetWindowPos(
 				w::HwndPlace::None,
-				w::POINT { x: cfg.win_x, y: cfg.win_y },
+				w::POINT { x: px, y: py },
 				w::SIZE { cx: cfg.win_w, cy: cfg.win_h },
 				co::SWP::NOZORDER | co::SWP::NOACTIVATE,
 			);
 		}
+		let _ = self.btn_up.hwnd().EnableWindow(false);
 		self.refresh_index_info();
+		self.update_sort_arrow();
+		self.layout_columns();
 		let initial = self.state.borrow().cfg.last_query.clone();
 		if !initial.is_empty() {
 			let _ = self.txt_query.set_text(&initial);
 			self.on_query_changed();
 		}
+		self.sync_chip_states();
 	}
 
 	/// WM_TIMER：消费后台消息 + 防抖到期发起搜索。
@@ -956,6 +1307,14 @@ impl App {
 				Err(_) => break,
 			}
 		}
+
+		// 按当前是否有防抖待办决定下一拍频率；SetTimer 对已存在的 id 会重置间隔。
+		let interval = if self.state.borrow().pending_since_ms != 0 {
+			TIMER_PUMP_MS
+		} else {
+			TIMER_IDLE_MS
+		};
+		let _ = self.wnd.hwnd().SetTimer(TIMER_PUMP, interval, None);
 	}
 
 	fn handle(&self, msg: TaskMsg) {
@@ -984,6 +1343,9 @@ impl App {
 			}
 			TaskMsg::IndexInfo(line) => {
 				self.state.borrow_mut().index_line = line.clone();
+				// serve 在线时「启动服务」无意义，置灰避免重复拉起。
+				let online = !line.starts_with("serve 未连接");
+				let _ = self.btn_serve.hwnd().EnableWindow(!online);
 				let _ = self.lbl_index.set_text_and_resize(&line);
 			}
 		}
@@ -1000,19 +1362,58 @@ impl App {
 		}
 	}
 
+	/// 按「文件类型」缓存图标序号；同一扩展名只取一次。
+	fn icon_for(&self, key: &str, path: &str, is_dir: bool) -> i32 {
+		if let Some(v) = self.icons.borrow().get(key) {
+			return *v;
+		}
+		let idx = icon_index_for(self.icon_list, path, is_dir);
+		self.icons.borrow_mut().insert(key.to_string(), idx);
+		idx
+	}
+
+	/// 让「所在目录」列吃掉除固定列以外的全部宽度，避免右侧留下一条空白带。
+	fn layout_columns(&self) {
+		let Ok(rc) = self.list.hwnd().GetClientRect() else {
+			return;
+		};
+		let total_w = rc.right - rc.left;
+		// 名称 / 大小 / 修改时间 / 类型 固定；-24 给垂直滚动条留位。
+		let fixed = gui::dpi_x(300) + gui::dpi_x(80) + gui::dpi_x(130) + gui::dpi_x(60) + 24;
+		let dir_w = (total_w - fixed).max(gui::dpi_x(180));
+		if let Ok(cols) = self.list.cols().iter() {
+			let v: Vec<_> = cols.collect();
+			if let Some(col) = v.get(1) {
+				let _ = col.set_width(dir_w);
+			}
+		}
+	}
+
 	fn render(&self, res: &SearchResult) {
+		self.layout_columns();
 		let _ = self.wnd.hwnd().SetWindowText(TITLE_BASE);
-		self.set_column_titles(["名称", "路径", "大小", "修改时间", "类型"]);
+		self.set_column_titles(["名称", "所在目录", "大小", "修改时间", "类型"]);
 		self.list.set_redraw(false);
 		let _ = self.list.items().delete_all();
 		let mut shown = 0usize;
 		for hit in &res.hits {
 			let name = format::file_name(&hit.path).to_string();
-			let path = hit.path.clone();
+			// 名称已含路径最后一段；这里只放所在目录，避免两列重复且都被截断。
+			let dir = format::parent_of(&hit.path).unwrap_or_default();
 			let size = if hit.is_dir { String::new() } else { format::human_size(hit.size) };
 			let mtime = format::format_time(hit.mtime);
-			let kind = format::type_label(&hit.path, hit.is_dir);
-			if self.list.items().add(&[name, path, size, mtime, kind], None, shown).is_ok() {
+			let kind = if hit.is_dir {
+				"文件夹".to_string()
+			} else {
+				std::path::Path::new(&hit.path)
+					.extension()
+					.and_then(|e| e.to_str())
+					.map(|e| e.to_ascii_lowercase())
+					.unwrap_or_default()
+			};
+			let icon = self.icon_for(&kind, &hit.path, hit.is_dir);
+			let icon_opt = if icon >= 0 { Some(icon as u32) } else { None };
+			if self.list.items().add(&[name, dir, size, mtime, kind], icon_opt, shown).is_ok() {
 				shown += 1;
 			}
 		}
@@ -1029,6 +1430,7 @@ impl App {
 			),
 		};
 		self.set_status(&status);
+		self.update_sort_arrow();
 	}
 
 	fn set_status(&self, text: &str) {
@@ -1189,7 +1591,38 @@ impl App {
 			let mut st = self.state.borrow_mut();
 			st.search.cycle_sort(key);
 		}
+		self.update_sort_arrow();
 		self.trigger_search_now();
+	}
+
+	/// 在表头显示当前排序方向（缺它用户不知道按什么排、是升还是降）。
+	fn update_sort_arrow(&self) {
+		let (sort, desc) = self.state.borrow().search.sort();
+		let active = match sort {
+			SortKey::Name => Some(0usize),
+			SortKey::Path => Some(1),
+			SortKey::Size => Some(2),
+			SortKey::Mtime => Some(3),
+			_ => None,
+		};
+		let Some(header) = self.list.header() else {
+			return;
+		};
+		let Ok(items) = header.items().iter() else {
+			return;
+		};
+		for (i, item) in items.enumerate() {
+			let arrow = if Some(i) == active {
+				if desc {
+					gui::HeaderArrow::Desc
+				} else {
+					gui::HeaderArrow::Asc
+				}
+			} else {
+				gui::HeaderArrow::None
+			};
+			let _ = item.set_arrow(arrow);
+		}
 	}
 
 	// ---------------- 索引状态 ----------------
@@ -1197,6 +1630,7 @@ impl App {
 	fn refresh_index_info(&self) {
 		let tx = self.tx.clone();
 		let client = self.client.clone();
+		let hwnd_raw = self.wnd.hwnd().ptr() as isize;
 		self.wnd.spawn_thread(move || {
 			let line = match client.stats() {
 				Ok(s) => {
@@ -1207,10 +1641,9 @@ impl App {
 					);
 					if let Ok(f) = client.feed() {
 						out.push_str(&format!(
-							" · 实时 Δ{} / 待删 {}{}",
+							" · 实时 +{}{}",
 							format::human_count(f.delta_entries),
-							format::human_count(f.pending_remove),
-							if f.saturated { " · 已饱和（建议重建）" } else { "" },
+							if f.saturated { " · 已饱和" } else { "" },
 						));
 					}
 					out.push_str(&format!(" · {}", client.addr()));
@@ -1219,6 +1652,7 @@ impl App {
 				Err(_) => format!("serve 未连接（{}）", client.addr()),
 			};
 			let _ = tx.send(TaskMsg::IndexInfo(line));
+			wake_pump(hwnd_raw);
 			Ok(())
 		});
 	}
