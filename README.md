@@ -28,8 +28,8 @@
 - **过滤查询语言**：`ext: size: dm: dc: type: hidden: parent: path: name:` + 取反（`!`）
 - **实时监控**：`fer monitor` 轮询 USN 日志增量更新（删除按 FRN 直删；内容写大、属性变更
   `attrib +h`、`SetFileTime` touch 都在一个轮询周期内刷新元数据）；变更经推送 overlay
-  **实测 1-5 秒**出现在 CLI 与网页；停机重启自动从 pending 快照续跑，不必手工 `fer index`
-- **HTTP API + 网页 UI** + **CLI --json**（稳定 JSON 输出，面向 agent）
+  **实测 1-5 秒**出现在 CLI 与 GUI；停机重启自动从 pending 快照续跑，不必手工 `fer index`
+- **HTTP API + 桌面 GUI** + **CLI --json**（稳定 JSON 输出，面向 agent）
 - **Everything 架构**：`fer index` 一次性把全盘扫进内存引擎并写成
   **FERIDX01 dump**（~1.2GB）；查询全靠内存的排序数组 + **整 arena 单遍 SIMD 扫描**
   （子串/正则走 memchr 大缓冲扫 + `name_offs`/`path_offs` 游标映射）+
@@ -43,16 +43,13 @@
 
 仅支持 Windows（依赖 NTFS `$MFT` / USN 原生 API）。
 
-网页 UI（`webui/dist/index.html`）是构建产物、不入库，**首次构建要先编一次前端**
-（需 Node.js）——`build.rs` 在它缺失时会 panic 并打印同样的命令：
-
 ```bash
-cd webui
-npm install
-npm run build                       # vite-plugin-singlefile → 单文件 dist/index.html（供 include_str! 嵌入）
-cd ..
 cargo build --release               # 产物 target-gnu/release/fer.exe（独立 exe，无运行时依赖）
 cargo build --profile min-size      # 精简编译（opt-level="z"）
+
+# 桌面 GUI（可选）：需要 windres 在 PATH（本机在 DevEnv\mingw64\bin，可用 WINDRES 覆盖）
+cargo build --release --features gui --bin fer-gui
+# 产物 target-gnu/release/fer-gui.exe
 ```
 
 没有 MSVC 链接器时可走 GNU 工具链：
@@ -75,7 +72,7 @@ fer search "ext:mp4 size:>1gb dm:thisweek"   # 过滤查询语言
 fer search "foo" --limit 50 --count-only     # 只看命中数
 fer search "size:>1gb" --sort size --desc --limit 10   # 服务端排序：全库最大的 10 个文件
 fer search "ext:log dm:today" --sort mtime --desc      # 最新的日志排在最前
-fer serve --addr 127.0.0.1:19876   # HTTP API + 网页 UI（默认端口）
+fer serve --addr 127.0.0.1:19876   # HTTP API（默认端口）
 fer upgrade                          # 格式迁移：老 dump 就地重建 trigram 段并写为最新版（免管理员）
 fer monitor --volume D               # USN 实时增量（需管理员）
 fer monitor --volume D,H             # 多卷监视（逗号列表或重复传参；每卷独立 journal）
@@ -157,7 +154,6 @@ GET /api/search?q=<query>&limit=<n>&sort=<key>&desc=<0|1> → 命中列表（带
 GET /api/du?path=<p>&depth=<n>&top=<n>&allocated=<bool> → 目录占用聚合（WizTree 式，字段同 `fer du --json`）
 GET /api/stats                      → 索引统计 + 卷列表
 POST /api/rescan                    → 后台全量重建
-GET /                              → 网页搜索 UI
 ```
 
 搜索响应（hits 为数组，`total` 为未截断的总命中数）：
@@ -194,6 +190,31 @@ curl -X POST http://127.0.0.1:19876/api/rescan
 - **稳定契约**：`--json` 输出与 `/api/*` 的字段名视为稳定 API；`took_ms`/`total` 仅供观测。
 - 已知边界：2 字短查询（尤其中文）走全名扫描，~60-150 ms；硬链接别名均已收录。
 
+## 桌面 GUI（fer-gui）
+
+`src/bin/fer-gui` 是 Everything 式的 Windows 原生前端：纯 Rust + winsafe（手写 Win32 绑定），
+**单 exe、无 WebView2、无第三方运行时**；数据面走常驻 `fer serve` 的 HTTP API
+（默认 `127.0.0.1:19876`，可用 `FER_GUI_ADDR` 覆盖）。
+
+编译：`cargo build --release --features gui --bin fer-gui`（需要 windres 在 PATH）。
+运行前确保 `fer serve` 在线。
+
+功能全部从菜单 / 工具栏 / 右键进入，**搜索框只做搜索**：
+
+- **搜索框**：输入即搜（150ms 防抖 + 代际号丢弃过期响应），语法完全沿用 fer
+- **菜单栏 / 工具栏 / 快捷 chip**：文件 / 目录 / 今天 / 本周 / >1MB / 隐藏
+- **结果表**：名称 / 路径 / 大小 / 修改时间 / 类型；点击列头三态排序（排序在服务端做）
+- **行交互**：双击 = 资源管理器定位；右键 = 打开 / 定位 / 分析此目录占用 /
+  复制路径·文件名·所在目录
+- **占用视图**：面包屑导航，`Backspace` 返回上级，列头切换 大小 / 文件数 / 占用
+- **最近查询**：`Ctrl+H`；窗口几何与上次查询持久化到 `%LOCALAPPDATA%\fer-gui\config.json`
+- **状态栏**：命中数 / 引擎耗时 / 索引条目数 / 实时 overlay 增量 / serve 地址（4s 轮询）
+
+快捷键：`Enter` 立即搜索或打开选中项，`Ctrl+C` 复制聚焦行路径，`Ctrl+H` 最近查询，
+`Backspace` 占用视图返回上级，`Esc` 退出占用视图。
+
+模块接口契约见 `docs/gui/INTERFACES.md`。
+
 ## 架构
 
 ```
@@ -213,7 +234,8 @@ src/
 ├── indexer.rs  build 编排：auto = 纯 MFT；usn/walk 仅显式可选（非提权硬拒绝）
 ├── monitor.rs  USN 日志轮询 → 内存增量（FRN 直删）+ 防抖写回 dump
 ├── dupes.rs    重复文件查找（同大小分组 + FNV 哈希 + 字节校验）
-├── server.rs   axum HTTP API + 内嵌网页
+├── server.rs   axum HTTP API
+├── bin/fer-gui/ 桌面 GUI（winsafe 手写 Win32；--features gui 才编译）
 └── main.rs     fer CLI（clap，--json 全局开关）
 ```
 
@@ -371,7 +393,7 @@ serve 稳态（引擎侧 took_ms，预热线程 + TTL 缓存）：`ext:rs` 0ms�
 - trigram 段只覆盖文件名（≥3 字节子串）；路径子串与 <3 字节子串走 arena 扫描
 - **实时更新的范围**（三条必须同时成立）：① 卷在 `monitor --volume` 列表里（本机 `D,H`；
   C/E/F/G 的变更要等 `fer index` / `fer rebuild`）② 查询走 serve —— 变更先进 serve 的 overlay，
-  `fer search`（默认自动转发）与网页秒级可见，而**直读 dump 的路径**（`--db`、serve 未运行）
+  `fer search`（默认自动转发）与 GUI 的查询秒级可见，而**直读 dump 的路径**（`--db`、serve 未运行）
   看不到未落盘的部分（dump 仍是每 `--flush-secs` 重写一次，`fer flush` 可立刻落盘）
   ③ 变更属于创建/删除/重命名/硬链接增删/内容写/属性设置；安全描述符与 EA 变更不在 mask 内。
   目录的改名/移动会**连带迁移其子树**（2026-10-12 起）：Windows 只对目录本身发两条 rename 记录，
@@ -414,6 +436,6 @@ serve 稳态（引擎侧 took_ms，预热线程 + TTL 缓存）：`ext:rs` 0ms�
 | 硬链接别名 | 无 | 有 | 有 |
 | 大小/时间/属性 | 部分 | 有 | 有 |
 | 存储 | SQLite | 内存索引 | **FERIDX01 dump 内存引擎（mmap 零拷贝）** |
-| 搜索 | HTTP API | GUI + IPC | CLI + HTTP + 网页 |
+| 搜索 | HTTP API | GUI + IPC | CLI + HTTP + GUI |
 | 监控 | fileMonitor | USN + RDCW | USN 轮询 |
 | 依赖 | JDK21+VS+GraalVM | 闭源 | 单一 exe |

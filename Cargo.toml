@@ -7,9 +7,18 @@ license = "GPL-3.0"
 repository = "https://github.com/qiansekai/fer"
 readme = "README.md"
 
+[features]
+# 桌面 GUI 前端（src/bin/fer-gui）：默认不编，`--features gui` 才产出 fer-gui.exe。
+gui = ["dep:winsafe"]
+
 [[bin]]
 name = "fer"
 path = "src/main.rs"
+
+[[bin]]
+name = "fer-gui"
+path = "src/bin/fer-gui/main.rs"
+required-features = ["gui"]
 
 [dependencies]
 anyhow = "1.0.104"
@@ -32,14 +41,24 @@ serde_json = "1.0.151"
 # "full" pulled in signal/process/time/io-util/fs for nothing.
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "net"] }
 walkdir = "2.5.0"
+# 桌面 GUI 前端用 winsafe（宿主 Win32 控件封装）；只在 --features gui 时编译。
+winsafe = { version = "0.0.29", features = ["gui"], optional = true }
+# GUI 侧额外需要 DataExchange（剪贴板）/ Memory / Time（本地时间，含 DST）。
+# features 是 crate 级并集，主 bin 也会带上，但不受影响。
+# 注：ShellExecuteW 刻意不用本 crate 的绑定 —— 0.61.2 里 UI/Shell 的每个条目还被
+# Win32_UI_WindowsAndMessaging 二次门控（Win32_UI_Shell = ["Win32_UI"] 拉不出来），
+# 故在 fer-gui 的 actions.rs 里按 Win32 文档自声明同签名 extern（与 GlobalFree 同一先例）。
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Storage_FileSystem",
+    "Win32_System_DataExchange",
     "Win32_System_IO",
     "Win32_System_Ioctl",
+    "Win32_System_Memory",
     "Win32_System_ProcessStatus",
     "Win32_System_Threading",
+    "Win32_System_Time",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }

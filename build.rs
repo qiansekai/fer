@@ -1,22 +1,51 @@
-use std::path::Path;
+//! 构建脚本。
+//!
+//! `gui` feature 开启时为 fer-gui 嵌入 Windows manifest（RT_MANIFEST）——comctl32 v6
+//! 视觉样式的唯一途径（缺失时 Button/ListView 退回 Win95 经典绘制）。本机走 GNU 链，
+//! windres 来自 DevEnv\mingw64\bin（已在 PATH）；可用 WINDRES 环境变量覆盖。
+//!
+//! 注意：刻意不用静态库（ar + link-lib）—— GNU ld 会丢弃 .a 里无符号引用的成员，
+//! 资源会静默丢失；必须把 .o 直接交给链接器。
 
-// `src/server.rs` embeds the built UI with `include_str!("../webui/dist/index.html")`.
-// A missing build output would otherwise surface as a bare "couldn't read file"
-// from rustc with no hint about how to produce it, so fail early and say what to do.
+use std::path::PathBuf;
+use std::process::Command;
+
 fn main() {
-    let dist = Path::new("webui/dist/index.html");
-    if !dist.exists() {
-        panic!(
-            "\n\nwebui/dist/index.html not found — src/server.rs embeds it with include_str!.\n\
-             Build the UI first:\n\n    cd webui && npm install && npm run build\n\n\
-             (Working directory was {})\n",
-            std::env::current_dir()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|_| "?".into())
-        );
-    }
-    // Rebuild the crate when the embedded UI or the sources behind it change.
-    println!("cargo:rerun-if-changed=webui/dist/index.html");
-    println!("cargo:rerun-if-changed=webui/src");
-    println!("cargo:rerun-if-changed=webui/index.html");
+	// 默认构建（纯 CLI）完全不碰 windres：没有 gui feature 就直接返回。
+	if std::env::var_os("CARGO_FEATURE_GUI").is_none() {
+		return;
+	}
+
+	println!("cargo:rerun-if-changed=app.rc");
+	println!("cargo:rerun-if-changed=app.manifest");
+
+	let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+	let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+
+	let rc = manifest_dir.join("app.rc");
+	let obj = out_dir.join("app_res.o");
+
+	let windres = std::env::var("WINDRES").unwrap_or_else(|_| "windres".to_string());
+	let status = Command::new(&windres)
+		.arg("--input").arg(&rc)
+		.arg("--output").arg(&obj)
+		.arg("--output-format=coff")
+		.arg("--include-dir").arg(&manifest_dir)
+		.status()
+		.unwrap_or_else(|e| {
+			panic!(
+				"failed to spawn {windres}: {e}\n\
+				 hint: 本机 windres 位于 DevEnv\\mingw64\\bin（PATH 应已包含），\
+				 或设 WINDRES 环境变量指向 windres.exe"
+			)
+		});
+	assert!(status.success(), "{windres} failed on {rc:?}");
+	assert!(obj.exists(), "{windres} produced no object file");
+
+	// 正斜杠：直接透传给 GNU ld，避免反斜杠被当成转义。
+	// 只链接到 fer-gui 这个 bin，绝不污染 `fer` 主 bin。
+	println!(
+		"cargo:rustc-link-arg-bin=fer-gui={}",
+		obj.to_string_lossy().replace('\\', "/")
+	);
 }

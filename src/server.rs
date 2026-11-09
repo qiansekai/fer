@@ -1,4 +1,4 @@
-//! HTTP API server (axum) with a minimal web UI. Queries run entirely
+//! HTTP API server (axum). Queries run entirely
 //! against the in-memory engine; `/api/rescan` rebuilds from the volumes and
 //! refreshes the dump + the live engine.
 
@@ -11,7 +11,6 @@ use anyhow::Result;
 use axum::{
     Json, Router,
     extract::{Query, State},
-    response::Html,
     routing::{get, post},
 };
 use serde::Deserialize;
@@ -404,7 +403,6 @@ pub async fn serve(
         }
     });
     let app = Router::new()
-        .route("/", get(index_page))
         .route("/api/health", get(health))
         .route("/api/search", get(search))
         .route("/api/feed", get(feed))
@@ -418,10 +416,6 @@ pub async fn serve(
     eprintln!("[server] listening on http://{addr}");
     axum::serve(listener, app).await?;
     Ok(())
-}
-
-async fn index_page() -> Html<&'static str> {
-    Html(INDEX_HTML)
 }
 
 async fn health() -> Json<Value> {
@@ -824,15 +818,6 @@ async fn rebuild() -> Json<Value> {
         Err(e) => Json(json!({ "ok": false, "error": e.to_string() })),
     }
 }
-
-/// The web UI, built from `webui/` by Vite into a single self-contained
-/// index.html (all JS and CSS inlined by vite-plugin-singlefile — see
-/// `webui/vite.config.js`). Embedding the build output keeps `fer serve` a
-/// lone binary with no asset directory to ship or locate at runtime.
-///
-/// `build.rs` checks that the file exists and tells you to run
-/// `cd webui && npm install && npm run build` if it does not.
-const INDEX_HTML: &str = include_str!("../webui/dist/index.html");
 
 // ---------------------------------------------------------------------------
 
