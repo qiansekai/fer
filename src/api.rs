@@ -20,10 +20,10 @@ pub use crate::du::{DuEntry, DuReport};
 
 /// `GET /api/search` 的成功响应。错误响应只有 `ok:false` + `error`，
 /// 其余字段回退默认值。
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SearchResult {
     pub ok: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(default)]
     pub query: String,

@@ -246,11 +246,11 @@ const CACHE_TTL: Duration = Duration::from_secs(3);
 
 #[derive(Default)]
 struct QueryCache {
-    map: HashMap<String, (serde_json::Value, Instant)>,
+    map: HashMap<String, (crate::api::SearchResult, Instant)>,
 }
 
 impl QueryCache {
-    fn get(&mut self, key: &str) -> Option<serde_json::Value> {
+    fn get(&mut self, key: &str) -> Option<crate::api::SearchResult> {
         let fresh = self
             .map
             .get(key)
@@ -263,7 +263,7 @@ impl QueryCache {
         None
     }
 
-    fn insert(&mut self, key: String, value: serde_json::Value) {
+    fn insert(&mut self, key: String, value: crate::api::SearchResult) {
         self.purge_expired();
         if self.map.len() >= CACHE_CAP
             && let Some(oldest) = self
@@ -674,10 +674,8 @@ async fn search(State(st): State<AppState>, Query(q): Query<SearchQuery>) -> Jso
     if let Some(mut hit) = st.cache.lock().unwrap_or_else(|e| e.into_inner()).get(&cache_key) {
         // The cached payload carries the ORIGINAL computation's took_ms —
         // refresh it so the field reflects this request (near-zero on a hit).
-        if let Some(obj) = hit.as_object_mut() {
-            obj.insert("took_ms".to_string(), json!(t.elapsed().as_millis()));
-        }
-        return Json(hit);
+        hit.took_ms = t.elapsed().as_millis() as u64;
+        return Json(serde_json::to_value(hit).expect("SearchResult 可序列化"));
     }
     let parsed = match crate::query::Query::parse(&q.q) {
         Ok(p) => p,
@@ -701,19 +699,21 @@ async fn search(State(st): State<AppState>, Query(q): Query<SearchQuery>) -> Jso
     })
     .await;
     let resp = match outcome {
-        Ok((total, hits)) => json!({
-            "ok": true,
-            "query": qq,
-            "engine": "mem",
-            "count": hits.len(),
-            "total": total,
-            "took_ms": t.elapsed().as_millis(),
-            "hits": hits,
-        }),
-        Err(e) => json!({ "ok": false, "error": e.to_string() }),
+        Ok((total, hits)) => crate::api::SearchResult {
+            ok: true,
+            error: None,
+            query: qq,
+            engine: "mem".to_string(),
+            count: hits.len(),
+            total,
+            took_ms: t.elapsed().as_millis() as u64,
+            hits,
+        },
+        // 错误响应只有 ok/error 两个字段，不缓存（旧实现对错误也缓存 3 秒）。
+        Err(e) => return Json(json!({ "ok": false, "error": e.to_string() })),
     };
     st.cache.lock().unwrap_or_else(|e| e.into_inner()).insert(cache_key, resp.clone());
-    Json(resp)
+    Json(serde_json::to_value(resp).expect("SearchResult 可序列化"))
 }
 
 #[derive(Deserialize)]
