@@ -481,22 +481,23 @@ async fn feed(State(st): State<AppState>) -> Json<Value> {
     // told apart from "the file never entered the overlay at all".
     let sample_append: Vec<&str> = g.appended.values().take(4).map(|e| e.p.as_str()).collect();
     let sample_remove: Vec<&str> = g.removed.iter().take(3).map(|s| s.as_str()).collect();
-    Json(json!({
-        "ok": true,
-        "pending_append": appended,
-        "pending_remove": removed,
-        "delta_entries": g.delta.as_ref().map(|d| d.len()).unwrap_or(0),
-        "batches_applied": g.batches,
-        "saturated": g.saturated,
+    let report = crate::api::FeedStatus {
+        ok: true,
+        pending_append: appended as u64,
+        pending_remove: removed as u64,
+        delta_entries: g.delta.as_ref().map(|d| d.len() as u64).unwrap_or(0),
+        batches_applied: g.batches,
+        saturated: g.saturated,
         // Removals that resolved to an entry id of the current dump: only
         // these can actually hide a hit. A path that resolves to nothing is
         // either newer than the dump or already flushed away.
-        "removed_in_dump": g.removed_ids.len(),
-        "overlay_generation": g.generation,
-        "last_apply_age_ms": g.last_apply.map(|t| t.elapsed().as_millis()),
-        "sample_append": sample_append,
-        "sample_remove": sample_remove,
-    }))
+        removed_in_dump: g.removed_ids.len() as u64,
+        overlay_generation: g.generation,
+        last_apply_age_ms: g.last_apply.map(|t| t.elapsed().as_millis() as u64),
+        sample_append: sample_append.iter().map(|s| s.to_string()).collect(),
+        sample_remove: sample_remove.iter().map(|s| s.to_string()).collect(),
+    };
+    Json(serde_json::to_value(report).expect("FeedStatus 可序列化"))
 }
 
 #[derive(Deserialize)]
@@ -761,15 +762,16 @@ async fn stats(State(st): State<AppState>) -> Json<Value> {
     let dump_mb = std::fs::metadata(&dump)
         .map(|m| m.len() / (1 << 20))
         .unwrap_or(0);
-    Json(json!({
-        "ok": true,
-        "files": files,
-        "dirs": dirs,
-        "entries": files + dirs,
-        "dump": dump.to_string_lossy(),
-        "dump_mb": dump_mb,
-        "mem_bytes": mem.memory_bytes(),
-    }))
+    let report = crate::api::IndexStats {
+        ok: true,
+        entries: files + dirs,
+        files,
+        dirs,
+        dump: dump.to_string_lossy().into_owned(),
+        dump_mb,
+        mem_bytes: mem.memory_bytes() as u64,
+    };
+    Json(serde_json::to_value(report).expect("IndexStats 可序列化"))
 }
 
 async fn rescan(State(st): State<AppState>) -> Json<Value> {

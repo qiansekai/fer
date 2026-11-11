@@ -41,12 +41,10 @@ pub fn url_encode(s: &str) -> String;   // UTF-8 按字节 %XX，unreserved 直�
 ## src/ferapi.rs —— fer API 客户端
 
 ```rust
-pub struct Hit { path, is_dir, size, allocated, mtime, ctime, flags }
-pub struct SearchResult { ok, error: Option<String>, query, count, total, took_ms, hits }
-pub struct FeedStatus { delta_entries, pending_remove, batches_applied, saturated }
-pub struct IndexStats { ok, entries, files, dirs, dump, dump_mb, mem_bytes, volumes, index_method, built_at_unix, feed }
-pub struct DuNode { name, path, size, allocated, files, dirs, depth, children, truncated }
-pub struct DuResult { root, total_bytes, total_allocated, files, dirs, entries, children, truncated }
+// 数据模型统一由库侧 src/api.rs 提供（与 serve 共用同一份定义）：
+pub use file_engine_rust::api::{
+    DuEntry as DuNode, DuReport as DuResult, FeedStatus, Hit, IndexStats, SearchResult,
+};
 impl FerClient {
     pub fn new(addr: &str, timeout: Duration) -> Self;
     pub fn addr(&self) -> &str;
@@ -86,7 +84,9 @@ stats 只有 ok/entries/files/dirs/dump/dump_mb/mem_bytes；du 的 children[] �
 
 ## src/query.rs —— 搜索会话状态机
 
-`SortKey` + `SearchState::{new,begin,generation,accept,cycle_sort,sort,set_sort,limit,set_limit,last_query}`
+`SortKey` 由库侧 `mem::SortKey` re-export（CLI / server / GUI 唯一来源），
+UI 专属映射是 `sort_label` / `sort_from_column`；
+`SearchState::{new,begin,generation,accept,cycle_sort,sort,set_sort,limit,set_limit,last_query}`
 + `now_ms()`。代际号用于丢弃过期响应；`cycle_sort` 三态：升 -> 降 -> 回 Name 默认。
 
 ## 验收标准（「完全可用」定义）

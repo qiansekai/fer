@@ -16,12 +16,14 @@
 //! 实现要求：所有响应经 crate::json 解析；字段缺失一律回退默认值而不得 panic；
 //! ok:false 时把 error 文本带回上层。
 //!
-//! 实测字段（本机 serve，见 docs/api-samples.md）：
-//! - search 顶层 ok/query/count/total/took_ms/engine/hits；hits[] = path/is_dir/size/
+//! 实测字段（本机 serve，见 docs/gui/api-samples.md）：
+//! - search 顶层 ok/query/engine/count/total/took_ms/hits；hits[] = path/is_dir/size/
 //!   allocated/mtime/ctime/flags（无 name）
-//! - stats 只有 ok/entries/files/dirs/dump/dump_mb/mem_bytes；volumes/index_method/
-//!   built_at_unix/feed 属 CLI 口径，缺失时回退默认值
+//! - stats 只有 ok/entries/files/dirs/dump/dump_mb/mem_bytes
 //! - du 的 children[] 只有 path/size/allocated/files/depth（无 name，名称从 path 末段派生）
+//!
+//! 数据模型统一在 `file_engine_rust::api`（与服务端共用）：本模块只做
+//! 「Json -> 共享结构体」的字段搬运，改名会直接编译失败。
 
 #![allow(dead_code)]
 
@@ -30,83 +32,11 @@ use std::time::Duration;
 use crate::http::{HttpClient, HttpError, url_encode};
 use crate::json::Json;
 
-/// 一条命中记录。
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct Hit {
-	pub path: String,
-	pub is_dir: bool,
-	pub size: u64,
-	pub allocated: u64,
-	pub mtime: i64,
-	pub ctime: i64,
-	pub flags: u32,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct SearchResult {
-	pub ok: bool,
-	pub error: Option<String>,
-	pub query: String,
-	pub count: usize,
-	pub total: u64,
-	pub took_ms: u64,
-	pub hits: Vec<Hit>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct FeedStatus {
-	pub delta_entries: u64,
-	pub pending_remove: u64,
-	pub batches_applied: u64,
-	pub saturated: bool,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct IndexStats {
-	pub ok: bool,
-	pub entries: u64,
-	pub files: u64,
-	pub dirs: u64,
-	/// dump 文件路径（serve 报的原始大小写）。
-	pub dump: String,
-	/// dump 文件大小（MB，serve 侧整除后的整数）。
-	pub dump_mb: u64,
-	/// 引擎常驻内存字节数。
-	pub mem_bytes: u64,
-	/// 索引覆盖的卷列表（本机 serve 不返回，缺失即空）。
-	pub volumes: Vec<String>,
-	/// 索引方法（CLI 口径；缺失即空串）。
-	pub index_method: String,
-	/// dump 构建时间（Unix 秒；缺失即 0）。
-	pub built_at_unix: i64,
-	/// 实时覆盖层状态（serve 的 /api/stats 不含，缺失即 None）。
-	pub feed: Option<FeedStatus>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct DuNode {
-	pub name: String,
-	pub path: String,
-	pub size: u64,
-	pub allocated: u64,
-	pub files: u64,
-	pub dirs: u64,
-	pub depth: u32,
-	pub children: Vec<DuNode>,
-	pub truncated: bool,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct DuResult {
-	pub root: String,
-	pub total_bytes: u64,
-	pub total_allocated: u64,
-	pub files: u64,
-	pub dirs: u64,
-	pub entries: u64,
-	pub children: Vec<DuNode>,
-	pub truncated: bool,
-}
+// 数据模型统一由库侧定义（src/api.rs）：字段改名在 GUI 侧会编译失败，
+// 不再有「客户端结构体与服务端响应各改一半」的静默漂移。
+pub use file_engine_rust::api::{
+	DuEntry as DuNode, DuReport as DuResult, FeedStatus, Hit, IndexStats, SearchResult,
+};
 
 pub struct FerClient {
 	http: HttpClient,
@@ -240,6 +170,7 @@ fn parse_search(body: &str, requested_query: &str) -> Result<SearchResult, HttpE
 		ok: v.bool_at("ok").unwrap_or(true),
 		error: v.str_at("error").map(|s| s.to_string()),
 		query: v.str_or("query", requested_query),
+		engine: v.str_or("engine", ""),
 		count: v.u64_at("count").map_or(hit_count, |n| n as usize),
 		total: v.u64_at("total").unwrap_or(0),
 		took_ms: v.u64_at("took_ms").unwrap_or(0),
@@ -255,7 +186,7 @@ fn parse_hit(item: &Json) -> Hit {
 		allocated: item.u64_at("allocated").unwrap_or(0),
 		mtime: item.i64_at("mtime").unwrap_or(0),
 		ctime: item.i64_at("ctime").unwrap_or(0),
-		flags: item.u64_at("flags").unwrap_or(0) as u32,
+		flags: item.u64_at("flags").unwrap_or(0) as u8,
 	}
 }
 
@@ -266,11 +197,25 @@ fn parse_feed(body: &str) -> Result<FeedStatus, HttpError> {
 
 fn feed_from(v: &Json) -> FeedStatus {
 	FeedStatus {
-		delta_entries: v.u64_at("delta_entries").unwrap_or(0),
+		ok: v.bool_at("ok").unwrap_or(true),
+		pending_append: v.u64_at("pending_append").unwrap_or(0),
 		pending_remove: v.u64_at("pending_remove").unwrap_or(0),
+		delta_entries: v.u64_at("delta_entries").unwrap_or(0),
 		batches_applied: v.u64_at("batches_applied").unwrap_or(0),
 		saturated: v.bool_at("saturated").unwrap_or(false),
+		removed_in_dump: v.u64_at("removed_in_dump").unwrap_or(0),
+		overlay_generation: v.u64_at("overlay_generation").unwrap_or(0),
+		last_apply_age_ms: v.u64_at("last_apply_age_ms"),
+		sample_append: str_list(v, "sample_append"),
+		sample_remove: str_list(v, "sample_remove"),
 	}
+}
+
+/// 取字符串数组字段；缺失或类型不符按空列表处理。
+fn str_list(v: &Json, key: &str) -> Vec<String> {
+	v.arr_at(key)
+		.map(|items| items.iter().filter_map(|s| s.as_str().map(str::to_string)).collect())
+		.unwrap_or_default()
 }
 
 fn parse_stats(body: &str) -> Result<IndexStats, HttpError> {
@@ -283,14 +228,6 @@ fn parse_stats(body: &str) -> Result<IndexStats, HttpError> {
 		dump: v.str_or("dump", ""),
 		dump_mb: v.u64_at("dump_mb").unwrap_or(0),
 		mem_bytes: v.u64_at("mem_bytes").unwrap_or(0),
-		volumes: v
-			.arr_at("volumes")
-			.map(|items| items.iter().filter_map(|s| s.as_str().map(|x| x.to_string())).collect())
-			.unwrap_or_default(),
-		// serve 不返回该字段；兼容 CLI 口径的别名 method
-		index_method: v.str_or("index_method", &v.str_or("method", "")),
-		built_at_unix: v.i64_at("built_at_unix").unwrap_or(0),
-		feed: v.get("feed").map(feed_from),
 	})
 }
 
@@ -312,36 +249,13 @@ fn parse_du(body: &str) -> Result<DuResult, HttpError> {
 }
 
 fn parse_du_node(item: &Json) -> DuNode {
-	let path = item.str_or("path", "");
-	// 实测 du 的 children[] 没有 name 字段：从路径末段派生（兼容 \ 与 / 分隔符）
-	let name = match item.str_at("name") {
-		Some(name) => name.to_string(),
-		None => last_segment(&path),
-	};
 	DuNode {
-		name,
-		path,
+		path: item.str_or("path", ""),
 		size: item.u64_at("size").unwrap_or(0),
 		allocated: item.u64_at("allocated").unwrap_or(0),
 		files: item.u64_at("files").unwrap_or(0),
-		dirs: item.u64_at("dirs").unwrap_or(0),
-		depth: item.u64_at("depth").unwrap_or(0) as u32,
-		children: item
-			.arr_at("children")
-			.map(|items| items.iter().map(parse_du_node).collect())
-			.unwrap_or_default(),
-		truncated: item.bool_at("truncated").unwrap_or(false),
+		depth: item.u64_at("depth").unwrap_or(0) as usize,
 	}
-}
-
-/// 取路径末段（忽略结尾分隔符）；空路径返回空串。
-fn last_segment(path: &str) -> String {
-	let trimmed = path.trim_end_matches(['\\', '/']);
-	trimmed
-		.rsplit(['\\', '/'])
-		.next()
-		.unwrap_or(trimmed)
-		.to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -451,25 +365,6 @@ mod tests {
 		assert_eq!(s.dump, r"C:\Users\x\AppData\Local\file-engine-rust\index.db.feridx");
 		assert_eq!(s.dump_mb, 1474);
 		assert_eq!(s.mem_bytes, 1_546_156_084);
-		// serve 实际不返回的字段一律回退默认值
-		assert!(s.volumes.is_empty());
-		assert_eq!(s.index_method, "");
-		assert_eq!(s.built_at_unix, 0);
-		assert!(s.feed.is_none());
-	}
-
-	#[test]
-	fn parses_cli_style_stats_optional_fields() {
-		let body = r#"{"ok":true,"entries":5,"volumes":["C:","D:"],"index_method":"mft","built_at_unix":1790000000,"feed":{"delta_entries":3,"pending_remove":1,"batches_applied":7,"saturated":true}}"#;
-		let s = parse_stats(body).expect("解析应成功");
-		assert_eq!(s.volumes, vec!["C:".to_string(), "D:".to_string()]);
-		assert_eq!(s.index_method, "mft");
-		assert_eq!(s.built_at_unix, 1_790_000_000);
-		let feed = s.feed.expect("feed 应解析出来");
-		assert_eq!(feed.delta_entries, 3);
-		assert_eq!(feed.pending_remove, 1);
-		assert_eq!(feed.batches_applied, 7);
-		assert!(feed.saturated);
 	}
 
 	#[test]
@@ -499,24 +394,11 @@ mod tests {
 		assert!(d.truncated);
 		assert_eq!(d.children.len(), 1);
 		let child = &d.children[0];
-		assert_eq!(child.name, "fer", "无 name 字段时从路径末段派生");
 		assert_eq!(child.path, r"D:\Kita-Tools\Coding\fer");
 		assert_eq!(child.size, 4_887_028_896);
 		assert_eq!(child.allocated, 4_902_397_412);
 		assert_eq!(child.files, 11_630);
 		assert_eq!(child.depth, 1);
-		assert!(child.children.is_empty());
-		assert!(!child.truncated);
-	}
-
-	#[test]
-	fn last_segment_derives_names() {
-		assert_eq!(last_segment(r"D:\Kita\Coding\fer"), "fer");
-		assert_eq!(last_segment("D:/Kita/Coding/fer"), "fer");
-		assert_eq!(last_segment("D:\\Kita\\fer\\"), "fer");
-		assert_eq!(last_segment("D:\\"), "D:");
-		assert_eq!(last_segment("name"), "name");
-		assert_eq!(last_segment(""), "");
 	}
 
 	#[test]

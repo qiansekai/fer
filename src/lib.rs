@@ -13,10 +13,10 @@
 //! * `meta`    — index-quality sidecar (`<dump>.meta`: method, volumes, built_at)
 //! * `server`  — HTTP API (axum) with a minimal web UI
 
+pub mod api;
 pub mod control;
 pub mod du;
-pub mod dupes;
-pub mod indexer;
+pub mod dupes;pub mod indexer;
 pub mod locks;
 pub mod mem;
 pub mod meta;
@@ -227,8 +227,9 @@ impl EntryMeta {
     }
 }
 
-/// One search hit (path + metadata), shared by every engine.
-#[derive(Debug, Clone, serde::Serialize)]
+/// One search hit (path + metadata), shared by every engine **and** the HTTP
+/// API clients — the field set is the wire contract of `/api/search`.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Hit {
     pub path: String,
     pub is_dir: bool,
