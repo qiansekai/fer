@@ -30,7 +30,7 @@ mod theme;
 
 use config::Config;
 use ferapi::{FerClient, Hit, SearchResult};
-use query::{SearchState, SortKey};
+use query::{SearchState, SortKey, sort_from_column};
 
 const PAD: i32 = 8;
 /// 自绘菜单栏高度（逻辑像素）：Win10 的系统菜单栏无法跟随深色，改在客户区自绘。
@@ -445,7 +445,7 @@ impl App {
 			let (sort, desc, limit) = {
 				let st = app.state.borrow();
 				(
-					SortKey::from_api(&st.cfg.sort_key).unwrap_or(SortKey::Name),
+					SortKey::parse(&st.cfg.sort_key).unwrap_or(SortKey::Name),
 					st.cfg.sort_desc,
 					st.cfg.limit,
 				)
@@ -875,7 +875,7 @@ impl App {
 		{
 			let st = self.state.borrow();
 			let (sort, desc) = st.search.sort();
-			cfg.sort_key = sort.as_api().to_string();
+			cfg.sort_key = sort.as_str().to_string();
 			cfg.sort_desc = desc;
 			cfg.limit = st.search.limit();
 		}
@@ -931,7 +931,7 @@ impl App {
 		let hwnd_raw = self.wnd.hwnd().ptr() as isize;
 		self.wnd.spawn_thread(move || {
 			let result = client
-				.search(&req.query, req.limit, Some(req.sort.as_api()), req.desc)
+				.search(&req.query, req.limit, Some(req.sort.as_str()), req.desc)
 				.map_err(|e| e.to_string());
 			let _ = tx.send(TaskMsg::Search { generation: req.generation, result });
 			wake_pump(hwnd_raw);
@@ -1584,7 +1584,7 @@ impl App {
 	}
 
 	fn on_column_click(&self, index: usize) {
-		let Some(key) = SortKey::from_column(index) else {
+		let Some(key) = sort_from_column(index) else {
 			return;
 		};
 		{

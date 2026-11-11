@@ -9,7 +9,7 @@
 #[path = "../src/bin/fer-gui/query.rs"]
 mod query;
 
-use query::{SearchRequest, SearchState, SortKey};
+use query::{SearchRequest, SearchState, SortKey, sort_from_column, sort_label};
 
 /// 契约里的全部排序键。
 const ALL_KEYS: [SortKey; 6] =
@@ -105,23 +105,25 @@ fn sort_keys_match_frozen_server_vocabulary() {
 		[(SortKey::Name, "name"), (SortKey::Path, "path"), (SortKey::Size, "size"),
 		 (SortKey::Allocated, "allocated"), (SortKey::Mtime, "mtime"), (SortKey::Ctime, "ctime")];
 	for (key, api) in expected {
-		assert_eq!(key.as_api(), api);
-		assert_eq!(SortKey::from_api(api), Some(key));
-		assert!(!key.label().is_empty(), "{key:?} 缺少中文列名");
+		assert_eq!(key.as_str(), api);
+		assert_eq!(SortKey::parse(api), Some(key));
+		assert!(!sort_label(key).is_empty(), "{key:?} 缺少中文列名");
 	}
-	for unknown in ["", "NAME", "modified", "asc", "0"] {
-		assert_eq!(SortKey::from_api(unknown), None, "未知取值 {unknown} 不应被识别");
+	// 库侧 parse 大小写不敏感（与服务端一致）；写端始终发小写。
+	assert_eq!(SortKey::parse("NAME"), Some(SortKey::Name));
+	for unknown in ["", "modified", "asc", "0"] {
+		assert_eq!(SortKey::parse(unknown), None, "未知取值 {unknown} 不应被识别");
 	}
 }
 
 #[test]
 fn from_column_covers_the_four_sortable_columns() {
-	assert_eq!(SortKey::from_column(0), Some(SortKey::Name));
-	assert_eq!(SortKey::from_column(1), Some(SortKey::Path));
-	assert_eq!(SortKey::from_column(2), Some(SortKey::Size));
-	assert_eq!(SortKey::from_column(3), Some(SortKey::Mtime));
+	assert_eq!(sort_from_column(0), Some(SortKey::Name));
+	assert_eq!(sort_from_column(1), Some(SortKey::Path));
+	assert_eq!(sort_from_column(2), Some(SortKey::Size));
+	assert_eq!(sort_from_column(3), Some(SortKey::Mtime));
 	for index in [4_usize, 5, 100, usize::MAX] {
-		assert_eq!(SortKey::from_column(index), None, "第 {index} 列不应可排序");
+		assert_eq!(sort_from_column(index), None, "第 {index} 列不应可排序");
 	}
 }
 

@@ -338,8 +338,13 @@ impl std::ops::Deref for MemIndex {
 /// Sort key for [`MemIndex::hits_sorted`] and the `/api/search?...&sort=`
 /// knob. The variants mirror the [`Hit`] fields one-to-one, so a caller names
 /// the field it wants to order by.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// This is the single source of truth for the wire vocabulary: the CLI parses
+/// `--sort` with [`SortKey::parse`], the server forwards it verbatim, and the
+/// GUI re-exports this type instead of keeping its own copy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SortKey {
+    #[default]
     Name,
     Path,
     Size,

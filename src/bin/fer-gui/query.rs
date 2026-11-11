@@ -1,7 +1,8 @@
 //! 搜索会话状态机（UI 无关的纯逻辑，全部可单测）。
 //!
 //! 契约（冻结，见 docs/INTERFACES.md 的 src/query.rs 一节）：
-//!   SortKey::{Name, Path, Size, Allocated, Mtime, Ctime} + as_api()/label()/from_api()/from_column()
+//!   SortKey::{Name, Path, Size, Allocated, Mtime, Ctime}（库侧 mem::SortKey 的 re-export）
+//!   sort_label(SortKey) / sort_from_column(usize)
 //!   SearchState::new(limit) -> Self
 //!   SearchState::begin(&mut self, query: &str) -> SearchRequest   （递增代际）
 //!   SearchState::accept(&self, generation: u64) -> bool           （丢弃过期响应）
@@ -22,6 +23,10 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// 排序键的唯一来源在库侧（`mem::SortKey`）：CLI 的 `--sort`、服务端的
+/// `sort=` 参数与 GUI 共用同一份字符串表。这里只做 re-export，不再维护副本。
+pub use file_engine_rust::mem::SortKey;
+
 /// limit 下限：至少 1 条，避免发出「要 0 条」这种无意义请求。
 pub const LIMIT_MIN: usize = 1;
 
@@ -33,66 +38,27 @@ fn clamp_limit(n: usize) -> usize {
 	n.clamp(LIMIT_MIN, LIMIT_MAX)
 }
 
-/// 结果排序键；`as_api()` 的字符串就是 fer 服务端 `sort=` 参数的取值（小写）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum SortKey {
-	#[default]
-	Name,
-	Path,
-	Size,
-	Allocated,
-	Mtime,
-	Ctime,
+/// 列头与排序提示上显示的中文名。
+pub fn sort_label(key: SortKey) -> &'static str {
+	match key {
+		SortKey::Name => "名称",
+		SortKey::Path => "路径",
+		SortKey::Size => "大小",
+		SortKey::Allocated => "占用",
+		SortKey::Mtime => "修改时间",
+		SortKey::Ctime => "创建时间",
+	}
 }
 
-impl SortKey {
-	/// 服务端 `sort=` 参数取值（契约：小写，与 fer /api/search 一致）。
-	pub fn as_api(&self) -> &'static str {
-		match self {
-			SortKey::Name => "name",
-			SortKey::Path => "path",
-			SortKey::Size => "size",
-			SortKey::Allocated => "allocated",
-			SortKey::Mtime => "mtime",
-			SortKey::Ctime => "ctime",
-		}
-	}
-
-	/// 列头与排序提示上显示的中文名。
-	pub fn label(&self) -> &'static str {
-		match self {
-			SortKey::Name => "名称",
-			SortKey::Path => "路径",
-			SortKey::Size => "大小",
-			SortKey::Allocated => "占用",
-			SortKey::Mtime => "修改时间",
-			SortKey::Ctime => "创建时间",
-		}
-	}
-
-	/// 服务端返回值 -> 排序键；未知取值（含大小写不符）返回 None，由调用方回退默认。
-	pub fn from_api(s: &str) -> Option<SortKey> {
-		match s {
-			"name" => Some(SortKey::Name),
-			"path" => Some(SortKey::Path),
-			"size" => Some(SortKey::Size),
-			"allocated" => Some(SortKey::Allocated),
-			"mtime" => Some(SortKey::Mtime),
-			"ctime" => Some(SortKey::Ctime),
-			_ => None,
-		}
-	}
-
-	/// 结果表列索引 -> 排序键（0 名称 / 1 路径 / 2 大小 / 3 修改时间）；
-	/// 越界或不可排序列（4 起）返回 None，调用方直接忽略该次点击。
-	pub fn from_column(index: usize) -> Option<SortKey> {
-		match index {
-			0 => Some(SortKey::Name),
-			1 => Some(SortKey::Path),
-			2 => Some(SortKey::Size),
-			3 => Some(SortKey::Mtime),
-			_ => None,
-		}
+/// 结果表列索引 -> 排序键（0 名称 / 1 路径 / 2 大小 / 3 修改时间）；
+/// 越界或不可排序列（4 起）返回 None，调用方直接忽略该次点击。
+pub fn sort_from_column(index: usize) -> Option<SortKey> {
+	match index {
+		0 => Some(SortKey::Name),
+		1 => Some(SortKey::Path),
+		2 => Some(SortKey::Size),
+		3 => Some(SortKey::Mtime),
+		_ => None,
 	}
 }
 
@@ -368,38 +334,38 @@ mod tests {
 	#[test]
 	fn sort_key_api_vocabulary_round_trips() {
 		for key in ALL_KEYS {
-			assert_eq!(SortKey::from_api(key.as_api()), Some(key));
-			// 服务端契约是小写，大小写不符一律不认。
-			assert_eq!(key.as_api(), key.as_api().to_lowercase());
-			assert!(!key.label().is_empty());
+			assert_eq!(SortKey::parse(key.as_str()), Some(key));
+			// 服务端契约是小写；库侧 parse 宽松（大小写不敏感），写端始终发小写。
+			assert_eq!(key.as_str(), key.as_str().to_lowercase());
+			assert!(!sort_label(key).is_empty());
 		}
-		assert_eq!(SortKey::Name.as_api(), "name");
-		assert_eq!(SortKey::Allocated.as_api(), "allocated");
-		assert_eq!(SortKey::Mtime.as_api(), "mtime");
-		assert_eq!(SortKey::from_api(""), None);
-		assert_eq!(SortKey::from_api("Name"), None);
-		assert_eq!(SortKey::from_api("modified"), None);
+		assert_eq!(SortKey::Name.as_str(), "name");
+		assert_eq!(SortKey::Allocated.as_str(), "allocated");
+		assert_eq!(SortKey::Mtime.as_str(), "mtime");
+		assert_eq!(SortKey::parse(""), None);
+		assert_eq!(SortKey::parse("Name"), Some(SortKey::Name));
+		assert_eq!(SortKey::parse("modified"), None);
 	}
 
 	#[test]
 	fn sort_key_labels_are_distinct() {
 		for (i, a) in ALL_KEYS.iter().enumerate() {
 			for b in ALL_KEYS.iter().skip(i + 1) {
-				assert_ne!(a.label(), b.label(), "列名重复会让用户无法区分列头");
+				assert_ne!(sort_label(*a), sort_label(*b), "列名重复会让用户无法区分列头");
 			}
 		}
 	}
 
 	#[test]
 	fn from_column_maps_ui_columns_only() {
-		assert_eq!(SortKey::from_column(0), Some(SortKey::Name));
-		assert_eq!(SortKey::from_column(1), Some(SortKey::Path));
-		assert_eq!(SortKey::from_column(2), Some(SortKey::Size));
-		assert_eq!(SortKey::from_column(3), Some(SortKey::Mtime));
+		assert_eq!(sort_from_column(0), Some(SortKey::Name));
+		assert_eq!(sort_from_column(1), Some(SortKey::Path));
+		assert_eq!(sort_from_column(2), Some(SortKey::Size));
+		assert_eq!(sort_from_column(3), Some(SortKey::Mtime));
 		for index in 4..=8 {
-			assert_eq!(SortKey::from_column(index), None, "第 {index} 列不可排序");
+			assert_eq!(sort_from_column(index), None, "第 {index} 列不可排序");
 		}
-		assert_eq!(SortKey::from_column(usize::MAX), None);
+		assert_eq!(sort_from_column(usize::MAX), None);
 	}
 
 	#[test]
