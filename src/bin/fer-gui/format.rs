@@ -44,32 +44,8 @@ pub fn local_utc_offset_seconds() -> i64 {
 		.unwrap_or(DEFAULT_UTC_OFFSET_SECONDS)
 }
 
-const SIZE_UNITS: [&str; 7] = ["B", "KB", "MB", "GB", "TB", "PB", "EB"];
-
-/// 人类可读的字节数。1024 进制，保留 2 位小数；
-/// 四舍五入后会顶到 1024.00 的（如 1TB-1）自动进到更大单位，避免出现 "1024.00 GB"。
-pub fn human_size(bytes: u64) -> String {
-	if bytes < 1024 {
-		return format!("{bytes} B");
-	}
-	let mut unit = 0usize;
-	let mut scale: u64 = 1;
-	while unit + 1 < SIZE_UNITS.len() {
-		let next = scale.saturating_mul(1024);
-		if bytes < next {
-			break;
-		}
-		scale = next;
-		unit += 1;
-	}
-	let mut value = bytes as f64 / scale as f64;
-	if value >= 1023.995 && unit + 1 < SIZE_UNITS.len() {
-		unit += 1;
-		scale = scale.saturating_mul(1024);
-		value = bytes as f64 / scale as f64;
-	}
-	format!("{value:.2} {}", SIZE_UNITS[unit])
-}
+// 字节格式化统一由库侧提供（src/fmt.rs）：CLI 与 GUI 共用同一份实现。
+pub use file_engine_rust::fmt::human_size;
 
 /// 千分位计数（每 3 位一个逗号）。
 pub fn human_count(n: u64) -> String {
@@ -405,25 +381,6 @@ pub fn parent_of(path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-
-	#[test]
-	fn human_size_边界() {
-		assert_eq!(human_size(0), "0 B");
-		assert_eq!(human_size(1), "1 B");
-		assert_eq!(human_size(512), "512 B");
-		assert_eq!(human_size(1023), "1023 B");
-		// 1024 起进入 KB
-		assert_eq!(human_size(1024), "1.00 KB");
-		assert_eq!(human_size(1536), "1.50 KB");
-		assert_eq!(human_size(1024 * 1024), "1.00 MB");
-		assert_eq!(human_size(1_320_000_000), "1.23 GB");
-		assert_eq!(human_size(1024u64.pow(4)), "1.00 TB");
-		assert_eq!(human_size(1024u64.pow(5)), "1.00 PB");
-		// >1TB：1TB-1 不得显示成 "1024.00 GB"
-		assert_eq!(human_size(1024u64.pow(4) - 1), "1.00 TB");
-		// 上界
-		assert_eq!(human_size(u64::MAX), "16.00 EB");
-	}
 
 	#[test]
 	fn human_count_千分位() {

@@ -16,7 +16,8 @@
 pub mod api;
 pub mod control;
 pub mod du;
-pub mod dupes;pub mod indexer;
+pub mod dupes;pub mod fmt;
+pub mod indexer;
 pub mod locks;
 pub mod mem;
 pub mod meta;

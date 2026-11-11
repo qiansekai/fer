@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde_json::json;
 
+use file_engine_rust::fmt::human_size;
 use file_engine_rust::indexer::{self, Method};
 use file_engine_rust::mem::{MemIndex, SortKey, dump_path};
 use file_engine_rust::query::Query;
@@ -395,7 +396,7 @@ fn main() -> Result<()> {
                 mem.memory_bytes() / (1 << 20),
                 dump.display(),
                 t_dump.elapsed().as_millis(),
-                fmt_bytes(peak_rss_bytes())
+                human_size(peak_rss_bytes())
             );
             if cli.json {
                 print_json(json!({
@@ -666,7 +667,7 @@ fn main() -> Result<()> {
                 println!(
                     "{:<60} {:>10}  {:>9} files",
                     report.root,
-                    fmt_bytes(total_shown),
+                    human_size(total_shown),
                     report.files
                 );
                 for c in &report.children {
@@ -675,7 +676,7 @@ fn main() -> Result<()> {
                         "{}{:<60} {:>10}  {:>9} files",
                         "  ".repeat(c.depth),
                         c.path,
-                        fmt_bytes(shown),
+                        human_size(shown),
                         c.files
                     );
                 }
@@ -714,9 +715,9 @@ fn main() -> Result<()> {
                 for g in &report.groups {
                     println!(
                         "{}  x{}  wasted {}",
-                        fmt_bytes(g.size),
+                        human_size(g.size),
                         g.paths.len(),
-                        fmt_bytes(g.size * (g.paths.len() as u64 - 1))
+                        human_size(g.size * (g.paths.len() as u64 - 1))
                     );
                     for p in &g.paths {
                         println!("    {p}");
@@ -725,7 +726,7 @@ fn main() -> Result<()> {
                 println!(
                     "{} duplicate groups, {} wasted, {} files hashed ({} skipped)",
                     report.groups.len(),
-                    fmt_bytes(report.wasted_bytes),
+                    human_size(report.wasted_bytes),
                     report.files_hashed,
                     report.skipped
                 );
@@ -841,21 +842,6 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn fmt_bytes(n: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-    if n >= GB {
-        format!("{:.2} GB", n as f64 / GB as f64)
-    } else if n >= MB {
-        format!("{:.2} MB", n as f64 / MB as f64)
-    } else if n >= KB {
-        format!("{:.2} KB", n as f64 / KB as f64)
-    } else {
-        format!("{n} B")
-    }
 }
 
 /// Peak working-set size of the current process (build memory observability).
