@@ -14,8 +14,6 @@
 //! 的扁平对象（字符串转义 + 整数 + 布尔），语法不合规整体回退 Default、字段缺失或类型
 //! 不符逐字段回退，保证 load() 在任何输入下都不 panic。
 
-#![allow(dead_code)]
-
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};

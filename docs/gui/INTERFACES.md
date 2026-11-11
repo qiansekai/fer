@@ -68,9 +68,9 @@ stats 只有 ok/entries/files/dirs/dump/dump_mb/mem_bytes；du 的 children[] �
 
 ## src/format.rs —— 展示层格式化（纯函数）
 
-`human_size`（1024 进制）/ `human_count`（千分位）/ `format_time`（Unix 秒 -> 本地
+`human_size`（库侧 `src/fmt.rs` 的实现）/ `human_count`（千分位）/ `format_time`（Unix 秒 -> 本地
 `YYYY-MM-DD HH:MM`，<=0 -> `-`，可自写 UTC+8 保持零依赖）/ `file_name` / `parent_dir` /
-`extension` / `type_label`。
+`path_segments` / `parent_of` / `normalize_dir`。
 
 ## src/config.rs —— 配置持久化
 

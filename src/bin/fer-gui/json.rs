@@ -10,8 +10,6 @@
 //! 合法输入必须解析成功，非法输入必须返回带偏移量的 JsonError 而不得 panic。
 //! 深嵌套有层级上限（MAX_DEPTH），避免递归爆栈 —— 栈溢出不可捕获，等同进程 abort。
 
-#![allow(dead_code)]
-
 use std::fmt;
 
 /// 递归解析的最大嵌套层级。真实 API 响应层级为个位数；上百层的恶意输入
@@ -87,6 +85,9 @@ impl Json {
 		}
 	}
 
+	/// 解析器契约的完整取值面：GUI 当前只用到其中一部分，
+	/// 保留是因为 `Json` 是通用解析入口，删掉会让调用方又去手写匹配。
+	#[allow(dead_code)]
 	pub fn as_f64(&self) -> Option<f64> {
 		match self {
 			Json::Num(n) => Some(*n),
@@ -108,10 +109,12 @@ impl Json {
 		}
 	}
 
+	#[allow(dead_code)]
 	pub fn arr_len(&self) -> usize {
 		self.as_arr().map(|a| a.len()).unwrap_or(0)
 	}
 
+	#[allow(dead_code)]
 	pub fn is_null(&self) -> bool {
 		matches!(self, Json::Null)
 	}

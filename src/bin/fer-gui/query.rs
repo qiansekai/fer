@@ -19,8 +19,6 @@
 //!   4. cycle_sort 同列三态：升 -> 降 -> 回 Name 默认（Name 升序）；换列一律从升序开始。
 //!   5. limit 恒被钳制在 LIMIT_MIN..=LIMIT_MAX；new 与 set_limit 走同一钳制函数。
 
-#![allow(dead_code)]
-
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// 排序键的唯一来源在库侧（`mem::SortKey`）：CLI 的 `--sort`、服务端的
@@ -38,7 +36,8 @@ fn clamp_limit(n: usize) -> usize {
 	n.clamp(LIMIT_MIN, LIMIT_MAX)
 }
 
-/// 列头与排序提示上显示的中文名。
+/// 列头与排序提示上显示的中文名（列头当前用固定文案，保留单一来源供 UI 复用）。
+#[allow(dead_code)]
 pub fn sort_label(key: SortKey) -> &'static str {
 	match key {
 		SortKey::Name => "名称",
@@ -110,7 +109,8 @@ impl SearchState {
 		}
 	}
 
-	/// 当前代际（0 = 尚未发起过搜索）。
+	/// 当前代际（0 = 尚未发起过搜索）。单测用它验证单调性。
+	#[allow(dead_code)]
 	pub fn generation(&self) -> u64 {
 		self.generation
 	}
@@ -165,7 +165,8 @@ impl SearchState {
 		self.limit = clamp_limit(n);
 	}
 
-	/// 最近一次 `begin` 使用的查询串（用于重启后恢复输入框）。
+	/// 最近一次 `begin` 使用的查询串（用于重启后恢复输入框）。单测覆盖。
+	#[allow(dead_code)]
 	pub fn last_query(&self) -> &str {
 		&self.last_query
 	}

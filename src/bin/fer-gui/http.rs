@@ -17,8 +17,6 @@
 //! - 自带单元测试：url_encode 边界 + 用 std::net::TcpListener 起桩服务器验证
 //!   GET/POST/chunked/超时/错误状态码。
 
-#![allow(dead_code)]
-
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -29,6 +27,8 @@ const READ_CHUNK: usize = 8 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct HttpResponse {
+	/// 状态码随 `HttpError::Status` 一起返回；这里保留完整响应供测试断言。
+	#[allow(dead_code)]
 	pub status: u16,
 	pub body: String,
 }

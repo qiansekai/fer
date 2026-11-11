@@ -1,13 +1,11 @@
 //! 展示层格式化（纯函数，全部可单测）。
 //!
-//! 契约（冻结）：
-//!   human_size(u64) -> String            例 "1.23 GB" / "512 B"
+//! 契约：
+//!   human_size(u64) -> String            库侧 src/fmt.rs 的实现（例 "1.23 GB" / "512 B"）
 //!   human_count(u64) -> String           千分位：例 "4,223,028"
 //!   format_time(i64) -> String           本地时区 "2026-09-30 12:34"；0 或负值 -> "-"
 //!   file_name(&str) -> &str              末段（路径以分隔符结尾时返回空串）
 //!   parent_dir(&str) -> &str             父目录（无分隔符时返回空串）
-//!   extension(&str) -> String            小写扩展名（无扩展名返回空串）
-//!   type_label(&str, bool) -> String     列显示用：目录 => "文件夹"，否则按扩展名给类别
 //!   path_segments(&str) -> Vec<(String, String)>  面包屑：逐级 (显示段, 该级完整路径)
 //!   parent_of(&str) -> Option<String>    上一级目录；已在根/无法解析 -> None
 //!   normalize_dir(&str) -> String        目录显示规范化（去多余尾分隔符，保留根形态）
@@ -18,8 +16,6 @@
 //! SystemTimeToTzSpecificLocalTime），得到真实本地时间并正确处理夏令时（DST）。
 //! 只有 API 失败（返回 0、或年份超出 SYSTEMTIME 可表示范围）时才回退到
 //! 「UTC + 固定偏移」——默认 +08:00，可用环境变量 FER_GUI_UTC_OFFSET_SECONDS 覆盖。
-
-#![allow(dead_code)]
 
 use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
 use windows_sys::Win32::System::Time::{
@@ -181,41 +177,6 @@ pub fn parent_dir(path: &str) -> &str {
 	}
 }
 
-/// 小写扩展名；无扩展名（含 .gitignore 这类点开头文件）返回空串。
-pub fn extension(path: &str) -> String {
-	let name = file_name(path);
-	match name.rfind('.') {
-		Some(i) if i > 0 => name[i + 1..].to_ascii_lowercase(),
-		_ => String::new(),
-	}
-}
-
-/// 列显示用的类型标签：目录 => "文件夹"；其余按扩展名归类。
-pub fn type_label(path: &str, is_dir: bool) -> String {
-	if is_dir {
-		return "文件夹".to_string();
-	}
-	let ext = extension(path);
-	if ext.is_empty() {
-		return "文件".to_string();
-	}
-	let label = match ext.as_str() {
-		"jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp" | "ico" | "svg" | "tif" | "tiff" | "heic" => "图片",
-		"mp4" | "mkv" | "avi" | "mov" | "wmv" | "flv" | "webm" | "m4v" | "mpg" | "mpeg" => "视频",
-		"mp3" | "wav" | "flac" | "ape" | "aac" | "ogg" | "m4a" | "wma" => "音频",
-		"zip" | "rar" | "7z" | "tar" | "gz" | "bz2" | "xz" | "zst" | "iso" => "压缩包",
-		"exe" | "msi" | "com" | "dll" | "sys" => "可执行文件",
-		"rs" | "c" | "h" | "cpp" | "hpp" | "cs" | "go" | "py" | "js" | "ts" | "tsx" | "jsx" | "java" | "php"
-		| "rb" | "lua" | "sh" | "ps1" | "bat" | "cmd" | "vue" => "代码",
-		"txt" | "md" | "log" | "ini" | "cfg" | "conf" | "json" | "yaml" | "yml" | "toml" | "xml" | "csv" => "文本",
-		"pdf" => "PDF 文档",
-		"doc" | "docx" | "odt" => "Word 文档",
-		"xls" | "xlsx" | "ods" => "Excel 表格",
-		"ppt" | "pptx" | "odp" => "PPT 演示",
-		_ => return format!("{ext} 文件"),
-	};
-	label.to_string()
-}
 
 /// 是否为路径分隔符（同时接受 Windows 反斜杠与正斜杠）。
 fn is_sep(c: char) -> bool {
@@ -561,32 +522,6 @@ mod tests {
 		// 纯盘符根
 		assert_eq!(file_name(r"D:\"), "");
 		assert_eq!(parent_dir(r"D:\"), "D:");
-	}
-
-	#[test]
-	fn extension_无扩展名与多点() {
-		assert_eq!(extension(r"D:\a\b\file.TXT"), "txt");
-		assert_eq!(extension("archive.tar.gz"), "gz");
-		assert_eq!(extension("no_ext"), "");
-		assert_eq!(extension(r"D:\dir\no_ext"), "");
-		assert_eq!(extension(".gitignore"), "");
-		assert_eq!(extension("trailing."), "");
-		assert_eq!(extension(""), "");
-		assert_eq!(extension("中文文件.文档"), "文档");
-	}
-
-	#[test]
-	fn type_label_归类() {
-		assert_eq!(type_label(r"D:\a", true), "文件夹");
-		assert_eq!(type_label(r"D:\a.png", false), "图片");
-		assert_eq!(type_label("a.JPG", false), "图片");
-		assert_eq!(type_label("a.rs", false), "代码");
-		assert_eq!(type_label("a.mp4", false), "视频");
-		assert_eq!(type_label("a.zip", false), "压缩包");
-		assert_eq!(type_label("a.pdf", false), "PDF 文档");
-		assert_eq!(type_label("noext", false), "文件");
-		assert_eq!(type_label(".gitignore", false), "文件");
-		assert_eq!(type_label("a.unknownext", false), "unknownext 文件");
 	}
 
 	// ---- 目录导航（面包屑 / 上一级 / 规范化）----

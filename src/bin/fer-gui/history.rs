@@ -12,8 +12,6 @@
 //! 刻意不依赖 crate::config 与 crate::json：历史文件坏了不该影响配置恢复，反之亦然
 //!（与 config.rs 自带极简 JSON 读写是同一个「解耦」理由）。零第三方依赖。
 
-#![allow(dead_code)]
-
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -66,10 +64,13 @@ impl History {
 		&self.items
 	}
 
+	/// 容器约定接口；生产侧直接走 `items()`，保留供测试与后续 UI 使用。
+	#[allow(dead_code)]
 	pub fn len(&self) -> usize {
 		self.items.len()
 	}
 
+	#[allow(dead_code)]
 	pub fn is_empty(&self) -> bool {
 		self.items.is_empty()
 	}

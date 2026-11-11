@@ -4,16 +4,13 @@
 //!   reveal_in_explorer(path: &str) -> io::Result<()>    explorer /select,"<path>"
 //!   open_file(path: &str) -> io::Result<()>             系统默认关联打开
 //!   copy_to_clipboard(text: &str) -> Result<(), String> CF_UNICODETEXT
-//!   is_valid_existing_path(path: &str) -> bool
 //!
 //! 约束：
 //! - 参数一律作为独立 argv 元素传入（禁止拼命令行字符串），防注入。
 //! - explorer 用 /select, 前缀形式；前导 / 或 - 不得被当成开关（先规范成绝对路径）。
 //! - 剪贴板失败要返回错误文本而不得 panic；必须成对 OpenClipboard/CloseClipboard。
 //! - open_file 主路径 = ShellExecuteW（verb "open"，路径单独传递）；失败回退 cmd /C start。
-//! - 自带单元测试：路径合法性判定 + 命令参数构造（不实际拉进程、不改用户剪贴板）。
-
-#![allow(dead_code)]
+//! - 自带单元测试：命令参数构造（不实际拉进程、不改用户剪贴板）。
 
 use std::io;
 use std::path::Path;
@@ -237,11 +234,6 @@ fn write_clipboard_locked(units: &[u16]) -> Result<(), String> {
 		}
 	}
 	Ok(()) // 移交成功：内存归系统所有，不得再释放
-}
-
-/// 路径存在性判定（不做任何进程启动、不触碰剪贴板）。
-pub fn is_valid_existing_path(path: &str) -> bool {
-	!path.trim().is_empty() && !path.contains('\0') && Path::new(path).exists()
 }
 
 #[cfg(test)]

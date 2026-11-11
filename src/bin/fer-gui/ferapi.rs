@@ -25,8 +25,6 @@
 //! 数据模型统一在 `file_engine_rust::api`（与服务端共用）：本模块只做
 //! 「Json -> 共享结构体」的字段搬运，改名会直接编译失败。
 
-#![allow(dead_code)]
-
 use std::time::Duration;
 
 use crate::http::{HttpClient, HttpError, url_encode};
@@ -52,6 +50,10 @@ impl FerClient {
 	}
 
 	/// GET /api/health —— serve 是否在线。
+	///
+	/// GUI 的在线判定走 `serve_ctl::probe`；此方法保留为客户端 API 的对称
+	/// 入口与桩服务器测试目标。
+	#[allow(dead_code)]
 	pub fn health(&self) -> Result<bool, HttpError> {
 		let body = self.http.get("/api/health")?.body;
 		Ok(match Json::parse(&body) {
@@ -130,6 +132,10 @@ impl FerClient {
 	}
 
 	/// POST /api/reveal —— 资源管理器定位。
+	///
+	/// GUI 的「定位」走 `actions::reveal_in_explorer`（独立 argv 拼装）；
+	/// 此方法保留为客户端 API 的对称入口与桩服务器测试目标。
+	#[allow(dead_code)]
 	pub fn reveal(&self, path: &str) -> Result<(), HttpError> {
 		let target = format!("/api/reveal?path={}", url_encode(path));
 		let body = self.http.post(&target)?.body;
