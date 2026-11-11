@@ -6,6 +6,7 @@
 //! * `query`   — filter query language (`ext: size: dm: parent:` …)
 //! * `mem`     — FERIDX01 dump engine: mmap zero-copy, all queries in memory
 //! * `du`      — directory size aggregation (WizTree-style totals from the dump)
+//! * `locks`   — who holds a path open: system handle table + process cwds
 //! * `monitor` — USN journal polling to keep the index live
 //! * `push`    — real-time change feed: monitor → serve (overlay, no dump rewrite)
 //! * `control` — loopback control channel: on-demand flush / rebuild of a running monitor
@@ -16,6 +17,7 @@ pub mod control;
 pub mod du;
 pub mod dupes;
 pub mod indexer;
+pub mod locks;
 pub mod mem;
 pub mod meta;
 pub mod mft;

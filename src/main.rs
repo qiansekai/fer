@@ -195,6 +195,31 @@ enum Cmd {
         #[arg(long, default_value_t = 50)]
         limit: usize,
     },
+    /// Who is holding a path open: open handles plus process working
+    /// directories. Read-only; needs an elevated process to see other users'
+    /// handles, otherwise it reports the caller's own plus every readable cwd.
+    Lock {
+        /// File or directory to inspect
+        #[arg(required_unless_present = "port")]
+        path: Option<String>,
+        /// Report the process listening on this TCP port instead of a path
+        #[arg(long, conflicts_with = "path")]
+        port: Option<u16>,
+        /// Also ask the target for DELETE access (the right a rename/delete
+        /// needs) and report the Win32 error. Off by default; never mutates.
+        #[arg(long)]
+        probe: bool,
+        /// Only scan working directories -- the half handle-only tools miss
+        #[arg(long, conflicts_with = "no_cwd")]
+        cwd_only: bool,
+        /// Skip the working-directory scan
+        #[arg(long)]
+        no_cwd: bool,
+        /// Also walk every process's full module list, so a loaded .dll that
+        /// locks the target is reported. Costs ~10x more than the default scan.
+        #[arg(long)]
+        modules: bool,
+    },
 }
 
 fn default_db() -> PathBuf {
@@ -703,6 +728,114 @@ fn main() -> Result<()> {
                     fmt_bytes(report.wasted_bytes),
                     report.files_hashed,
                     report.skipped
+                );
+            }
+        }
+        Cmd::Lock {
+            path,
+            port,
+            probe,
+            cwd_only,
+            no_cwd,
+            modules,
+        } => {
+            let started = Instant::now();
+            if let Some(port) = port {
+                let owners = file_engine_rust::locks::port_owners(port)?;
+                if cli.json {
+                    print_json(json!({
+                        "ok": true,
+                        "port": port,
+                        "owners": owners,
+                        "took_ms": started.elapsed().as_millis(),
+                    }))?;
+                    return Ok(());
+                }
+                if owners.is_empty() {
+                    println!("port {port}: nothing is listening");
+                }
+                for o in &owners {
+                    println!(
+                        "port {port}: pid {}  {}  {} ({})",
+                        o.pid, o.process, o.local_addr, o.family
+                    );
+                }
+                return Ok(());
+            }
+            let target = path.unwrap_or_default();
+            let report = file_engine_rust::locks::inspect(
+                &target,
+                file_engine_rust::locks::LockOptions {
+                    probe,
+                    cwd_only,
+                    no_cwd,
+                    modules,
+                },
+            )?;
+            if cli.json {
+                let mut value = serde_json::to_value(&report)?;
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert("ok".into(), json!(true));
+                }
+                print_json(value)?;
+                return Ok(());
+            }
+            println!("{}", report.target);
+            println!("  kind:    {}", report.kind);
+            if let Some(frn) = report.frn {
+                println!("  record:  {}", file_engine_rust::locks::frn_display(frn));
+            }
+            if let Some(p) = &report.probe {
+                println!("  probe:   {} (win32 error {})", p.verdict, p.win32_error);
+            }
+            let handle_count = report.holders.iter().filter(|h| h.kind == "handle").count();
+            let cwd_count = report.holders.iter().filter(|h| h.kind == "cwd").count();
+            let other_count = report.holders.len() - handle_count - cwd_count;
+            println!(
+                "  holders: {} ({handle_count} handle, {cwd_count} cwd, {other_count} image/module)",
+                report.holders.len()
+            );
+            for h in &report.holders {
+                let strength = if h.hard { "hard" } else { "soft" };
+                let tag = if h.is_self { " (this process)" } else { "" };
+                if h.kind == "handle" {
+                    println!(
+                        "  pid {:>6}  {:<24} {:<6} {:<4} {}{}",
+                        h.pid,
+                        h.process,
+                        h.kind,
+                        strength,
+                        file_engine_rust::locks::describe_access(h.access),
+                        tag
+                    );
+                } else {
+                    println!(
+                        "  pid {:>6}  {:<24} {:<6} {:<4}{}",
+                        h.pid, h.process, h.kind, strength, tag
+                    );
+                }
+                if !h.path.is_empty() {
+                    println!("          {}", h.path);
+                }
+                if h.hard_link_alias {
+                    println!("          (same file record as the target: hard-link alias)");
+                }
+            }
+            eprintln!(
+                "{} file handles / {} processes scanned in {} ms{}",
+                report.handles_scanned,
+                report.processes_seen,
+                report.elapsed_ms,
+                if report.elevated {
+                    ""
+                } else {
+                    " (not elevated: other users' processes were skipped)"
+                }
+            );
+            if report.processes_unreadable > 0 {
+                eprintln!(
+                    "{} processes could not be opened (protected, or another user)",
+                    report.processes_unreadable
                 );
             }
         }

@@ -86,6 +86,10 @@ fer dupes --min-size 1kb --limit 50  # 找重复文件（同大小分组 + 内�
 fer dupes --name adb.exe             # 只看文件名含 adb.exe 的重复组
 fer du "D:\proj" --top 20            # 磁盘占用聚合（WizTree 式 du，见下节）
 fer du "D:\" --depth 1 --top 10 --json  # 整卷顶层占用，JSON 输出
+fer lock "D:\proj"                   # 谁占着这个路径（句柄 + 工作目录，两类一起查）
+fer lock "D:\proj" --probe           # 额外请求 DELETE 权限（改名/删除真正需要的），报 Win32 错误码
+fer lock "D:\proj" --cwd-only        # 只查 handle 的盲点：进程工作目录
+fer lock --port 8899                 # 端口占用
 fer --db <path> <cmd>                # 自定义索引库（默认 %LOCALAPPDATA%\file-engine-rust\index.db）
 ```
 
@@ -116,6 +120,58 @@ fer --db <path> <cmd>                # 自定义索引库（默认 %LOCALAPPDATA
 > 注意：`parent:`/`path:` 是**朴素前缀**——`parent:D:\proj` 也会匹配 `D:\proj2`。
 > 需要组件边界语义（`d:\proj` 绝不匹配 `d:\proj2`）请用 `fer du`，其底层
 > `subtree_ids` 是边界感知的。
+
+## fer lock — 谁占着这个路径（句柄 + 工作目录）
+
+`handle.exe` 只答一半：它能列出句柄，但**看不见进程的工作目录** —— 而「子目录都能改名、
+父目录改不了」最常见的原因正是某个 GUI（照片 / 画图 / 编辑器 / shell）以该目录为 cwd 启动。
+2026-11-11 的实战就是这形态：`Photos.exe` 与 `mspaint.exe` 的 cwd 挡在目录里，
+`handle -a` 报 "No matching handles found"。`fer lock` 一次给两半：
+
+```bash
+fer lock "D:\proj"               # 句柄 + cwd，默认两类都查
+fer lock "D:\proj" --cwd-only    # 只查 handle 的盲点
+fer lock "D:\proj" --modules     # 连加载着的 dll 也查（默认只查 exe 映像，快 10 倍）
+fer lock "D:\proj" --probe       # 额外请求 DELETE 权限（改名/删除真正需要的），报 Win32 错误码
+fer lock --port 8899             # 端口占用（TCP 监听表）
+fer lock "D:\proj" --json        # 稳定结构，给 agent 用
+```
+
+实现在 `src/locks.rs`，三处刻意的取舍：
+
+- **`NtQueryObject` 一律不用**：它对同步对象（管道）的句柄名查询会死挂，业界标准做法是
+  配看门狗线程。这里只关心文件 —— `GetFinalPathNameByHandleW` 直接给路径，安全。
+- **File 类型索引是运行时测出来的，不写死**：各 Windows 版本的 ObjectTypeIndex 不同，
+  写错会让整次扫描变成「谁也没占用」—— 恰好是这功能要防的假阴性。测法 = 打开自身 exe，
+  在同一个句柄表快照里找到那个句柄的类型索引（本机实测 37）。
+- **cwd 只能锁它自己或其下方**：Windows 允许改名 cwd 的子项，所以 cwd 在目标**之上**不算
+  占用（按「两边互为前缀」判断会给出一堆假阳性）。
+
+**第三个盲点：加载的映像**。运行中的 `.exe` / `.dll` 锁住自己的文件，但**不持有句柄** ——
+内核持有 Section，文件句柄在加载时就关闭了。所以 handle 类工具对「程序还在跑、exe 删不掉」
+同样报假阴性。对文件目标，`fer lock` 先比一次**进程映像路径**（每进程一次调用，覆盖绝大多数
+场景），命中标 `kind: image`；再加 `--modules` 才逐进程枚举完整模块表
+（`EnumProcessModules` + `GetModuleFileNameExW`），把加载着的 dll 也找出来，标
+`kind: module`。实测：查在役 `fer.exe` 得到 `pid … fer.exe image (this process)`，
+而同一份文件用句柄扫描是 0 命中。`--modules` 的代价是每进程几十个模块、全系统多花约 1.4 s，
+默认不付。
+
+查询过程本身也是 `fer.exe`，所以结果里通常会有自己，标 `(this process)`。
+
+两个超出 handle 的信息：
+
+- **硬链接别名**：`BY_HANDLE_FILE_INFORMATION.nFileIndex` 与 fer 索引的 `frn` 同一
+  口径（`FRN_MASK`）。用户报 `h1.txt`、实际是有人经 `h2.txt` 别名打开 ——
+  路径不同但记录号相同，报告标 `hard_link_alias`。
+- **access mask 分级**：`hard` = 掩码含 `DELETE` / 写类权限，`soft` = 只读
+  打开。真正的阻塞判据是「打开时没带 `FILE_SHARE_DELETE`」，而句柄表不报共享模式，
+  所以 `hard` 是提示不是结论 —— 要结论用 `--probe`。
+
+`--probe` **默认关**：它只是以 `DELETE` 权限打开目标再立即关闭，不删不改，但确实是
+一次真实打开，所以让调用方显式选择。`would_succeed` = 没人挡；`sharing_violation` =
+有句柄没带共享删除（就是被挡）；`access_denied` = ACL 或只读属性。
+
+非管理员仍可用，只是看得到自己权限内的进程，其余计入 `processes_unreadable`。
 
 ## fer du — 磁盘占用聚合（WizTree 式）
 
@@ -415,6 +471,9 @@ serve 稳态（引擎侧 took_ms，预热线程 + TTL 缓存）：`ext:rs` 0ms�
   `GetFileAttributesExW`（attributes/size/时间戳全准，allocated 由簇大小向上取整推导，压缩与稀疏
   文件会高估）；`off` = 完全不 stat，flags 与目录位取自 USN 记录，size/时间标为「未知」
   （`FLAG_META_UNKNOWN`，与「测量为 0」区分）。编译这类高频写入场景的磁盘活动主要来自这一步。
+- **`fer lock` 的两个已知边界**：① 32 位（WOW64）进程的 cwd 走的是另一套 PEB 布局，
+  当前读不到 —— 记为跳过，不会误报成「没有 cwd」；② 受保护进程（PPL / 其他用户）的打开会失败，
+  计入 `processes_unreadable`，非管理员时这个数会明显偏大。这条功能不依赖索引，`--db` 与它无关。
 - 内存引擎的路径排序只折叠 ASCII 大小写（非 ASCII 大小写字母如 É/Ö 按字节比较）
   ——Windows 路径中极少见
 - 8.3 短名（namespace=2）不入索引（避免噪音）；分片 `$MFT` 不支持 attribute-list 布局
