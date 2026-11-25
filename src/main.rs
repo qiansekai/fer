@@ -70,7 +70,7 @@ enum Cmd {
         #[arg(long)]
         count_only: bool,
     },
-    /// Start the HTTP API + web UI
+    /// Start the HTTP API (the desktop GUI talks to it; there is no web UI)
     Serve {
         /// Port 9876 sits inside a WinNAT-reserved range on some hosts, so
         /// the default lives elsewhere; both ends must agree (serve --addr
@@ -248,7 +248,7 @@ fn load_index(db: &Path) -> Result<MemIndex> {
 }
 
 /// Percent-encode a query string for a GET request (RFC 3986 unreserved kept
-/// as-is, space as `+` — the form style the web UI already sends).
+/// as-is, space as `+` — the form style the HTTP clients already send).
 fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {

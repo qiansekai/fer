@@ -3,7 +3,8 @@
 > **fer** = **F**ile **E**xpress **R**etriever（文件极速检索器）。
 > Everything 级「秒定位全局文件」搜索引擎，纯 Rust。
 > 索引走 **原始 $MFT 扫描**（与 Everything 同款内核路径），搜索走 **FERIDX01 dump 内存引擎**
-> （mmap 零拷贝，毫秒级），支持硬链接别名、文件大小/时间/属性过滤，CLI + HTTP API 双通道，agent 友好。
+> （mmap 零拷贝，毫秒级），支持硬链接别名、文件大小/时间/属性过滤，CLI + HTTP API + 桌面 GUI
+> 三通道，agent 友好。`fer serve` 自 2026-11-09 起只提供 HTTP API（Web UI 已摘除，图形入口是 `fer-gui`）。
 
 ## 特性
 
@@ -29,7 +30,12 @@
 - **实时监控**：`fer monitor` 轮询 USN 日志增量更新（删除按 FRN 直删；内容写大、属性变更
   `attrib +h`、`SetFileTime` touch 都在一个轮询周期内刷新元数据）；变更经推送 overlay
   **实测 1-5 秒**出现在 CLI 与 GUI；停机重启自动从 pending 快照续跑，不必手工 `fer index`
-- **HTTP API + 桌面 GUI** + **CLI --json**（稳定 JSON 输出，面向 agent）
+- **HTTP API + 桌面 GUI** + **CLI --json**（稳定 JSON 输出，面向 agent）；
+  GUI 是独立 exe（`--features gui`），数据面走 `fer serve`，**没有 Web UI**
+- **谁占着这个路径（`fer lock`）**：打开句柄 + 进程工作目录 + 加载中的映像/模块 + 端口，
+  四类一次查完（`handle.exe` 只给第一类，对 cwd 与 image 都是假阴性）；不依赖索引
+- **monitor 元数据成本可调**：`--stat-policy full|fast|off`（默认 fast，每事件一次
+  `GetFileAttributesExW`）+ `--exclude-dir` 构建产物目录排除；目录改名/移动连带迁移子树
 - **Everything 架构**：`fer index` 一次性把全盘扫进内存引擎并写成
   **FERIDX01 dump**（~1.2GB）；查询全靠内存的排序数组 + **整 arena 单遍 SIMD 扫描**
   （子串/正则走 memchr 大缓冲扫 + `name_offs`/`path_offs` 游标映射）+
@@ -72,7 +78,7 @@ fer search "ext:mp4 size:>1gb dm:thisweek"   # 过滤查询语言
 fer search "foo" --limit 50 --count-only     # 只看命中数
 fer search "size:>1gb" --sort size --desc --limit 10   # 服务端排序：全库最大的 10 个文件
 fer search "ext:log dm:today" --sort mtime --desc      # 最新的日志排在最前
-fer serve --addr 127.0.0.1:19876   # HTTP API（默认端口）
+fer serve --addr 127.0.0.1:19876   # HTTP API（默认端口；无 Web UI，图形入口用 fer-gui）
 fer upgrade                          # 格式迁移：老 dump 就地重建 trigram 段并写为最新版（免管理员）
 fer monitor --volume D               # USN 实时增量（需管理员）
 fer monitor --volume D,H             # 多卷监视（逗号列表或重复传参；每卷独立 journal）
@@ -208,15 +214,23 @@ GET /api/search?q=<query>&limit=<n>&sort=<key>&desc=<0|1> → 命中列表（带
                                       排序在服务端做，页里是**整个结果集的 top N**，不是「先取 N 条再排序」
                                       total = 不设 limit 时实际会返回的命中数（已扣除实时 overlay 里的删除）
 GET /api/du?path=<p>&depth=<n>&top=<n>&allocated=<bool> → 目录占用聚合（WizTree 式，字段同 `fer du --json`）
-GET /api/stats                      → 索引统计 + 卷列表
-POST /api/rescan                    → 后台全量重建
+GET /api/stats                      → 索引统计（ok/entries/files/dirs/dump/dump_mb/mem_bytes —— 不含卷列表）
+GET /api/feed                       → 实时 overlay 状态（pending_append/pending_remove/delta_entries/
+                                      batches_applied/saturated/removed_in_dump/overlay_generation + sample_*）
+POST /api/rescan                    → serve 进程内全量重建（扫 $MFT，需管理员；非提权时用 /api/rebuild）
+POST /api/rebuild                   → 转交已提权的 `fer monitor` 重建（本机默认部署走这条）
+POST /api/reveal?path=<abs>         → 资源管理器定位（explorer /select,；Origin/Referer 必须同源或缺失，
+                                      只接受已存在路径）。服务端不渲染任何页面，这是 GUI「定位」的对称接口
 ```
+
+> `fer serve` **没有 Web UI**（2026-11-09 摘除 Vue3 前端，`GET /` 返回 404）；图形入口是独立的
+> `fer-gui.exe`，它按上面这些端点的 JSON 响应工作。
 
 搜索响应（hits 为数组，`total` 为未截断的总命中数）：
 
 ```json
 {
-  "ok": true, "query": "ext:rs", "count": 100, "total": 40039, "took_ms": 5,
+  "ok": true, "engine": "mem", "query": "ext:rs", "count": 100, "total": 40039, "took_ms": 5,
   "hits": [
     {"path": "D:\\proj\\main.rs", "is_dir": false, "size": 1234,
      "mtime": 1750000000, "ctime": 1749000000, "flags": 0}
@@ -290,23 +304,47 @@ src/
 │               trigram 倒排段（trigrams/trig_offs/trig_posts），mmap 零拷贝
 │               加载，多 term 并行求值；子串/正则走整 arena 单遍 SIMD 扫描
 │               （跨 entry 边界伪命中过滤 + 命中后跳到 entry 尾），≥3 字节
-│               子串先走 trigram posting 交集（候选超集，逐候选 memmem 校验）
+│               子串先走 trigram posting 交集（候选超集，逐候选 memmem 校验）；
+│               同文件还含 IdSet 三形态组合器、glob Shift-And 位并行、trigram 构建
 ├── query.rs    查询语言解析（纯函数 + 单测）
 ├── indexer.rs  build 编排：auto = 纯 MFT；usn/walk 仅显式可选（非提权硬拒绝）
-├── monitor.rs  USN 日志轮询 → 内存增量（FRN 直删）+ 防抖写回 dump
+├── monitor.rs  USN 日志轮询 → 内存增量（FRN 直删）+ 防抖写回 dump；
+│               --stat-policy 三档元数据策略、目录改名子树迁移、pending 快照
+├── push.rs     monitor → serve 的变更推送（回环 TCP 19877，全量替换语义的 overlay delta）
+├── control.rs  `fer flush` / `fer rebuild` 的回环控制通道（19878）
+├── meta.rs     `.meta` sidecar 读写（method/volumes/built_at）
+├── du.rs       磁盘占用聚合（subtree_ids 边界感知枚举 + FRN 去重 + 祖先 roll-up）
 ├── dupes.rs    重复文件查找（同大小分组 + FNV 哈希 + 字节校验）
-├── server.rs   axum HTTP API
+├── locks.rs    `fer lock`：句柄 + cwd + 映像/模块 + 端口（不依赖索引，不用 NtQueryObject）
+├── api.rs      HTTP 响应模型（服务端与 GUI 共用的唯一字段定义）
+├── fmt.rs      字节格式化（CLI 与 GUI 共用一份）
+├── server.rs   axum HTTP API（无 Web UI；/api/feed 叠加 monitor 推送的 overlay）
 ├── bin/fer-gui/ 桌面 GUI（winsafe 手写 Win32；--features gui 才编译）
+├── lib.rs      库根：模块导出 + 共享辅助（导出 api/mem/du 等给两个 bin）
 └── main.rs     fer CLI（clap，--json 全局开关）
 ```
 
 ## 测试
 
 ```bash
-cargo test                                        # 单元 + 端到端
+cargo test --features gui                         # 单元 + 端到端（GUI 单测也跑）
+cargo test --test live_serve -- --ignored --nocapture    # 对独立 serve 实例（25000 端口）
+cargo test --test api_contract -- --ignored --nocapture  # HTTP 响应反序列化回共享模型
 cargo test --test live_volume -- --ignored --nocapture   # 真实卷（需管理员）
 # 自定义盘符：$env:FER_TEST_DRIVE='D'
 ```
+
+| 测试二进制 | 用例 | 默认行为 |
+|---|---:|---|
+| `src/lib.rs` 单元 | 174 | 全跑 |
+| `src/bin/fer-gui` 单元 | 127 | 123 跑 / 4 ignored（窗口相关） |
+| `tests/integration.rs` | 1 | 跑 |
+| `tests/query_state.rs` | 26 | 跑 |
+| `tests/live_serve.rs` | 5 | 全 ignored（需 serve 实例） |
+| `tests/api_contract.rs` | 4 | 全 ignored（需 serve 实例） |
+| `tests/live_volume.rs` | 3 | 全 ignored（需管理员） |
+
+2026-11-11 实测：`cargo test --features gui` = **148 passed / 0 failed / 12 ignored**。
 
 真实卷测试断言：MFT 扫描 >10 万文件、`hosts` 命中、**硬链接别名 System32\ntdll.dll 命中**、
 元数据 size 真实、搜索 <1s。与 Everything(es) 交叉验证见提交历史中的验证记录。

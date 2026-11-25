@@ -11,12 +11,13 @@
 //! * `push`    — real-time change feed: monitor → serve (overlay, no dump rewrite)
 //! * `control` — loopback control channel: on-demand flush / rebuild of a running monitor
 //! * `meta`    — index-quality sidecar (`<dump>.meta`: method, volumes, built_at)
-//! * `server`  — HTTP API (axum) with a minimal web UI
+//! * `server`  — HTTP API (axum); no UI — the desktop client is `src/bin/fer-gui`
 
 pub mod api;
 pub mod control;
 pub mod du;
-pub mod dupes;pub mod fmt;
+pub mod dupes;
+pub mod fmt;
 pub mod indexer;
 pub mod locks;
 pub mod mem;

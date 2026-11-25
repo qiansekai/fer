@@ -66,7 +66,7 @@ const MASK: u32 = USN_REASON_FILE_CREATE
 /// a file marked hidden kept `flags = 0` (measured: `hidden:true` still missed it
 /// 12 s after `attrib +h`), and a bare timestamp touch kept its old mtime, all
 /// until the next flush — up to `--flush-secs` (1800 s here) or a `fer rebuild`.
-/// `size:` / `dm:` / `hidden:` filters, `du` and the Web UI reported the stale
+/// `size:` / `dm:` / `hidden:` filters, `du` and the GUI reported the stale
 /// value in the meantime.
 ///
 /// The stat is now paid, but at most once per FRN per round (see
