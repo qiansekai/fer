@@ -1,6 +1,8 @@
 /target
 /target-gnu
 /target-verify
+# 便携发布构建（release 附件用，baseline x86-64，不入库）
+/target-dist
 *.db
 *.db-wal
 *.db-shm
