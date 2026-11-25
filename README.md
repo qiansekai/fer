@@ -216,7 +216,8 @@ GET /api/search?q=<query>&limit=<n>&sort=<key>&desc=<0|1> → 命中列表（带
 GET /api/du?path=<p>&depth=<n>&top=<n>&allocated=<bool> → 目录占用聚合（WizTree 式，字段同 `fer du --json`）
 GET /api/stats                      → 索引统计（ok/entries/files/dirs/dump/dump_mb/mem_bytes —— 不含卷列表）
 GET /api/feed                       → 实时 overlay 状态（pending_append/pending_remove/delta_entries/
-                                      batches_applied/saturated/removed_in_dump/overlay_generation + sample_*）
+                                      batches_applied/saturated/removed_in_dump/overlay_generation/
+                                      last_apply_age_ms + sample_append/sample_remove 诊断采样）
 POST /api/rescan                    → serve 进程内全量重建（扫 $MFT，需管理员；非提权时用 /api/rebuild）
 POST /api/rebuild                   → 转交已提权的 `fer monitor` 重建（本机默认部署走这条）
 POST /api/reveal?path=<abs>         → 资源管理器定位（explorer /select,；Origin/Referer 必须同源或缺失，
